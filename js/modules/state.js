@@ -1,11 +1,16 @@
+/* ═══════════════════════════════════════
+   STATE — Application state management
+   ═══════════════════════════════════════ */
+
 export const state = {
-    currentMode: 'custom',    // ← was 'code', but no 'code' exists in MODE_INFO
+    currentMode: 'custom',
     messages: [],
     conversationHistory: [],
     isStreaming: false,
     streamElement: null,
     streamBuffer: '',
     streamRenderTimeout: null,
+    isRenderScheduled: false, // Required for ultra-fast streaming
     sidebarOpen: false,
     currentChatId: null,
     abortController: null,
@@ -21,6 +26,14 @@ export const state = {
     },
 
     modelContextLimits: {},
+
+    // Agentic Task Loop Control & Resume State
+    activeTask: {
+        isRunning: false,
+        loopCount: 0,
+        maxLoops: 10, // Hard limit to prevent infinite loops
+        pendingIntegrations: [] // Tracks files the AI still needs to connect
+    }
 };
 
 export const voiceState = {

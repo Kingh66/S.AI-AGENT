@@ -77,6 +77,10 @@ export async function sendMessage(userText, isAutoContinue) {
 
         addUserMessage(userText);
         state.conversationHistory.push({ role: 'user', content: userText });
+        
+        // Initialize agentic task loop for new user requests
+        state.activeTask.isRunning = true;
+        state.activeTask.loopCount = 0;
     }
 
     var sys = state.settings.systemPrompt;
@@ -104,7 +108,7 @@ export async function sendMessage(userText, isAutoContinue) {
         }
     }
     
-    setConnectionStatus('connecting', isAutoContinue ? 'Auto-continuing...' : 'Generating...');
+    setConnectionStatus('connecting', isAutoContinue ? 'Task loop ' + (state.activeTask.loopCount + 1) + '/' + state.activeTask.maxLoops + '...' : 'Generating...');
 
     if (voiceState.isVoiceChat) {
         import('./voice.js').then(function(m) { m.setVoiceMode('thinking'); });
@@ -195,19 +199,32 @@ export async function sendMessage(userText, isAutoContinue) {
         finalizeStream();
         clearInterval(stallWatchdog);
 
-        // 🧠 AUTO-CONTINUE BRAIN
-        if (finishReason === 'length' && (state.autoContinueCount || 0) < 3) {
-            state.autoContinueCount = (state.autoContinueCount || 0) + 1;
-            toast('Output limit reached. Auto-continuing (' + state.autoContinueCount + '/3)...', 'info');
+        // 🧠 ADVANCED AUTO-CONTINUE BRAIN
+        var hitLimit = (finishReason === 'length');
+        
+        // Check for secret tag overriding the API finish state
+        var lastResponse = state.conversationHistory[state.conversationHistory.length - 1];
+        var hasContinueTag = lastResponse && lastResponse.content.includes('<|CONTINUE_TASK|>');
+        
+        if (hasContinueTag) {
+            lastResponse.content = lastResponse.content.replace('<|CONTINUE_TASK|>', '');
+            hitLimit = true; 
+        }
+
+        if (hitLimit && state.activeTask.loopCount < state.activeTask.maxLoops) {
+            state.activeTask.loopCount++;
+            toast('Task loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + '...', 'info');
             
             state.conversationHistory.push({ 
                 role: 'user', 
-                content: 'continue from exactly where you left off. Do not repeat the previous text, just continue writing.' 
+                content: 'SYSTEM OVERRIDE: Continue your work. If you created new files, you MUST now output the files that import them to complete the integration. Do not repeat finished code.' 
             });
             
             setTimeout(function() { sendMessage('', true); }, 1000);
         } else {
-            state.autoContinueCount = 0;
+            // TASK RESOLVED: Guarantee state returns to idle
+            state.activeTask.isRunning = false;
+            state.activeTask.loopCount = 0;
             setConnectionStatus('connected', 'Connected — ' + state.settings.model);
             if (state.conversationHistory.length > 30) {
                 state.conversationHistory = state.conversationHistory.slice(-20);
@@ -221,15 +238,33 @@ export async function sendMessage(userText, isAutoContinue) {
         if (error.name === 'AbortError') { 
             if (Date.now() - lastChunkTime >= INACTIVE_TIMEOUT - 100) {
                 finalizeStream(); 
-                toast('Model stalled. Auto-continuing...', 'error'); 
-                state.conversationHistory.push({ role: 'user', content: 'continue from exactly where you left off. Do not repeat the previous text, just continue writing.' });
-                setTimeout(function() { sendMessage('', true); }, 1500);
+                
+                // Stall fallback also respects task limits and tags
+                var stallLastResponse = state.conversationHistory[state.conversationHistory.length - 1];
+                var stallTag = stallLastResponse && stallLastResponse.content.includes('<|CONTINUE_TASK|>');
+                if (stallTag) stallLastResponse.content = stallLastResponse.content.replace('<|CONTINUE_TASK|>', '');
+
+                if ((finishReason === 'length' || stallTag) && state.activeTask.loopCount < state.activeTask.maxLoops) {
+                    state.activeTask.loopCount++;
+                    toast('Model stalled. Auto-continuing (' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')...', 'error'); 
+                    state.conversationHistory.push({ role: 'user', content: 'SYSTEM OVERRIDE: Continue your work. If you created new files, you MUST now output the files that import them to complete the integration. Do not repeat finished code.' });
+                    setTimeout(function() { sendMessage('', true); }, 1500);
+                } else {
+                    state.activeTask.isRunning = false;
+                    state.activeTask.loopCount = 0;
+                    toast('Task stopped or completed.', 'info');
+                    setConnectionStatus('connected', 'Connected — ' + state.settings.model);
+                }
             } else {
+                state.activeTask.isRunning = false; // User manually stopped it
                 finalizeStream(); 
                 toast('Response stopped', 'info'); 
             }
             return; 
         }
+        
+        // Standard API errors
+        state.activeTask.isRunning = false;
         finalizeStream();
         var msg = error.message.indexOf('Failed to fetch') > -1 || error.message.indexOf('NetworkError') > -1
             ? 'Cannot reach the LLM endpoint.' : error.message;
