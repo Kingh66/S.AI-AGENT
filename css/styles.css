@@ -1,0 +1,15 @@
+/* ═══════════════════════════════════════
+   S.ai — Main Stylesheet
+   Imports all partials in dependency order
+   ═══════════════════════════════════════ */
+@import url('base/styles.css');
+@import url('components/boot-screen.css');
+@import url('components/background.css');
+@import url('components/sidebar.css');
+@import url('components/chat.css');
+@import url('components/input-area.css');
+@import url('components/voice-status.css');
+@import url('components/code-blocks.css');
+@import url('components/modals.css');
+@import url('components/toasts.css');
+@import url('components/responsive.css');

@@ -1,0 +1,63 @@
+/* ═══════════════════════════════════════
+   BASE — Variables, Reset, Typography
+   ═══════════════════════════════════════ */
+:root {
+    --bg-deep: #08080f;
+    --bg-surface: #0e0e18;
+    --bg-card: rgba(16, 16, 28, 0.85);
+    --bg-card-hover: rgba(22, 22, 38, 0.9);
+    --bg-input: rgba(12, 12, 22, 0.9);
+    --border: rgba(0, 229, 160, 0.12);
+    --border-active: rgba(0, 229, 160, 0.4);
+    --accent: #00e5a0;
+    --accent-dim: rgba(0, 229, 160, 0.15);
+    --accent-glow: rgba(0, 229, 160, 0.25);
+    --accent-dark: #009966;
+    --accent-bright: #00ffb3;
+    --green: #00e5a0;
+    --green-dim: rgba(0, 229, 160, 0.15);
+    --red: #ff4757;
+    --red-dim: rgba(255, 71, 87, 0.15);
+    --cyan: #00d4ff;
+    --cyan-dim: rgba(0, 212, 255, 0.15);
+    --text: #dcdce0;
+    --text-muted: #6a6a7a;
+    --text-bright: #f0f0f5;
+    --code-bg: #111120;
+    --sidebar-w: 300px;
+    --header-h: 56px;
+    --radius: 12px;
+    --radius-sm: 8px;
+    --font-ui: 'Poppins', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 15px; }
+body {
+    font-family: var(--font-ui);
+    background: var(--bg-deep);
+    color: var(--text);
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(0, 229, 160, 0.2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0, 229, 160, 0.35); }
+::selection { background: var(--accent-dim); color: var(--accent); }
+
+a { color: var(--cyan); text-decoration: none; }
+a:hover { text-decoration: underline; }
+button { font-family: var(--font-ui); cursor: pointer; border: none; outline: none; }
+input, textarea, select { font-family: var(--font-ui); outline: none; border: none; }
+
+/* App layout */
+#app {
+    display: none; height: 100vh; width: 100vw;
+    position: relative; z-index: 1;
+    flex-direction: row;
+}
+#app.active { display: flex; }

@@ -1,0 +1,63 @@
+/* ═══════════════════════════════════════
+   INPUT AREA — Text Input, Mic, Send
+   ═══════════════════════════════════════ */
+#input-area {
+    padding: 16px 20px; flex-shrink: 0;
+    border-top: 1px solid var(--border);
+    background: var(--bg-card); backdrop-filter: blur(20px);
+}
+.input-wrapper {
+    display: flex; align-items: flex-end; gap: 10px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 6px 6px 6px 16px;
+    transition: border-color 0.2s;
+}
+.input-wrapper:focus-within { border-color: var(--border-active); box-shadow: 0 0 0 3px var(--accent-dim); }
+#msg-input {
+    flex: 1; background: transparent; color: var(--text);
+    font-size: 0.85rem; line-height: 1.5;
+    resize: none; max-height: 160px; min-height: 24px;
+    padding: 8px 0; font-family: var(--font-mono);
+}
+#msg-input::placeholder { color: var(--text-muted); }
+
+.send-btn {
+    width: 38px; height: 38px; border-radius: var(--radius-sm);
+    background: var(--accent); color: #000;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.9rem; transition: all 0.2s; flex-shrink: 0;
+}
+.send-btn:hover { background: var(--accent-bright); transform: scale(1.05); }
+.send-btn:disabled { opacity: 0.3; cursor: not-allowed; transform: none; }
+.send-btn.stop { background: var(--red); color: #fff; }
+
+.mic-btn {
+    width: 38px; height: 38px; border-radius: var(--radius-sm);
+    background: transparent; color: var(--text-muted);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.9rem; transition: all 0.2s; flex-shrink: 0;
+    border: 1px solid var(--border);
+}
+.mic-btn:hover { background: var(--accent-dim); color: var(--accent); border-color: var(--border-active); }
+.mic-btn.recording {
+    background: var(--red-dim); color: var(--red);
+    border-color: rgba(255, 71, 87, 0.5);
+    animation: micPulse 1.5s infinite;
+}
+@keyframes micPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255, 71, 87, 0.4); }
+    50% { box-shadow: 0 0 0 8px rgba(255, 71, 87, 0); }
+}
+.mic-btn.unavailable { opacity: 0.3; cursor: not-allowed; }
+
+.input-hint {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 4px 0; font-size: 0.65rem; color: var(--text-muted);
+}
+.slash-cmds { display: flex; gap: 8px; }
+.slash-cmds code {
+    background: var(--accent-dim); padding: 1px 6px; border-radius: 3px;
+    color: var(--accent); font-family: var(--font-mono);
+}

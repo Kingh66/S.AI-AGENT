@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S.ai | Local Coding Agent</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+
+<!-- BOOT SCREEN -->
+<div id="boot-screen">
+    <div class="boot-terminal">
+        <div class="boot-header">
+            <div class="boot-dot r"></div>
+            <div class="boot-dot y"></div>
+            <div class="boot-dot g"></div>
+            <span class="boot-title">s.ai --init --turbo</span>
+        </div>
+        <div class="boot-body" id="boot-body"></div>
+    </div>
+</div>
+
+<!-- BACKGROUND -->
+<canvas id="bg-canvas"></canvas>
+
+<!-- MOBILE OVERLAY -->
+<div class="mobile-overlay" id="mobile-overlay"></div>
+
+<!-- VOICE STATUS BAR -->
+<div class="voice-status-bar" id="voice-status-bar">
+    <div class="voice-status-dot" id="voice-status-dot"></div>
+    <span id="voice-status-text">Listening...</span>
+    <button class="voice-stop-btn" id="voice-stop-btn" title="Stop voice chat"><i class="fas fa-xmark"></i></button>
+</div>
+
+<!-- MAIN APP -->
+<div id="app">
+    <aside id="sidebar">
+        <div class="sidebar-brand">
+            <div class="brand-icon">S.ai</div>
+            <div class="brand-text">
+                <h3>S.ai Agent</h3>
+                <span>local coding agent v1.0</span>
+            </div>
+        </div>
+        <div class="sidebar-scroll">
+            <div class="sidebar-section">
+                <div class="conn-status disconnected" id="conn-status">
+                    <div class="conn-dot"></div>
+                    <span id="conn-text">Not Connected</span>
+                </div>
+            </div>
+            <div class="sidebar-section">
+                <h4>Agent Mode</h4>
+                <div class="mode-grid" id="mode-grid">
+                    <button class="mode-btn active" data-mode="doc"><i class="fas fa-file-alt"></i> Documentation Writer</button>
+                    <button class="mode-btn" data-mode="review"><i class="fas fa-search-plus"></i> Code Reviewer</button>
+                    <button class="mode-btn" data-mode="improve"><i class="fas fa-wand-magic-sparkles"></i> Code Improver</button>
+                    <button class="mode-btn" data-mode="debug"><i class="fas fa-bug"></i> Debug Assistant</button>
+                    <button class="mode-btn" data-mode="explain"><i class="fas fa-graduation-cap"></i> Code Explainer</button>
+                    <button class="mode-btn" data-mode="selfimprove"><i class="fas fa-brain"></i> Self-Improve</button>
+                    <button class="mode-btn" data-mode="custom"><i class="fas fa-sliders"></i> Custom Mode</button>
+                </div>
+            </div>
+            <div class="sidebar-section">
+                <h4>Project Context</h4>
+                <textarea class="context-area" id="project-context" placeholder="Describe your project, tech stack, goals...&#10;This helps S.ai give better responses."></textarea>
+            </div>
+            <div class="sidebar-section">
+                <h4><i class="fas fa-folder-open" style="margin-right:4px"></i> Workspace</h4>
+                <button class="btn-sm btn-ghost" id="btn-connect-folder" style="width:100%;margin-bottom:8px">
+                    <i class="fas fa-folder-plus"></i> Connect Folder
+                </button>
+                <div class="folder-status" id="folder-status">
+                    <span style="color:var(--text-muted)">No folder connected</span>
+                </div>
+                <div class="file-tree" id="file-tree"></div>
+                <div class="context-indicator" id="context-indicator" style="display:none"></div>
+                <button class="btn-sm btn-ghost" id="btn-refresh-folder" style="width:100%;margin-top:6px;display:none">
+                    <i class="fas fa-sync-alt"></i> Refresh
+                </button>
+
+                <h4>Quick Settings</h4>
+                <div class="setting-row">
+                    <label class="setting-label">Temperature</label>
+                    <div class="range-wrapper">
+                        <input type="range" id="q-temp" min="0" max="1" step="0.05" value="0.7">
+                        <span class="range-value" id="q-temp-val">0.7</span>
+                    </div>
+                </div>
+                <div class="setting-row">
+                    <label class="setting-label">Max Tokens</label>
+                    <input type="number" class="setting-input" id="q-tokens" value="4096" min="100" max="32768" step="100">
+                </div>
+            </div>
+            <div class="sidebar-section">
+                <h4><i class="fas fa-microphone" style="margin-right:4px"></i> Voice</h4>
+                <div class="setting-row">
+                    <label class="setting-label">Language</label>
+                    <select class="setting-select" id="q-voice-lang">
+                        <option value="en-US">English (US)</option>
+                        <option value="en-GB">English (UK)</option>
+                        <option value="es-ES">Spanish</option>
+                        <option value="fr-FR">French</option>
+                        <option value="de-DE">German</option>
+                        <option value="pt-BR">Portuguese (BR)</option>
+                        <option value="zh-CN">Chinese (Simplified)</option>
+                        <option value="ja-JP">Japanese</option>
+                        <option value="ko-KR">Korean</option>
+                        <option value="ar-SA">Arabic</option>
+                        <option value="hi-IN">Hindi</option>
+                    </select>
+                </div>
+                <div class="setting-row">
+                    <label class="setting-label">Speech Speed</label>
+                    <div class="range-wrapper">
+                        <input type="range" id="q-voice-rate" min="0.5" max="2" step="0.1" value="1">
+                        <span class="range-value" id="q-voice-rate-val">1.0</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </aside>
+
+    <main id="main-area">
+        <header id="chat-header">
+            <button id="sidebar-toggle" aria-label="Toggle sidebar"><i class="fas fa-bars"></i></button>
+            <div class="header-title">
+                <h2 id="header-mode-title">Documentation Writer</h2>
+                <span id="header-mode-desc">Generate comprehensive docs for your code</span>
+            </div>
+            <div class="header-actions">
+                <button class="header-btn" id="btn-voice-chat" title="Voice Chat Mode" aria-label="Toggle voice chat"><i class="fas fa-headset"></i></button>
+                <button class="header-btn" id="btn-prompt" title="Edit System Prompt" aria-label="Edit system prompt"><i class="fas fa-brain"></i></button>
+                <button class="header-btn" id="btn-settings" title="Connection Settings" aria-label="Connection settings"><i class="fas fa-plug"></i></button>
+                <button class="header-btn" id="btn-export" title="Export Chat" aria-label="Export chat"><i class="fas fa-download"></i></button>
+                <button class="header-btn" id="btn-clear" title="Clear Chat" aria-label="Clear chat"><i class="fas fa-trash-can"></i></button>
+            </div>
+        </header>
+
+        <div id="messages">
+            <div class="welcome-state" id="welcome-state">
+                <div class="welcome-icon">S</div>
+                <h2>S.ai, Ready</h2>
+                <p>Your local coding agent for documentation, code review, and improvement. Connect to an LLM to get started — supports OpenRouter, Ollama, LM Studio, and more.</p>
+                <div class="quick-actions">
+                    <button class="quick-action" data-cmd="/doc"><i class="fas fa-file-alt"></i> Write Documentation</button>
+                    <button class="quick-action" data-cmd="/review"><i class="fas fa-search-plus"></i> Review Code</button>
+                    <button class="quick-action" data-cmd="/improve"><i class="fas fa-wand-magic-sparkles"></i> Improve Code</button>
+                    <button class="quick-action" data-cmd="/debug"><i class="fas fa-bug"></i> Debug Issue</button>
+                    <button class="quick-action" data-cmd="/explain"><i class="fas fa-graduation-cap"></i> Explain Code</button>
+                    <button class="quick-action" id="qa-settings"><i class="fas fa-plug"></i> Configure Connection</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="input-area">
+            <div class="input-wrapper">
+                <textarea id="msg-input" rows="1" placeholder="Paste your code or describe what you need..." aria-label="Message input"></textarea>
+                <button class="mic-btn" id="mic-btn" aria-label="Voice input" title="Click to speak"><i class="fas fa-microphone"></i></button>
+                <button class="send-btn" id="send-btn" aria-label="Send message"><i class="fas fa-arrow-up"></i></button>
+            </div>
+            <div class="input-hint">
+                <div class="slash-cmds">
+                    <code>/doc</code> <code>/review</code> <code>/improve</code> <code>/debug</code> <code>/explain</code> <code>/clear</code> <code>/export</code>
+                </div>
+                <span>Shift+Enter for new line &middot; Mic for voice</span>
+            </div>
+        </div>
+    </main>
+</div>
+
+<!-- SETTINGS MODAL -->
+<div class="modal-overlay" id="settings-modal">
+    <div class="modal">
+        <div class="modal-header">
+            <h3><i class="fas fa-plug" style="margin-right:8px;color:var(--accent)"></i>Connection Settings</h3>
+            <button class="modal-close" data-close="settings-modal"><i class="fas fa-xmark"></i></button>
+        </div>
+        <div class="modal-body">
+            <div class="form-group">
+                <label class="form-label">Provider</label>
+                <select class="form-select" id="s-provider">
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="ollama">Ollama (Local)</option>
+                    <option value="lmstudio">LM Studio (Local)</option>
+                    <option value="openai-compat">OpenAI Compatible</option>
+                    <option value="openai">OpenAI API</option>
+                </select>
+                <p class="form-hint" id="s-provider-hint">OpenRouter — access Step 3.5 Flash, GLM 5 Turbo, MiMo-V2-Pro and more</p>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Endpoint URL</label>
+                <input type="text" class="form-input" id="s-endpoint" placeholder="https://openrouter.ai/api">
+                <p class="form-hint">The base URL for your LLM API</p>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">API Key</label>
+                    <input type="password" class="form-input" id="s-apikey" placeholder="sk-or-v1-...">
+                    <p class="form-hint" id="s-key-hint">Get your key at openrouter.ai/keys</p>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Model Name</label>
+                    <input type="text" class="form-input" id="s-model" placeholder="stepfun/step-3.5-flash">
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Available Models</label>
+                <button class="btn-sm btn-ghost" id="s-fetch-models" style="width:100%"><i class="fas fa-refresh"></i> Fetch Models</button>
+                <select class="form-select" id="s-models-list" style="margin-top:6px;display:none"></select>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn-sm btn-ghost" id="btn-reset-settings" style="color:var(--red);border-color:rgba(255,71,87,0.3);margin-right:auto"><i class="fas fa-trash-can"></i> Reset All</button>
+            <button class="btn-sm btn-ghost" data-close="settings-modal">Cancel</button>
+            <button class="btn-sm btn-ghost" id="s-test-conn"><i class="fas fa-bolt"></i> Test</button>
+            <button class="btn-sm btn-accent" id="s-save">Save & Connect</button>
+        </div>
+    </div>
+</div>
+
+<!-- SYSTEM PROMPT MODAL -->
+<div class="modal-overlay" id="prompt-modal">
+    <div class="modal">
+        <div class="modal-header">
+            <h3><i class="fas fa-brain" style="margin-right:8px;color:var(--accent)"></i>System Prompt</h3>
+            <button class="modal-close" data-close="prompt-modal"><i class="fas fa-xmark"></i></button>
+        </div>
+        <div class="modal-body">
+            <div class="prompt-presets" id="prompt-presets">
+                <button class="preset-chip active" data-preset="doc">Documentation</button>
+                <button class="preset-chip" data-preset="review">Code Review</button>
+                <button class="preset-chip" data-preset="improve">Code Improve</button>
+                <button class="preset-chip" data-preset="debug">Debug</button>
+                <button class="preset-chip" data-preset="explain">Explain</button>
+            </div>
+            <div class="form-group">
+                <textarea class="form-textarea" id="s-prompt" rows="12"></textarea>
+                <p class="form-hint">This defines how S.ai behaves. Edit to customize for your workflow.</p>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn-sm btn-ghost" data-close="prompt-modal">Cancel</button>
+            <button class="btn-sm btn-accent" id="s-prompt-save">Save Prompt</button>
+        </div>
+    </div>
+</div>
+
+<!-- TOASTS -->
+<div id="toast-container"></div>
+
+<!-- Prism.js (CDN) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-csharp.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-php.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-dart.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-go.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js"></script>
+
+<!-- App Entry Point -->
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
