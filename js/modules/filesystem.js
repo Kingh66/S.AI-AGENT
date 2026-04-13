@@ -103,37 +103,38 @@ export async function writeFile(path, content) {
     }
 }
 
-/* ── Helper to get max context chars safely ── */
+/* ── Get max context chars — USER BUDGET IS THE HARD CAP ──
+   This prevents sending more context than the user's credits can handle.
+   The model's theoretical context window is irrelevant if you can't pay for it. ── */
 function getMaxContextChars() {
+    /* 1. User's explicit budget setting — this is the LAW */
+    var userBudget = state.settings.contextBudget || 60000;
+
+    /* 2. Model's theoretical limit (from API data or conservative estimates) */
+    var modelLimit = 120000;
     var modelId = state.settings.model;
-    var maxChars = 120000; // Baseline fallback
 
     if (modelId && state.settings.provider === 'openrouter') {
-        // Strip :free tag to check base model name
         var baseModel = modelId.replace(':free', '');
 
-        // 1. ALWAYS trust the live API data first (most accurate)
         if (state.modelContextLimits[modelId]) {
-            maxChars = state.modelContextLimits[modelId];
-        } 
-        // 2. Conservative fallback estimates ONLY if models haven't been fetched yet
-        // (Using ~128k tokens = ~450,000 chars as a safe baseline for all top tier models)
-        else if (baseModel.indexOf('step-3.5') > -1 || baseModel.indexOf('mimo-v2') > -1 || baseModel.indexOf('hunter-alpha') > -1 || baseModel.indexOf('minimax-m2') > -1) {
-            maxChars = 450000;
-        } else if (baseModel.indexOf('glm-5') > -1 || baseModel.indexOf('qwen-3') > -1 || baseModel.indexOf('nemotron') > -1) {
-            maxChars = 450000;  
+            modelLimit = state.modelContextLimits[modelId];
+        } else if (baseModel.indexOf('step-3.5') > -1 || baseModel.indexOf('mimo-v2') > -1 || baseModel.indexOf('minimax-m2') > -1) {
+            modelLimit = 450000;
+        } else if (baseModel.indexOf('glm-5') > -1 || baseModel.indexOf('nemotron') > -1) {
+            modelLimit = 450000;
         } else if (baseModel.indexOf('claude') > -1) {
-            maxChars = 700000;  
-        }
-        // 3. Assume large limit for any other free models
-        else if (modelId.indexOf(':free') > -1) {
-            maxChars = 450000; 
+            modelLimit = 700000;
+        } else if (modelId.indexOf(':free') > -1) {
+            modelLimit = 450000;
         }
     }
-    return maxChars;
+
+    /* 3. The user's budget ALWAYS wins — you can't use what you can't pay for */
+    return Math.min(modelLimit, userBudget);
 }
 
-/* ── Build context string — dynamically sized to fit model's context window ── */
+/* ── Build context string — dynamically sized ── */
 export function getFileContext() {
     if (!dirHandle) return '';
 
@@ -144,8 +145,15 @@ export function getFileContext() {
     for (var h = 0; h < state.conversationHistory.length; h++) {
         historySize += (state.conversationHistory[h].content || '').length;
     }
-    /* Leave 2000 char safety margin */
-    var budget = Math.max(4000, maxChars - sysSize - historySize - 2000);
+
+    /* Warn if conversation history is eating into the file budget */
+    var overhead = sysSize + historySize + 2000;
+    if (overhead > maxChars * 0.7) {
+        var estTokens = Math.round(overhead / 3.5);
+        toast('Chat history is large (~' + estTokens + ' tokens). File context will be minimal. Start a new chat for full folder review.', 'info');
+    }
+
+    var budget = Math.max(4000, maxChars - overhead);
 
     var tree = getTree();
     var readableFiles = tree.filter(function(f) { return f.hasContent; });
@@ -181,9 +189,8 @@ export function getFileContext() {
         used += content.length + blockOverhead;
     }
 
-    // Only nag about truncation if it ACTUALLY happens (which it won't on free models now)
     if (truncated > 0) {
-        toast('Context filled — ' + (readableFiles.length - truncated) + '/' + readableFiles.length + ' files included. Switch to a larger model for full access.', 'info');
+        toast('Context filled — ' + (readableFiles.length - truncated) + '/' + readableFiles.length + ' files included. Increase Context Budget in Settings if you have credits.', 'info');
     }
 
     return ctx;
@@ -219,10 +226,8 @@ export function getTree() {
     });
 }
 
-/* ── Check if connected ── */
 export function isConnected() { return !!dirHandle; }
 
-/* ── Refresh folder ── */
 export async function refreshFolder() {
     if (!dirHandle) return;
     fileMap.clear();
@@ -332,15 +337,12 @@ export async function applyFileChange(btn) {
     var block = btn.closest('.file-block');
     var filePath = block.dataset.filePath;
     var code = block.querySelector('code').textContent;
-    
-    // SAFETY CHECK: Compare new code size to original file size
+
     var originalInfo = fileMap.get(filePath);
     if (originalInfo && originalInfo.content !== null) {
         var originalLines = originalInfo.content.split('\n').length;
         var newLines = code.split('\n').length;
-        
-        // If the original was substantial (over 20 lines) and the new code is less than 30% of the size,
-        // the AI definitely omitted code. Block the apply to save the user's file.
+
         if (originalLines > 20 && newLines < (originalLines * 0.3)) {
             toast('⛔ SAFETY BLOCK: Original file is ' + originalLines + ' lines, but AI output is only ' + newLines + ' lines. The AI omitted code. Apply cancelled to prevent data loss.', 'error');
             btn.innerHTML = '<i class="fas fa-ban"></i> Blocked (Incomplete)';

@@ -4,9 +4,21 @@
 import { state, voiceState } from './state.js';
 import { PROVIDER_DEFAULTS } from './config.js';
 
+/* ── Safe text setter — never crashes on missing elements ── */
+function safeText(id, value) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = value;
+}
+
+function safeVal(id, value) {
+    var el = document.getElementById(id);
+    if (el) el.value = value;
+}
+
 export function toast(message, type) {
     type = type || 'info';
     var container = document.getElementById('toast-container');
+    if (!container) return;
     var t = document.createElement('div');
     t.className = 'toast ' + type;
     var icons = { success: 'fa-check-circle', error: 'fa-exclamation-circle', info: 'fa-info-circle' };
@@ -22,16 +34,17 @@ export function getTimeStr() {
 export function setConnectionStatus(status, text) {
     var el = document.getElementById('conn-status');
     var txt = document.getElementById('conn-text');
-    el.className = 'conn-status ' + status;
-    txt.textContent = text;
+    if (el) el.className = 'conn-status ' + status;
+    if (txt) txt.textContent = text;
 }
 
 export function scrollToBottom() {
     var msgs = document.getElementById('messages');
-    requestAnimationFrame(function() { msgs.scrollTop = msgs.scrollHeight; });
+    if (msgs) requestAnimationFrame(function() { msgs.scrollTop = msgs.scrollHeight; });
 }
 
 export function highlightCodeBlocks(container) {
+    if (!container) return;
     container.querySelectorAll('pre code').forEach(function(block) {
         if (!block.classList.contains('prism-highlighted')) {
             Prism.highlightElement(block);
@@ -41,15 +54,18 @@ export function highlightCodeBlocks(container) {
 }
 
 export function autoResize(ta) {
+    if (!ta) return;
     ta.style.height = 'auto';
     ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
 }
 
 export function openModal(id) {
-    document.getElementById(id).classList.add('active');
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.classList.add('active');
     if (id === 'settings-modal') populateSettingsUI();
     if (id === 'prompt-modal') {
-        document.getElementById('s-prompt').value = state.settings.systemPrompt;
+        safeVal('s-prompt', state.settings.systemPrompt);
         document.querySelectorAll('.preset-chip').forEach(function(c) {
             c.classList.toggle('active', c.dataset.preset === state.currentMode);
         });
@@ -57,7 +73,8 @@ export function openModal(id) {
 }
 
 export function closeModal(id) {
-    document.getElementById(id).classList.remove('active');
+    var el = document.getElementById(id);
+    if (el) el.classList.remove('active');
 }
 
 export function bindQuickActions() {
@@ -68,31 +85,213 @@ export function bindQuickActions() {
     });
 }
 
+/* ═══════════════════════════════════════
+   FORMAT HELPERS
+   ═══════════════════════════════════════ */
+function fmtBudgetChars(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return Math.round(n / 1000) + 'K';
+    return n.toString();
+}
+
+function fmtBudgetTokens(chars) {
+    var tokens = Math.round(chars / 3.5);
+    if (tokens >= 1000) return Math.round(tokens / 1000) + 'K tokens';
+    return tokens + ' tokens';
+}
+
+/* ═══════════════════════════════════════
+   INJECT CONTEXT BUDGET UI
+   ═══════════════════════════════════════ */
+function injectContextBudgetUI() {
+    if (document.getElementById('context-budget-row')) return;
+
+    var tokensRow = document.getElementById('q-tokens');
+    if (!tokensRow) return;
+    var parentRow = tokensRow.closest('.setting-row');
+    if (!parentRow) return;
+
+    var wrapper = document.createElement('div');
+    wrapper.className = 'setting-row';
+    wrapper.id = 'context-budget-row';
+    wrapper.innerHTML =
+        '<label class="setting-label">' +
+        'Context Budget' +
+        '<span style="display:block;color:var(--text-muted);font-size:0.6rem;margin-top:1px">Max file context sent per request (input tokens)</span>' +
+        '</label>' +
+        '<div style="width:100%">' +
+        '<div style="display:flex;align-items:center;gap:8px">' +
+        '<input type="range" id="q-context-budget" min="10000" max="500000" step="5000" value="60000" style="flex:1">' +
+        '<span id="q-context-budget-val" style="min-width:90px;text-align:right;font-size:0.8rem;color:var(--accent);font-weight:600;white-space:nowrap">60K chars</span>' +
+        '</div>' +
+        '<div id="q-context-budget-tokens" style="font-size:0.6rem;color:var(--text-muted);margin-top:1px">~17K tokens</div>' +
+        '<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">' +
+        '<button type="button" class="ctx-preset-btn" data-val="30000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">Ultra Safe</button>' +
+        '<button type="button" class="ctx-preset-btn" data-val="60000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--accent);background:rgba(0,212,170,0.1);color:var(--accent);cursor:pointer;transition:all 0.15s;font-weight:600">Free Tier</button>' +
+        '<button type="button" class="ctx-preset-btn" data-val="120000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">Standard</button>' +
+        '<button type="button" class="ctx-preset-btn" data-val="250000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">Large Folder</button>' +
+        '<button type="button" class="ctx-preset-btn" data-val="500000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">Maximum</button>' +
+        '</div>' +
+        '<div style="font-size:0.58rem;color:var(--text-muted);margin-top:4px;line-height:1.4">' +
+        'Free tier on OpenRouter typically allows ~30K input tokens. "Free Tier" preset (60K chars ≈ 17K tokens) leaves room for system prompt + chat history. Increase only if you have credits.' +
+        '</div>' +
+        '</div>';
+
+    parentRow.parentNode.insertBefore(wrapper, parentRow.nextSibling);
+
+    var slider = document.getElementById('q-context-budget');
+    var valEl = document.getElementById('q-context-budget-val');
+    var tokEl = document.getElementById('q-context-budget-tokens');
+
+    slider.addEventListener('input', function() {
+        var v = parseInt(this.value);
+        if (valEl) valEl.textContent = fmtBudgetChars(v) + ' chars';
+        if (tokEl) tokEl.textContent = '~' + fmtBudgetTokens(v);
+        highlightActivePreset(v);
+    });
+
+    wrapper.querySelectorAll('.ctx-preset-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            var v = parseInt(this.dataset.val);
+            if (slider) slider.value = v;
+            if (valEl) valEl.textContent = fmtBudgetChars(v) + ' chars';
+            if (tokEl) tokEl.textContent = '~' + fmtBudgetTokens(v);
+            highlightActivePreset(v);
+        });
+    });
+}
+
+function highlightActivePreset(val) {
+    document.querySelectorAll('.ctx-preset-btn').forEach(function(btn) {
+        var bv = parseInt(btn.dataset.val);
+        if (bv === val) {
+            btn.style.borderColor = 'var(--accent)';
+            btn.style.background = 'rgba(0,212,170,0.1)';
+            btn.style.color = 'var(--accent)';
+            btn.style.fontWeight = '600';
+        } else {
+            btn.style.borderColor = 'var(--border)';
+            btn.style.background = 'transparent';
+            btn.style.color = 'var(--text-muted)';
+            btn.style.fontWeight = '400';
+        }
+    });
+}
+
+/* ═══════════════════════════════════════
+   INJECT MAX TOKENS PRESETS
+   ═══════════════════════════════════════ */
+function injectMaxTokensPresets() {
+    if (document.getElementById('max-tokens-presets')) return;
+
+    var tokensRow = document.getElementById('q-tokens');
+    if (!tokensRow) return;
+    var parentRow = tokensRow.closest('.setting-row');
+    if (!parentRow || parentRow.querySelector('.max-tokens-presets')) return;
+
+    tokensRow.max = '32768';
+    tokensRow.step = '512';
+
+    var presetWrap = document.createElement('div');
+    presetWrap.className = 'max-tokens-presets';
+    presetWrap.id = 'max-tokens-presets';
+    presetWrap.style.cssText = 'display:flex;gap:6px;margin-top:6px;flex-wrap:wrap';
+    presetWrap.innerHTML =
+        '<button type="button" class="mtk-preset-btn" data-val="2048" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">2K</button>' +
+        '<button type="button" class="mtk-preset-btn" data-val="4096" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--accent);background:rgba(0,212,170,0.1);color:var(--accent);cursor:pointer;transition:all 0.15s;font-weight:600">4K</button>' +
+        '<button type="button" class="mtk-preset-btn" data-val="8192" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">8K</button>' +
+        '<button type="button" class="mtk-preset-btn" data-val="16384" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">16K</button>' +
+        '<button type="button" class="mtk-preset-btn" data-val="32768" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">32K</button>';
+
+    parentRow.appendChild(presetWrap);
+
+    presetWrap.querySelectorAll('.mtk-preset-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            var v = parseInt(this.dataset.val);
+            tokensRow.value = v;
+            /* Was crashing here — q-tokens-val may not exist in HTML */
+            safeText('q-tokens-val', v);
+            highlightMtkPreset(v);
+        });
+    });
+
+    tokensRow.addEventListener('input', function() {
+        highlightMtkPreset(parseInt(this.value));
+    });
+}
+
+function highlightMtkPreset(val) {
+    document.querySelectorAll('.mtk-preset-btn').forEach(function(btn) {
+        var bv = parseInt(btn.dataset.val);
+        if (bv === val) {
+            btn.style.borderColor = 'var(--accent)';
+            btn.style.background = 'rgba(0,212,170,0.1)';
+            btn.style.color = 'var(--accent)';
+            btn.style.fontWeight = '600';
+        } else {
+            btn.style.borderColor = 'var(--border)';
+            btn.style.background = 'transparent';
+            btn.style.color = 'var(--text-muted)';
+            btn.style.fontWeight = '400';
+        }
+    });
+}
+
+/* ═══════════════════════════════════════
+   POPULATE SETTINGS
+   ═══════════════════════════════════════ */
 export function populateSettingsUI() {
-    document.getElementById('s-provider').value = state.settings.provider;
-    document.getElementById('s-endpoint').value = state.settings.endpoint;
-    document.getElementById('s-apikey').value = state.settings.apiKey;
-    document.getElementById('s-model').value = state.settings.model;
-    document.getElementById('q-temp').value = state.settings.temperature;
-    document.getElementById('q-temp-val').textContent = state.settings.temperature;
-    document.getElementById('q-tokens').value = state.settings.maxTokens;
-    document.getElementById('s-prompt').value = state.settings.systemPrompt;
-    document.getElementById('q-voice-lang').value = voiceState.lang;
-    document.getElementById('q-voice-rate').value = voiceState.rate;
-    document.getElementById('q-voice-rate-val').textContent = voiceState.rate.toFixed(1);
+    injectContextBudgetUI();
+    injectMaxTokensPresets();
+
+    safeVal('s-provider', state.settings.provider);
+    safeVal('s-endpoint', state.settings.endpoint);
+    safeVal('s-apikey', state.settings.apiKey);
+    safeVal('s-model', state.settings.model);
+    safeVal('q-temp', state.settings.temperature);
+    safeText('q-temp-val', state.settings.temperature);
+    safeVal('q-tokens', state.settings.maxTokens);
+    /* BUG FIX: was writing temperature here instead of maxTokens */
+    safeText('q-tokens-val', state.settings.maxTokens);
+    safeVal('s-prompt', state.settings.systemPrompt);
+    safeVal('q-voice-lang', voiceState.lang);
+    safeVal('q-voice-rate', voiceState.rate);
+    safeText('q-voice-rate-val', voiceState.rate.toFixed(1));
+
+    /* Context budget slider */
+    var ctxSlider = document.getElementById('q-context-budget');
+    if (ctxSlider) {
+        var cb = state.settings.contextBudget || 60000;
+        ctxSlider.value = cb;
+        safeText('q-context-budget-val', fmtBudgetChars(cb) + ' chars');
+        safeText('q-context-budget-tokens', '~' + fmtBudgetTokens(cb));
+        highlightActivePreset(cb);
+    }
+
+    highlightMtkPreset(state.settings.maxTokens || 4096);
+
     updateProviderHint();
 }
 
 export function updateProviderHint() {
-    var provider = document.getElementById('s-provider').value;
+    var providerEl = document.getElementById('s-provider');
+    if (!providerEl) return;
+    var provider = providerEl.value;
     var defaults = PROVIDER_DEFAULTS[provider];
-    document.getElementById('s-provider-hint').textContent = defaults.hint;
-    document.getElementById('s-apikey').placeholder = defaults.keyPlaceholder;
-    document.getElementById('s-key-hint').textContent = defaults.keyHint;
-    var currentEndpoint = document.getElementById('s-endpoint').value;
+    if (!defaults) return;
+
+    safeText('s-provider-hint', defaults.hint);
+
+    var keyEl = document.getElementById('s-apikey');
+    if (keyEl) keyEl.placeholder = defaults.keyPlaceholder;
+
+    safeText('s-key-hint', defaults.keyHint);
+
+    var currentEndpoint = document.getElementById('s-endpoint');
+    if (!currentEndpoint) return;
     var allDefaults = Object.values(PROVIDER_DEFAULTS).map(function(d) { return d.endpoint; });
-    if (!currentEndpoint || allDefaults.indexOf(currentEndpoint) === -1) {
-        document.getElementById('s-endpoint').value = defaults.endpoint;
+    if (!currentEndpoint.value || allDefaults.indexOf(currentEndpoint.value) === -1) {
+        currentEndpoint.value = defaults.endpoint;
     }
 }
 
@@ -182,54 +381,54 @@ export function renderMultiAgentSettings() {
         '<input type="number" class="setting-input" id="ma-max-rejections" value="' + (state.settings.maxCriticRejections || 2) + '" min="1" max="3">' +
         '</div>';
 
-    /* Bind all events */
-    document.getElementById('ma-enabled').addEventListener('change', function(e) {
+    var maEnabled = document.getElementById('ma-enabled');
+    if (maEnabled) maEnabled.addEventListener('change', function(e) {
         state.settings.multiAgentEnabled = e.target.checked;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
-
-    document.getElementById('ma-planner-model').addEventListener('change', function(e) {
+    var maPlanner = document.getElementById('ma-planner-model');
+    if (maPlanner) maPlanner.addEventListener('change', function(e) {
         if (!state.settings.agentModels) state.settings.agentModels = {};
         state.settings.agentModels.planner = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
-
-    document.getElementById('ma-coder-model').addEventListener('change', function(e) {
+    var maCoder = document.getElementById('ma-coder-model');
+    if (maCoder) maCoder.addEventListener('change', function(e) {
         if (!state.settings.agentModels) state.settings.agentModels = {};
         state.settings.agentModels.coder = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
-
-    document.getElementById('ma-coder-fallback-model').addEventListener('change', function(e) {
+    var maCoderFb = document.getElementById('ma-coder-fallback-model');
+    if (maCoderFb) maCoderFb.addEventListener('change', function(e) {
         if (!state.settings.agentModels) state.settings.agentModels = {};
         state.settings.agentModels.coderFallback = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
-
-    document.getElementById('ma-critic-model').addEventListener('change', function(e) {
+    var maCritic = document.getElementById('ma-critic-model');
+    if (maCritic) maCritic.addEventListener('change', function(e) {
         if (!state.settings.agentModels) state.settings.agentModels = {};
         state.settings.agentModels.critic = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
-
-    document.getElementById('ma-critic-fallback-model').addEventListener('change', function(e) {
+    var maCriticFb = document.getElementById('ma-critic-fallback-model');
+    if (maCriticFb) maCriticFb.addEventListener('change', function(e) {
         if (!state.settings.agentModels) state.settings.agentModels = {};
         state.settings.agentModels.criticFallback = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
-
-    document.getElementById('ma-tester-model').addEventListener('change', function(e) {
+    var maTester = document.getElementById('ma-tester-model');
+    if (maTester) maTester.addEventListener('change', function(e) {
         if (!state.settings.agentModels) state.settings.agentModels = {};
         state.settings.agentModels.tester = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
-
-    document.getElementById('ma-max-attempts').addEventListener('change', function(e) {
+    var maAttempts = document.getElementById('ma-max-attempts');
+    if (maAttempts) maAttempts.addEventListener('change', function(e) {
         state.settings.maxCoderAttempts = parseInt(e.target.value) || 3;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
-
-    document.getElementById('ma-max-rejections').addEventListener('change', function(e) {
+    var maRejections = document.getElementById('ma-max-rejections');
+    if (maRejections) maRejections.addEventListener('change', function(e) {
         state.settings.maxCriticRejections = parseInt(e.target.value) || 2;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });

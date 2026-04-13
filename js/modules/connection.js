@@ -1,7 +1,6 @@
 /* ═══════════════════════════════════════
    CONNECTION — LLM API calls, streaming
-   Handles both regular and reasoning models
-   Enhanced: request timeout, rate limit detection, error classification
+   Hard token cap prevents 402 on free tier
    ═══════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { FILE_SYSTEM_INSTRUCTIONS } from './config.js';
@@ -15,6 +14,27 @@ import { setConnectionStatus, toast } from './ui.js';
 /* ── Timeout constants ── */
 var FETCH_TIMEOUT = 110000;
 var STREAM_STALL_TIMEOUT = 60000;
+
+/* ── Hard limits — nothing outside this range ever leaves this file ── */
+var MIN_MAX_TOKENS = 256;
+var MAX_MAX_TOKENS = 32768;
+var DEFAULT_MAX_TOKENS = 4096;
+
+/* ═══════════════════════════════════════
+   TOKEN ESTIMATOR — chars → tokens (safe)
+   1 token ≈ 3.5 chars for English/code
+   ═══════════════════════════════════════ */
+function estimateTokens(text) {
+    if (!text) return 0;
+    return Math.ceil(text.length / 3.5);
+}
+
+/* ── Clamp helper — used everywhere maxTokens is read ── */
+function clampMaxTokens(val) {
+    if (typeof val !== 'number' || isNaN(val) || val < MIN_MAX_TOKENS) return DEFAULT_MAX_TOKENS;
+    if (val > MAX_MAX_TOKENS) return MAX_MAX_TOKENS;
+    return val;
+}
 
 export function getApiUrl() {
     var endpoint = state.settings.endpoint.replace(/\/+$/, '');
@@ -31,7 +51,7 @@ export function isOllamaProvider() {
 export function buildPayload(messages, overrideModel) {
     var model = overrideModel || state.settings.model || 'gpt-3.5-turbo';
     var temperature = state.settings.temperature;
-    var maxTokens = state.settings.maxTokens;
+    var maxTokens = clampMaxTokens(state.settings.maxTokens);
 
     if (isOllamaProvider()) {
         return { model: model, messages: messages, stream: true, options: { temperature: temperature, num_predict: maxTokens } };
@@ -58,6 +78,102 @@ export function buildHeaders() {
     return h;
 }
 
+/* ═══════════════════════════════════════
+   SAFE CONTEXT BUILDER
+   Three-stage token reduction:
+   1. Skip file context for trivial messages
+   2. If over budget, strip file context
+   3. If still over, truncate history
+   ═══════════════════════════════════════ */
+function isTrivialMessage(text) {
+    var t = text.trim().toLowerCase();
+    var trivial = [
+        'hi', 'hello', 'hey', 'hola', 'yo', 'sup', 'howdy',
+        'thanks', 'thank you', 'thx', 'ty', 'cheers',
+        'ok', 'okay', 'sure', 'yeah', 'yep', 'yes',
+        'bye', 'goodbye', 'see ya', 'later', 'cya',
+        'lol', 'lmao', 'haha', 'nice', 'cool', 'great',
+        'what can you do', 'who are you', 'help'
+    ];
+    for (var i = 0; i < trivial.length; i++) {
+        if (t === trivial[i]) return true;
+    }
+    if (t.length < 15 && t.indexOf('fix') === -1 && t.indexOf('bug') === -1 &&
+        t.indexOf('error') === -1 && t.indexOf('code') === -1 && t.indexOf('file') === -1 &&
+        t.indexOf('function') === -1 && t.indexOf('class') === -1 && t.indexOf('```') === -1) {
+        return true;
+    }
+    return false;
+}
+
+function buildSafeSystemPrompt(userText) {
+    var sys = state.settings.systemPrompt;
+    var ctx = document.getElementById('project-context').value.trim();
+    if (ctx) sys += '\n\n--- PROJECT CONTEXT ---\n' + ctx + '\n--- END CONTEXT ---';
+
+    if (isTrivialMessage(userText)) {
+        console.log('[Connection] Trivial message detected — skipping file context');
+        return sys;
+    }
+
+    var fileCtx = getFileContext();
+    if (fileCtx) sys += '\n\n' + FILE_SYSTEM_INSTRUCTIONS + '\n\n' + fileCtx;
+
+    return sys;
+}
+
+function buildSafeMessages(userText, systemPrompt) {
+    var sysTokens = estimateTokens(systemPrompt);
+    var maxInputTokens = estimateTokens(state.settings.contextBudget || 60000);
+    var safeLimit = Math.floor(maxInputTokens * 0.8);
+
+    var stripped = false;
+    if (sysTokens > safeLimit) {
+        console.warn('[Connection] System prompt (' + sysTokens + ' tokens) exceeds safe limit (' + safeLimit + '). Stripping file context.');
+
+        var sys = state.settings.systemPrompt;
+        var ctx = document.getElementById('project-context').value.trim();
+        if (ctx) sys += '\n\n--- PROJECT CONTEXT ---\n' + ctx + '\n--- END CONTEXT ---';
+
+        var strippedTokens = estimateTokens(sys);
+        if (strippedTokens <= safeLimit) {
+            systemPrompt = sys;
+            sysTokens = strippedTokens;
+            stripped = true;
+            toast('File context stripped — too large for your budget. Increase Context Budget in Settings or start a new chat.', 'info');
+        } else {
+            systemPrompt = state.settings.systemPrompt;
+            sysTokens = estimateTokens(systemPrompt);
+            if (sysTokens > safeLimit) {
+                var maxSysChars = Math.floor(safeLimit * 3.5);
+                systemPrompt = systemPrompt.substring(0, maxSysChars) + '\n\n[System prompt truncated to fit token budget]';
+                sysTokens = safeLimit;
+                toast('System prompt truncated to fit budget.', 'error');
+            }
+            stripped = true;
+        }
+    }
+
+    var remainingTokens = safeLimit - sysTokens;
+    var historySlice = [];
+
+    for (var i = state.conversationHistory.length - 1; i >= 0; i--) {
+        var msgTokens = estimateTokens(state.conversationHistory[i].content);
+        if (historySlice.length > 0 && (remainingTokens - msgTokens) < 500) {
+            break;
+        }
+        historySlice.unshift(state.conversationHistory[i]);
+        remainingTokens -= msgTokens;
+    }
+
+    var trimmedCount = state.conversationHistory.length - historySlice.length;
+    if (trimmedCount > 0) {
+        console.log('[Connection] Trimmed ' + trimmedCount + ' old messages from history to fit budget');
+    }
+
+    return [{ role: 'system', content: systemPrompt }].concat(historySlice);
+}
+
 export async function sendMessage(userText, isAutoContinue) {
     /* ── User clicked STOP while streaming ── */
     if (state.isStreaming && !isAutoContinue) {
@@ -80,13 +196,20 @@ export async function sendMessage(userText, isAutoContinue) {
         state.activeTask.loopCount = 0;
     }
 
-    var sys = state.settings.systemPrompt;
-    var ctx = document.getElementById('project-context').value.trim();
-    if (ctx) sys += '\n\n--- PROJECT CONTEXT ---\n' + ctx + '\n--- END CONTEXT ---';
-    var fileCtx = getFileContext();
-    if (fileCtx) sys += '\n\n' + FILE_SYSTEM_INSTRUCTIONS + '\n\n' + fileCtx;
+    /* ═══════════════════════════════════════
+       SAFE CONTEXT BUILDING — prevents 402
+       ═══════════════════════════════════════ */
+    var systemPrompt = buildSafeSystemPrompt(userText);
+    var messages = buildSafeMessages(userText, systemPrompt);
 
-    var messages = [{ role: 'system', content: sys }].concat(state.conversationHistory.slice(-20));
+    /* Clamp maxTokens for the log too — shows the REAL value being sent */
+    var actualMaxTokens = clampMaxTokens(state.settings.maxTokens);
+
+    var totalEstTokens = 0;
+    for (var m = 0; m < messages.length; m++) {
+        totalEstTokens += estimateTokens(messages[m].content);
+    }
+    console.log('[Connection] Sending ~' + totalEstTokens + ' input tokens + ' + actualMaxTokens + ' max output tokens');
 
     state.isStreaming = true;
     state.abortController = new AbortController();
@@ -115,7 +238,6 @@ export async function sendMessage(userText, isAutoContinue) {
     var lastChunkTime = Date.now();
     var finishReason = null;
     var firstTokenReceived = false;
-
     var abortSource = null;
 
     var thinkStartTime = Date.now();
@@ -573,7 +695,6 @@ async function fetchOpenRouterModels() {
             }
         }
 
-        /* Only models confirmed to exist on OpenRouter */
         var topTierIds = [
             'stepfun/step-3.5-flash', 'z-ai/glm-5-turbo', 'xiaomi/mimo-v2-pro',
             'minimax/minimax-m2.7', 'minimax/minimax-m2.5',

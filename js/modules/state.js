@@ -10,7 +10,7 @@ export const state = {
     streamElement: null,
     streamBuffer: '',
     streamRenderTimeout: null,
-    isRenderScheduled: false, // Required for ultra-fast streaming
+    isRenderScheduled: false,
     sidebarOpen: false,
     currentChatId: null,
     abortController: null,
@@ -22,17 +22,17 @@ export const state = {
         model: '',
         temperature: 0.7,
         maxTokens: 4096,
+        contextBudget: 60000,
         systemPrompt: '',
     },
 
     modelContextLimits: {},
 
-    // Agentic Task Loop Control & Resume State
     activeTask: {
         isRunning: false,
         loopCount: 0,
-        maxLoops: 10, // Hard limit to prevent infinite loops
-        pendingIntegrations: [] // Tracks files the AI still needs to connect
+        maxLoops: 10,
+        pendingIntegrations: []
     }
 };
 

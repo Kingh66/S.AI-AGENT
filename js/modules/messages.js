@@ -7,10 +7,10 @@ import { parseMarkdown } from './markdown.js';
 import { highlightCodeBlocks, getTimeStr } from './ui.js';
 
 /* ── Fast-stream state ── */
-let backtickCount = 0;       // O(1) code block tracking — no regex on full buffer
-let streamPre = null;        // Cached <pre> element for ultra-fast code dump
-let renderTimer = null;      // Throttled render timer
-const RENDER_THROTTLE = 25;  // ms between renders (was ~16ms via rAF, now batched)
+let backtickCount = 0;
+let streamPre = null;
+let renderTimer = null;
+const RENDER_THROTTLE = 25;
 let lastRenderTime = 0;
 
 export function removeWelcome() {
@@ -39,9 +39,10 @@ export function addBotMessageStart() {
     const div = document.createElement('div');
     div.className = 'message bot';
     div.id = 'streaming-msg';
-    const content = document.createElement('div');
-    content.className = 'msg-content streaming-active';
-    content.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+
+    /* Build the COMPLETE structure in one innerHTML call —
+       no create-then-replace-then-reappend pattern that can
+       orphan the content element and corrupt its state. */
     div.innerHTML =
         '<div class="msg-avatar">S</div>' +
         '<div class="msg-body">' +
@@ -49,11 +50,16 @@ export function addBotMessageStart() {
         '<span class="msg-name">S.ai</span>' +
         '<span class="msg-time">' + getTimeStr() + '</span>' +
         '<button class="speak-btn" onclick="speakLastResponse()" title="Read aloud"><i class="fas fa-volume-high"></i> Speak</button>' +
-        '</div></div>';
-    div.querySelector('.msg-body').appendChild(content);
+        '</div>' +
+        '<div class="msg-content streaming-active">' +
+        '<div class="typing-indicator"><span></span><span></span><span></span></div>' +
+        '</div>' +
+        '</div>';
+
     msgs.appendChild(div);
-    fastScroll();
-    state.streamElement = content;
+
+    /* Grab the reference AFTER the DOM is built — guaranteed intact */
+    state.streamElement = div.querySelector('.msg-content');
     state.streamBuffer = '';
     state.isRenderScheduled = false;
 
@@ -62,16 +68,23 @@ export function addBotMessageStart() {
     streamPre = null;
     lastRenderTime = 0;
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+
+    fastScroll();
 }
 
 export function appendStreamChunk(chunk) {
+    /* Defensive: ensure chunk is a string, strip any null/BOM bytes
+       that some models sneak in as the first character */
+    if (typeof chunk !== 'string') chunk = String(chunk);
+    chunk = chunk.replace(/^\u0000+/, '').replace(/^\uFEFF/, '');
+
     state.streamBuffer += chunk;
 
     /* ⚡ Count triple-backticks in THIS chunk only — O(len(chunk)) not O(total) */
     for (let i = 0; i < chunk.length - 2; i++) {
         if (chunk[i] === '`' && chunk[i + 1] === '`' && chunk[i + 2] === '`') {
             backtickCount++;
-            i += 2; // skip the other two backticks
+            i += 2;
         }
     }
     var inCode = (backtickCount % 2 !== 0);
@@ -93,50 +106,37 @@ export function appendStreamChunk(chunk) {
             if (inCode) {
                 /* ⚡ ULTRA-FAST PATH: Raw native text dump. Zero JS parsing. */
                 if (!streamPre) {
-                    state.streamElement.innerHTML = '';
                     streamPre = document.createElement('pre');
                     streamPre.className = 'streaming-code-pre';
-                    streamPre.textContent = state.streamBuffer;
+                    state.streamElement.innerHTML = '';
                     state.streamElement.appendChild(streamPre);
-                } else {
-                    streamPre.textContent = state.streamBuffer;
                 }
+                streamPre.textContent = state.streamBuffer;
             } else {
-                /* 🚀 FAST PATH: Lightweight streaming parser — skips code blocks,
-                   lists, blockquotes, links. 10x faster than full parseMarkdown(). */
+                /* 🚀 FAST PATH: Lightweight streaming parser */
                 streamPre = null;
                 state.streamElement.innerHTML = parseMarkdownStreaming(state.streamBuffer);
             }
 
-            /* Streaming cursor — visual proof the agent is still working */
+            /* Streaming cursor */
             appendCursor(state.streamElement);
             fastScroll();
         }, delay);
     }
 }
 
-/* ── Lightweight markdown parser for LIVE streaming ──
-   Handles only inline formatting + headers. Code blocks are handled by the
-   ultra-fast raw dump path above, so we never need to parse them here.
-   Lists, blockquotes, and links are deferred to the final full parse. ── */
+/* ── Lightweight markdown parser for LIVE streaming ── */
 function parseMarkdownStreaming(text) {
     var html = escapeHtml(text);
-    /* Inline code */
     html = html.replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>');
-    /* Bold + italic */
     html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
-    /* Bold */
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    /* Italic */
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-    /* Headers */
     html = html.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
     html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
     html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
     html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-    /* Horizontal rule */
     html = html.replace(/^---+$/gm, '<hr>');
-    /* Line breaks */
     html = html.replace(/\n/g, '<br>');
     return html;
 }
@@ -158,11 +158,9 @@ function removeCursor(container) {
 
 /* ── Finalize: full parse + syntax highlight ── */
 export function finalizeStream() {
-    /* Cancel any pending throttled render */
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
     state.isRenderScheduled = false;
 
-    /* Reset fast-stream state */
     backtickCount = 0;
     streamPre = null;
 
@@ -170,19 +168,18 @@ export function finalizeStream() {
         removeCursor(state.streamElement);
         state.streamElement.classList.remove('streaming-active');
 
-        /* Final render: full markdown + real Prism syntax highlighting */
-        state.streamElement.innerHTML = parseMarkdown(state.streamBuffer);
+        /* Strip any leading garbage before the final parse */
+        var clean = state.streamBuffer.replace(/^\u0000+/, '').replace(/^\uFEFF/, '');
+        state.streamElement.innerHTML = parseMarkdown(clean);
         highlightCodeBlocks(state.streamElement);
-        state.conversationHistory.push({ role: 'assistant', content: state.streamBuffer });
+        state.conversationHistory.push({ role: 'assistant', content: clean });
 
-        /* Voice chat: speak the response then resume listening */
         if (voiceState.isVoiceChat) {
-            var resp = state.streamBuffer;
             import('./voice.js').then(function (m) {
                 m.stopListening();
                 voiceState.mode = 'speaking';
                 m.setVoiceMode('speaking');
-                m.speakText(resp, function () {
+                m.speakText(clean, function () {
                     if (voiceState.isVoiceChat && !state.isStreaming) {
                         setTimeout(function () { m.startListening(); }, 1500);
                     }
@@ -195,12 +192,6 @@ export function finalizeStream() {
         fastScroll();
     }
 
-    /* ═══════════════════════════════════════════════════════
-       KEY FIX: Only reset the button when NO task is running.
-       During auto-continue loops the task stays "running" and
-       the button stays on stop. It resets ONLY when the task
-       truly completes (else branch in connection.js).
-       ═══════════════════════════════════════════════════════ */
     if (!state.activeTask.isRunning) {
         state.isStreaming = false;
         updateSendButton();
