@@ -1,6 +1,7 @@
 /* ═══════════════════════════════════════
    CONNECTION — LLM API calls, streaming
    Handles both regular and reasoning models
+   Enhanced: request timeout, rate limit detection, error classification
    ═══════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { FILE_SYSTEM_INSTRUCTIONS } from './config.js';
@@ -10,6 +11,10 @@ import {
     appendStreamChunk, finalizeStream, updateSendButton
 } from './messages.js';
 import { setConnectionStatus, toast } from './ui.js';
+
+/* ── Timeout constants ── */
+var FETCH_TIMEOUT = 110000;
+var STREAM_STALL_TIMEOUT = 60000;
 
 export function getApiUrl() {
     var endpoint = state.settings.endpoint.replace(/\/+$/, '');
@@ -23,8 +28,8 @@ export function isOllamaProvider() {
     return state.settings.provider === 'ollama';
 }
 
-export function buildPayload(messages) {
-    var model = state.settings.model || 'gpt-3.5-turbo';
+export function buildPayload(messages, overrideModel) {
+    var model = overrideModel || state.settings.model || 'gpt-3.5-turbo';
     var temperature = state.settings.temperature;
     var maxTokens = state.settings.maxTokens;
 
@@ -34,11 +39,10 @@ export function buildPayload(messages) {
 
     var isReasoning = model.indexOf('deepseek-r1') > -1 || model.indexOf('qwq') > -1 || model.indexOf('o1') > -1 || model.indexOf('reasoner') > -1;
 
-    // Force massive output limit for OpenRouter top tier models if user left it at default 4096
     var baseModel = model.replace(':free', '');
     if (state.settings.provider === 'openrouter' && maxTokens <= 4096) {
-        if (baseModel.indexOf('step-3.5') > -1 || baseModel.indexOf('mimo') > -1 || baseModel.indexOf('minimax') > -1 || baseModel.indexOf('hunter-alpha') > -1 || baseModel.indexOf('glm-5') > -1 || baseModel.indexOf('qwen') > -1 || baseModel.indexOf('nemotron') > -1) {
-            maxTokens = 16384; // Let these massive models actually output full files
+        if (baseModel.indexOf('step-3.5') > -1 || baseModel.indexOf('mimo') > -1 || baseModel.indexOf('minimax') > -1 || baseModel.indexOf('glm-5') > -1 || baseModel.indexOf('nemotron') > -1) {
+            maxTokens = 16384;
         }
     }
 
@@ -62,14 +66,15 @@ export function buildHeaders() {
 }
 
 export async function sendMessage(userText, isAutoContinue) {
-    if (state.isStreaming) {
+    /* ── User clicked STOP while streaming ── */
+    if (state.isStreaming && !isAutoContinue) {
         if (state.abortController) state.abortController.abort();
         state.abortController = null;
-        finalizeStream();
+        state.activeTask.isRunning = false;
+        state.activeTask.loopCount = 0;
         return;
     }
-    
-    // Skip UI/API checks for silent auto-continues
+
     if (!isAutoContinue) {
         if (!userText.trim()) return;
         if (!state.settings.apiKey) { toast('No API key set. Open Settings.', 'error'); return; }
@@ -77,8 +82,7 @@ export async function sendMessage(userText, isAutoContinue) {
 
         addUserMessage(userText);
         state.conversationHistory.push({ role: 'user', content: userText });
-        
-        // Initialize agentic task loop for new user requests
+
         state.activeTask.isRunning = true;
         state.activeTask.loopCount = 0;
     }
@@ -87,45 +91,69 @@ export async function sendMessage(userText, isAutoContinue) {
     var ctx = document.getElementById('project-context').value.trim();
     if (ctx) sys += '\n\n--- PROJECT CONTEXT ---\n' + ctx + '\n--- END CONTEXT ---';
     var fileCtx = getFileContext();
-    if (fileCtx) sys += '\n\n' + fileCtx + '\n\n' + FILE_SYSTEM_INSTRUCTIONS;
+    if (fileCtx) sys += '\n\n' + FILE_SYSTEM_INSTRUCTIONS + '\n\n' + fileCtx;
 
     var messages = [{ role: 'system', content: sys }].concat(state.conversationHistory.slice(-20));
 
     state.isStreaming = true;
     state.abortController = new AbortController();
     updateSendButton();
-    
+
     if (!isAutoContinue) {
         addBotMessageStart();
     } else {
-        // SEAMLESS CONTINUE: Re-attach to the exact same message bubble so text flows without splitting
         var existingBubble = document.querySelector('.message.bot:last-child .msg-content');
         if (existingBubble) {
             state.streamElement = existingBubble;
-            state.streamBuffer = existingBubble.textContent; // Preserve what was already typed
+            state.streamBuffer = existingBubble.textContent;
         } else {
-            addBotMessageStart(); // Fallback just in case
+            addBotMessageStart();
         }
     }
-    
-    setConnectionStatus('connecting', isAutoContinue ? 'Task loop ' + (state.activeTask.loopCount + 1) + '/' + state.activeTask.maxLoops + '...' : 'Generating...');
+
+    setConnectionStatus('connecting', isAutoContinue ? 'Task loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + '...' : 'Generating...');
 
     if (voiceState.isVoiceChat) {
-        import('./voice.js').then(function(m) { m.setVoiceMode('thinking'); });
+        import('./voice.js').then(function (m) { m.setVoiceMode('thinking'); });
     }
 
     var thinkingContent = '';
     var isThinkingPhase = false;
     var lastChunkTime = Date.now();
-    var INACTIVE_TIMEOUT = 60000;
     var finishReason = null;
+    var firstTokenReceived = false;
 
-    var stallWatchdog = setInterval(function() {
-        if (state.isStreaming && (Date.now() - lastChunkTime > INACTIVE_TIMEOUT)) {
-            console.warn('Stream stalled (no data for 60s). Force-finalizing...');
+    var abortSource = null;
+
+    var thinkStartTime = Date.now();
+    var thinkTimer = setInterval(function () {
+        if (!firstTokenReceived && state.isStreaming) {
+            var elapsed = ((Date.now() - thinkStartTime) / 1000).toFixed(0);
+            setConnectionStatus('connecting', 'Thinking... ' + elapsed + 's');
+        }
+    }, 500);
+
+    var fetchTimeoutId = setTimeout(function () {
+        if (state.isStreaming && state.abortController) {
+            abortSource = 'timeout';
+            console.warn('Fetch timeout (' + FETCH_TIMEOUT + 'ms). Aborting...');
+            state.abortController.abort();
+        }
+    }, FETCH_TIMEOUT);
+
+    var stallWatchdog = setInterval(function () {
+        if (state.isStreaming && firstTokenReceived && (Date.now() - lastChunkTime > STREAM_STALL_TIMEOUT)) {
+            abortSource = 'stall';
+            console.warn('Stream stalled (no data for ' + STREAM_STALL_TIMEOUT / 1000 + 's). Force-finalizing...');
             if (state.abortController) state.abortController.abort();
         }
     }, 5000);
+
+    var originalAbort = state.abortController.abort.bind(state.abortController);
+    state.abortController.abort = function () {
+        if (!abortSource) abortSource = 'user';
+        originalAbort();
+    };
 
     try {
         var res = await fetch(getApiUrl(), {
@@ -135,9 +163,24 @@ export async function sendMessage(userText, isAutoContinue) {
             signal: state.abortController.signal
         });
 
+        clearTimeout(fetchTimeoutId);
+        fetchTimeoutId = null;
+
         if (!res.ok) {
-            var errText = await res.text().catch(function() { return ''; });
-            throw new Error('HTTP ' + res.status + ': ' + errText.substring(0, 300));
+            var errText = await res.text().catch(function () { return ''; });
+            var status = res.status;
+
+            if (status === 429) {
+                throw new Error('RATE_LIMIT:' + errText.substring(0, 300));
+            } else if (status === 401 || status === 403) {
+                throw new Error('AUTH_ERROR:' + status + ': ' + errText.substring(0, 200));
+            } else if (status === 502 || status === 503 || status === 504) {
+                throw new Error('SERVER_OVERLOAD:' + status + ': ' + errText.substring(0, 200));
+            } else if (status >= 500) {
+                throw new Error('SERVER_ERROR:' + status + ': ' + errText.substring(0, 300));
+            } else {
+                throw new Error('HTTP ' + status + ': ' + errText.substring(0, 300));
+            }
         }
 
         var reader = res.body.getReader();
@@ -146,18 +189,29 @@ export async function sendMessage(userText, isAutoContinue) {
         while (true) {
             var result = await reader.read();
             if (result.done) break;
-            
+
+            if (!firstTokenReceived) {
+                firstTokenReceived = true;
+                clearInterval(thinkTimer);
+                thinkTimer = null;
+                if (isAutoContinue) {
+                    setConnectionStatus('connecting', 'Task loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + '...');
+                } else {
+                    setConnectionStatus('connecting', 'Generating...');
+                }
+            }
+
             lastChunkTime = Date.now();
             var chunk = decoder.decode(result.value, { stream: true });
 
             if (isOllamaProvider()) {
-                var lines = chunk.split('\n').filter(function(l) { return l.trim(); });
+                var lines = chunk.split('\n').filter(function (l) { return l.trim(); });
                 for (var i = 0; i < lines.length; i++) {
                     try {
                         var d = JSON.parse(lines[i]);
                         if (d.message && d.message.content) appendStreamChunk(d.message.content);
                         if (d.done) finishReason = 'stop';
-                    } catch(e) {}
+                    } catch (e) { }
                 }
             } else {
                 var sseLines = chunk.split('\n');
@@ -190,7 +244,7 @@ export async function sendMessage(userText, isAutoContinue) {
                             }
                             appendStreamChunk(content);
                         }
-                    } catch(e) {}
+                    } catch (e) { }
                 }
             }
         }
@@ -198,34 +252,36 @@ export async function sendMessage(userText, isAutoContinue) {
         if (isThinkingPhase) closeThinkingBlock();
         finalizeStream();
         clearInterval(stallWatchdog);
+        if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
 
-        // 🧠 ADVANCED AUTO-CONTINUE BRAIN
         var hitLimit = (finishReason === 'length');
-        
-        // Check for secret tag overriding the API finish state
+
         var lastResponse = state.conversationHistory[state.conversationHistory.length - 1];
-        var hasContinueTag = lastResponse && lastResponse.content.includes('<|CONTINUE_TASK|>');
-        
+        var hasContinueTag = lastResponse && lastResponse.content.indexOf('<|CONTINUE_TASK|>') !== -1;
+
         if (hasContinueTag) {
             lastResponse.content = lastResponse.content.replace('<|CONTINUE_TASK|>', '');
-            hitLimit = true; 
+            hitLimit = true;
         }
 
-        if (hitLimit && state.activeTask.loopCount < state.activeTask.maxLoops) {
+        if (state.activeTask.isRunning && hitLimit && state.activeTask.loopCount < state.activeTask.maxLoops) {
             state.activeTask.loopCount++;
             toast('Task loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + '...', 'info');
-            
-            state.conversationHistory.push({ 
-                role: 'user', 
-                content: 'SYSTEM OVERRIDE: Continue your work. If you created new files, you MUST now output the files that import them to complete the integration. Do not repeat finished code.' 
+            setConnectionStatus('connecting', 'Continuing (loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')...');
+
+            state.conversationHistory.push({
+                role: 'user',
+                content: 'SYSTEM OVERRIDE: Continue your work. If you created new files, you MUST now output the files that import them to complete the integration. Do not repeat finished code.'
             });
-            
-            setTimeout(function() { sendMessage('', true); }, 1000);
+
+            setTimeout(function () { sendMessage('', true); }, 1000);
         } else {
-            // TASK RESOLVED: Guarantee state returns to idle
             state.activeTask.isRunning = false;
             state.activeTask.loopCount = 0;
+            state.isStreaming = false;
+            updateSendButton();
             setConnectionStatus('connected', 'Connected — ' + state.settings.model);
+
             if (state.conversationHistory.length > 30) {
                 state.conversationHistory = state.conversationHistory.slice(-20);
             }
@@ -234,45 +290,115 @@ export async function sendMessage(userText, isAutoContinue) {
     } catch (error) {
         closeThinkingBlock();
         clearInterval(stallWatchdog);
-        
-        if (error.name === 'AbortError') { 
-            if (Date.now() - lastChunkTime >= INACTIVE_TIMEOUT - 100) {
-                finalizeStream(); 
-                
-                // Stall fallback also respects task limits and tags
+        if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
+
+        if (error.name === 'AbortError') {
+            finalizeStream();
+
+            if (abortSource === 'timeout') {
+                state.activeTask.isRunning = false;
+                state.activeTask.loopCount = 0;
+                state.isStreaming = false;
+                updateSendButton();
+                toast('Request timed out (' + (FETCH_TIMEOUT / 1000) + 's) — model may be overloaded. Try again or switch models.', 'error');
+                setConnectionStatus('disconnected', 'Timeout');
+
+            } else if (abortSource === 'stall') {
                 var stallLastResponse = state.conversationHistory[state.conversationHistory.length - 1];
-                var stallTag = stallLastResponse && stallLastResponse.content.includes('<|CONTINUE_TASK|>');
+                var stallTag = stallLastResponse && stallLastResponse.content.indexOf('<|CONTINUE_TASK|>') !== -1;
                 if (stallTag) stallLastResponse.content = stallLastResponse.content.replace('<|CONTINUE_TASK|>', '');
 
-                if ((finishReason === 'length' || stallTag) && state.activeTask.loopCount < state.activeTask.maxLoops) {
+                if (state.activeTask.isRunning && (finishReason === 'length' || stallTag) && state.activeTask.loopCount < state.activeTask.maxLoops) {
                     state.activeTask.loopCount++;
-                    toast('Model stalled. Auto-continuing (' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')...', 'error'); 
-                    state.conversationHistory.push({ role: 'user', content: 'SYSTEM OVERRIDE: Continue your work. If you created new files, you MUST now output the files that import them to complete the integration. Do not repeat finished code.' });
-                    setTimeout(function() { sendMessage('', true); }, 1500);
+                    toast('Stream stalled. Auto-continuing (' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')...', 'error');
+                    setConnectionStatus('connecting', 'Stall recovery (loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')...');
+
+                    state.conversationHistory.push({
+                        role: 'user',
+                        content: 'SYSTEM OVERRIDE: Continue your work. If you created new files, you MUST now output the files that import them to complete the integration. Do not repeat finished code.'
+                    });
+                    setTimeout(function () { sendMessage('', true); }, 1500);
                 } else {
                     state.activeTask.isRunning = false;
                     state.activeTask.loopCount = 0;
-                    toast('Task stopped or completed.', 'info');
+                    state.isStreaming = false;
+                    updateSendButton();
+                    toast('Stream stalled — no data for ' + (STREAM_STALL_TIMEOUT / 1000) + 's. Model may be overloaded.', 'error');
                     setConnectionStatus('connected', 'Connected — ' + state.settings.model);
                 }
+
             } else {
-                state.activeTask.isRunning = false; // User manually stopped it
-                finalizeStream(); 
-                toast('Response stopped', 'info'); 
+                state.activeTask.isRunning = false;
+                state.activeTask.loopCount = 0;
+                state.isStreaming = false;
+                updateSendButton();
+                toast('Response stopped', 'info');
+                setConnectionStatus('connected', 'Connected — ' + state.settings.model);
             }
-            return; 
+            return;
         }
-        
-        // Standard API errors
-        state.activeTask.isRunning = false;
-        finalizeStream();
-        var msg = error.message.indexOf('Failed to fetch') > -1 || error.message.indexOf('NetworkError') > -1
-            ? 'Cannot reach the LLM endpoint.' : error.message;
-        toast(msg, 'error');
-        setConnectionStatus('disconnected', 'Connection Error');
-        if (voiceState.isVoiceChat) import('./voice.js').then(function(m) { m.setVoiceMode('idle'); });
+
+        var errMsg = error.message || '';
+
+        if (errMsg.indexOf('RATE_LIMIT:') === 0) {
+            var rateDetail = errMsg.replace('RATE_LIMIT:', '');
+            state.activeTask.isRunning = false;
+            state.activeTask.loopCount = 0;
+            state.isStreaming = false;
+            updateSendButton();
+            toast('Rate limited by provider. Wait a moment or switch models.', 'error');
+            setConnectionStatus('disconnected', 'Rate Limited');
+            state.lastError = { type: 'rate_limit', detail: rateDetail };
+
+        } else if (errMsg.indexOf('AUTH_ERROR:') === 0) {
+            state.activeTask.isRunning = false;
+            state.activeTask.loopCount = 0;
+            state.isStreaming = false;
+            updateSendButton();
+            toast('Authentication failed. Check your API key in Settings.', 'error');
+            setConnectionStatus('disconnected', 'Auth Error');
+
+        } else if (errMsg.indexOf('SERVER_OVERLOAD:') === 0) {
+            state.activeTask.isRunning = false;
+            state.activeTask.loopCount = 0;
+            state.isStreaming = false;
+            updateSendButton();
+            toast('Provider overloaded (502/503/504). Try again in a moment.', 'error');
+            setConnectionStatus('disconnected', 'Server Overloaded');
+            state.lastError = { type: 'server_overload', detail: errMsg.replace('SERVER_OVERLOAD:', '') };
+
+        } else if (errMsg.indexOf('SERVER_ERROR:') === 0) {
+            state.activeTask.isRunning = false;
+            state.activeTask.loopCount = 0;
+            state.isStreaming = false;
+            updateSendButton();
+            var serverDetail = errMsg.replace('SERVER_ERROR:', '');
+            toast('Server error: ' + serverDetail.substring(0, 100), 'error');
+            setConnectionStatus('disconnected', 'Server Error');
+
+        } else {
+            state.activeTask.isRunning = false;
+            state.activeTask.loopCount = 0;
+            state.isStreaming = false;
+            updateSendButton();
+
+            var msg = errMsg.indexOf('Failed to fetch') > -1 || errMsg.indexOf('NetworkError') > -1
+                ? 'Cannot reach the LLM endpoint. Check your connection and endpoint URL.' : errMsg;
+            toast(msg, 'error');
+            setConnectionStatus('disconnected', 'Connection Error');
+        }
+
+        if (voiceState.isVoiceChat) import('./voice.js').then(function (m) { m.setVoiceMode('idle'); });
+
     } finally {
         clearInterval(stallWatchdog);
+        if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
+        if (fetchTimeoutId) { clearTimeout(fetchTimeoutId); fetchTimeoutId = null; }
+
+        if (state.isStreaming && !state.activeTask.isRunning && !state.isRenderScheduled) {
+            state.isStreaming = false;
+            updateSendButton();
+        }
     }
 }
 
@@ -312,7 +438,7 @@ function closeThinkingBlock() {
     }
 }
 
-window.toggleThinkingBlock = function() {
+window.toggleThinkingBlock = function () {
     var block = document.getElementById('sai-thinking-block');
     if (!block) return;
     var textEl = block.querySelector('.thinking-text');
@@ -359,7 +485,12 @@ export async function testConnection() {
         }
 
         var r = await fetch(getApiUrl(), { method: 'POST', headers: h, body: body });
-        if (!r.ok) { var e = await r.text().catch(function() { return ''; }); throw new Error('HTTP ' + r.status + ': ' + e.substring(0, 200)); }
+        if (!r.ok) {
+            var e = await r.text().catch(function () { return ''; });
+            if (r.status === 429) throw new Error('Rate limited. Wait a moment and try again.');
+            if (r.status === 401 || r.status === 403) throw new Error('Authentication failed. Check your API key.');
+            throw new Error('HTTP ' + r.status + ': ' + e.substring(0, 200));
+        }
         var d = await r.json();
 
         if (provider === 'ollama') {
@@ -376,7 +507,7 @@ export async function testConnection() {
     }
 }
 
-/* ── Fetch Models — live from API, no hardcoded lists ── */
+/* ── Fetch Models ── */
 export async function fetchModels() {
     var provider = state.settings.provider;
     var endpoint = state.settings.endpoint;
@@ -402,13 +533,13 @@ export async function fetchModels() {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         var d = await r.json();
         var models = provider === 'ollama'
-            ? (d.models || []).map(function(m) { return m.name; })
-            : (d.data || []).map(function(m) { return m.id; });
+            ? (d.models || []).map(function (m) { return m.name; })
+            : (d.data || []).map(function (m) { return m.id; });
         if (!models.length) {
             toast('No models found.', 'error');
             listEl.style.display = 'none';
         } else {
-            listEl.innerHTML = models.map(function(m) {
+            listEl.innerHTML = models.map(function (m) {
                 return '<option value="' + m + '">' + m + '</option>';
             }).join('');
             listEl.style.display = 'block';
@@ -436,13 +567,12 @@ async function fetchOpenRouterModels() {
     try {
         var r = await fetch('https://openrouter.ai/api/v1/models', { headers: h });
         if (!r.ok) {
-            var errBody = await r.text().catch(function() { return ''; });
+            var errBody = await r.text().catch(function () { return ''; });
             throw new Error('HTTP ' + r.status + ': ' + errBody.substring(0, 200));
         }
         var d = await r.json();
         var allModels = d.data || [];
 
-        // Store context limits for every model
         for (var x = 0; x < allModels.length; x++) {
             var ctx = allModels[x].context_length;
             if (ctx) {
@@ -450,35 +580,33 @@ async function fetchOpenRouterModels() {
             }
         }
 
-        /* ── 1. OPENCLAW TOP TIER MODELS (Pulled to the very top) ── */
+        /* Only models confirmed to exist on OpenRouter */
         var topTierIds = [
-            'stepfun/step-3.5-flash', 'z-ai/glm-5-turbo', 'xiaomi/mimo-v2-pro', 
-            'minimax/minimax-m2.7', 'anthropic/claude-sonnet-4.6', 'qwen/qwen-3.6-plus', 
-            'openrouter/hunter-alpha', 'minimax/minimax-m2.5', 'anthropic/claude-opus-4.6', 
+            'stepfun/step-3.5-flash', 'z-ai/glm-5-turbo', 'xiaomi/mimo-v2-pro',
+            'minimax/minimax-m2.7', 'minimax/minimax-m2.5',
+            'anthropic/claude-sonnet-4.6', 'anthropic/claude-opus-4.6',
             'nvidia/nemotron-3-super'
         ];
-        
+
         var topTierModels = [];
         for (var t = 0; t < topTierIds.length; t++) {
-            var found = allModels.find(function(m) { return m.id === topTierIds[t] || m.id === topTierIds[t] + ':free'; });
+            var found = allModels.find(function (m) { return m.id === topTierIds[t] || m.id === topTierIds[t] + ':free'; });
             if (found) topTierModels.push(found);
         }
 
-        /* ── 2. OTHER FREE MODELS ── */
-        var freeModels = allModels.filter(function(m) {
-            return m.id.indexOf(':free') > -1 && !topTierIds.some(function(id) { return m.id.startsWith(id); });
-        }).sort(function(a, b) { return a.id.localeCompare(b.id); });
+        var freeModels = allModels.filter(function (m) {
+            return m.id.indexOf(':free') > -1 && !topTierIds.some(function (id) { return m.id.startsWith(id); });
+        }).sort(function (a, b) { return a.id.localeCompare(b.id); });
 
-        /* ── 3. REASONING MODELS ── */
-        var reasoningModels = allModels.filter(function(m) {
+        var reasoningModels = allModels.filter(function (m) {
             var id = m.id.toLowerCase();
-            return (id.indexOf('deepseek-r1') > -1 || id.indexOf('qwq') > -1 || id.indexOf('o1') > -1 || id.indexOf('reasoner') > -1) && !topTierIds.some(function(id) { return m.id.startsWith(id); });
-        }).sort(function(a, b) { return a.id.localeCompare(b.id); });
+            return (id.indexOf('deepseek-r1') > -1 || id.indexOf('qwq') > -1 || id.indexOf('o1') > -1 || id.indexOf('reasoner') > -1) && !topTierIds.some(function (id) { return m.id.startsWith(id); });
+        }).sort(function (a, b) { return a.id.localeCompare(b.id); });
 
         var html = '';
 
         if (topTierModels.length > 0) {
-            html += '<option disabled style="color:var(--accent);font-weight:700">── 🔥 OpenClaw Top Tier (Massive Context) ──</option>';
+            html += '<option disabled style="color:var(--accent);font-weight:700">── 🔥 Top Tier (Massive Context) ──</option>';
             for (var i = 0; i < topTierModels.length; i++) {
                 var isFree = topTierModels[i].id.indexOf(':free') > -1;
                 var tag = isFree ? ' [FREE]' : ' [PAID]';
@@ -504,7 +632,6 @@ async function fetchOpenRouterModels() {
         listEl.innerHTML = html;
         listEl.style.display = 'block';
 
-        // Auto-select Step 3.5 Flash if no model is set
         var curModel = document.getElementById('s-model').value;
         if (!curModel && topTierModels.length > 0) {
             var defaultModel = topTierModels[0].id;

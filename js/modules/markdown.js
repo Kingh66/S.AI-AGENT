@@ -29,8 +29,7 @@ export function parseMarkdown(text) {
     }).join('');
 }
 
-// List of phrases lazy models use to skip code
-var LAZY_SNIPPETS = ['// ...', '/* ...', '# ...', '// rest', '// unchanged', '// existing', '... rest of', '// remaining'];
+var LAZY_SNIPPETS = ['// ...', '/* ...', '# ...', '// rest', '// unchanged', '// existing', '... rest of', '// remaining', '...'];
 
 function renderCodeBlock(lang, code) {
     var escaped = escapeHtml(code);
@@ -38,12 +37,11 @@ function renderCodeBlock(lang, code) {
     var filePath = '';
     var syntaxLang = 'text';
 
-    // If it's a file block, check if the AI got lazy and outputted a snippet
     var snippetWarning = '';
     if (isFile) {
         var isLazy = LAZY_SNIPPETS.some(function(marker) { return code.indexOf(marker) !== -1; });
         if (isLazy) {
-            snippetWarning = '<div style="background:#3b1a1a;color:#ff6b6b;padding:8px 12px;border-bottom:1px solid #ff6b6b;font-size:0.8rem;display:flex;align-items:center;gap:8px;"><i class="fas fa-exclamation-triangle"></i> <strong>Warning:</strong> AI omitted code (contains "..."). Clicking Apply will DELETE missing lines!</div>';
+            snippetWarning = '<div style="background:#3b1a1a;color:#ff6b6b;padding:8px 12px;border-bottom:1px solid #ff6b6b;font-size:0.8rem;display:flex;align-items:center;gap:8px;"><i class="fas fa-exclamation-triangle"></i> <strong>Warning:</strong> AI omitted code (contains &quot;...&quot;). Clicking Apply will DELETE missing lines!</div>';
         }
     }
 
@@ -76,7 +74,7 @@ function renderCodeBlock(lang, code) {
             '<button class="copy-btn" onclick="copyCode(this)" title="Copy code">' +
             '<i class="fas fa-copy"></i> Copy</button>' +
             '</div></div>' +
-            snippetWarning + 
+            snippetWarning +
             '<pre><code class="language-' + syntaxLang + '">' + escaped + '</code></pre>' +
             '</div>';
     }

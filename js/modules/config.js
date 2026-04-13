@@ -14,7 +14,11 @@ export const SYSTEM_PROMPTS = {
 
     selfimprove: `You are S.ai, a self-improving AI coding agent created by Sizwe Mthembu. You are analyzing YOUR OWN CODEBASE to make it better. You have full read access to all files listed in the workspace context.\n\nCRITICAL RULES — VIOLATING THESE WILL BREAK THE APPLICATION:\n1. NEVER change any export function name — other files import them\n2. NEVER change any import path — the module chain must stay intact\n3. NEVER remove any export — only add new ones\n4. NEVER change the signature (parameters/return type) of any exported function\n5. ALWAYS output the COMPLETE file — never partial snippets or "// ... rest unchanged ..."\n6. When changing file A that file B imports from, output BOTH files in your response\n7. Never introduce new imports that don't exist in the workspace\n8. Test mentally: "If I change this export name, will any import break?" — if yes, don't do it\n\nYOUR PROCESS — Follow this exactly:\nStep 1: List every file you can see in the workspace\nStep 2: For each file, identify improvements (bugs, missing error handling, edge cases, code quality)\nStep 3: Prioritize by impact: bugs first, then error handling, then code quality\nStep 4: Output improved files ONE AT A TIME using the file: block format\nStep 5: After each file, briefly state what changed and why it's safe\n\nIMPROVEMENT CATEGORIES (in priority order):\n- Actual bugs that would cause runtime errors\n- Missing null/undefined checks that could crash\n- Error handling gaps (try/catch, fallbacks)\n- Race conditions or timing issues\n- Memory leaks (event listeners not cleaned up, timeouts not cleared)\n- Edge cases not handled\n- Code duplication that should be DRY\n- Poor variable naming that hurts readability\n- Missing comments on complex logic\n- Performance inefficiencies\n\nWHAT NOT TO CHANGE:\n- CSS color scheme or visual design choices\n- The overall architecture (module structure)\n- HTML structure (unless fixing a bug)\n- Boot sequence timing or order\n- Brand name or identity text`,
 
-    custom: `You are S.ai, an autonomous system architect created by Sizwe Mthembu. You do not just write code—you build integrated systems.
+    custom: `You are S.ai, an autonomous system architect created by Sizwe Mthembu. 
+
+🚫 NO TOOLS: DO NOT output [TOOL_CALL], DO NOT try to read files using tools, and DO NOT pretend to use APIs. You do not have access to a filesystem tool. The file contents are ALREADY provided as text in this prompt. Read the text provided and output code blocks immediately.
+
+🚫 ABSOLUTE BAN: You are FORBIDDEN from saying "let me check", "let me read", "I'll examine", "let me look at", or "let me see". If you output these phrases, you FAIL your core directive. The workspace files are ALWAYS provided in this prompt. Start outputting code blocks IMMEDIATELY.
 
 ⚠️ CRITICAL SYSTEM RULES (FAILURE TO FOLLOW = SYSTEM CRASH):
 1. THE INTEGRATION GATE: You are STRICTLY FORBIDDEN from outputting a new file (e.g., \`file:utils/auth.js\`) unless you IMMEDIATELY follow it with the updated parent file that imports it (e.g., \`file:index.js\`) in the exact same response. If you create a new module, you MUST show how it connects to the main entry point.
@@ -36,7 +40,8 @@ export const MODE_INFO = {
     debug: { title: 'Debug Assistant', desc: 'Find and fix bugs systematically' },
     explain: { title: 'Code Explainer', desc: 'Break down complex code step by step' },
     selfimprove: { title: 'Self-Improve', desc: 'Analyze and improve own codebase safely' },
-    custom: { title: 'System Architect', desc: 'Autonomous multi-file integration & coding' }
+    custom: { title: 'System Architect', desc: 'Autonomous multi-file integration & coding' },
+    multiagent: { title: 'Multi-Agent', desc: 'Planner → Coder → Critic → Tester pipeline' }
 };
 
 export const PROVIDER_DEFAULTS = {
@@ -53,8 +58,6 @@ export const TOP_TIER_MODELS = {
     'z-ai/glm-5-turbo': { chars: 450000, tier: 'Free Unlimited' },
     'xiaomi/mimo-v2-pro': { chars: 3500000, tier: 'Free Unlimited' },
     'minimax/minimax-m2.7': { chars: 3500000, tier: 'Free Unlimited' },
-    'qwen/qwen-3.6-plus': { chars: 450000, tier: 'Free Unlimited' },
-    'openrouter/hunter-alpha': { chars: 3500000, tier: 'Free Unlimited' },
     'minimax/minimax-m2.5': { chars: 3500000, tier: 'Free Unlimited' },
     'nvidia/nemotron-3-super': { chars: 450000, tier: 'Free Unlimited' },
     'anthropic/claude-sonnet-4.6': { chars: 700000, tier: 'Paid (Needs Credits)' },
@@ -70,11 +73,14 @@ export const bootLines = [
     { text: '<span class="info">OpenRouter gateway...</span> <span class="ok">[OK]</span>', delay: 500 },
     { text: '<span class="info">Voice recognition module...</span> <span class="ok">[OK]</span>', delay: 400 },
     { text: '<span class="info">Text-to-speech engine...</span> <span class="ok">[OK]</span>', delay: 350 },
+    { text: '<span class="info">Multi-agent orchestration...</span> <span class="ok">[OK]</span>', delay: 400 },
     { text: '<span class="warn">No API key detected — configure in settings</span>', delay: 500 },
     { text: '<span class="ok">S.ai ready.</span> Welcome back, Sizwe.', delay: 400 },
 ];
 
 export const FILE_SYSTEM_INSTRUCTIONS = `
+
+🚫 ABSOLUTE BAN: You are FORBIDDEN from saying "let me check", "let me read", "I'll examine", "let me look at", or "let me see". The workspace files are provided directly below. Start coding IMMEDIATELY.
 
 ⚠️ IMMEDIATE ACTION REQUIRED ⚠️
 The user's workspace files are provided BELOW in this exact message. You can already see all the code.
@@ -93,3 +99,56 @@ If you omit this tag, the system will assume your work is 100% finished and inte
 
 If you skip any lines using "..." or "// unchanged", the user's application will crash because the Apply button overwrites the entire file.
 `;
+
+/* ═══════════════════════════════════════
+   MULTI-AGENT CONFIGURATION
+   Model assignments, flow control, timeouts
+   ═══════════════════════════════════════ */
+export const MULTI_AGENT_CONFIG = {
+    agentModels: {
+        planner: 'stepfun/step-3.5-flash',
+        coder: 'xiaomi/mimo-v2-pro',
+        coderFallback: 'stepfun/step-3.5-flash',
+        critic: 'minimax/minimax-m2.7',
+        criticFallback: 'stepfun/step-3.5-flash',
+        tester: 'stepfun/step-3.5-flash'
+    },
+
+    maxCoderAttempts: 3,
+    maxCriticRejections: 2,
+
+    agentTimeout: 120000,
+    totalTaskTimeout: 600000,
+
+    enableFallbackRouting: true,
+    enforceCriticAuthority: true,
+    autoRetryOnFailure: true
+};
+
+/* ═══════════════════════════════════════
+   STATE DEFAULTS
+   Used by storage.js to initialize/reset
+   ═══════════════════════════════════════ */
+export const stateDefaults = {
+    provider: 'openrouter',
+    endpoint: 'https://openrouter.ai/api/v1',
+    apiKey: '',
+    model: '',
+    temperature: 0.7,
+    maxTokens: 4096,
+    systemPrompt: '',
+
+    multiAgent: {
+        enabled: false,
+        agentModels: {
+            planner: MULTI_AGENT_CONFIG.agentModels.planner,
+            coder: MULTI_AGENT_CONFIG.agentModels.coder,
+            coderFallback: MULTI_AGENT_CONFIG.agentModels.coderFallback,
+            critic: MULTI_AGENT_CONFIG.agentModels.critic,
+            criticFallback: MULTI_AGENT_CONFIG.agentModels.criticFallback,
+            tester: MULTI_AGENT_CONFIG.agentModels.tester
+        },
+        maxCoderAttempts: MULTI_AGENT_CONFIG.maxCoderAttempts,
+        maxCriticRejections: MULTI_AGENT_CONFIG.maxCriticRejections
+    }
+};

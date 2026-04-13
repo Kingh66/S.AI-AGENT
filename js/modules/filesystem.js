@@ -10,6 +10,7 @@ let dirHandle = null;
 let fileMap = new Map();
 let folderName = '';
 
+
 /* ── Connect to a local folder ── */
 export async function connectFolder() {
     if (!('showDirectoryPicker' in window)) {

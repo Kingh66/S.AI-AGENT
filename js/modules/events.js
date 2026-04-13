@@ -22,10 +22,18 @@ export function initEventListeners() {
             sendMessage('');
             return;
         }
+
         const text = input.value.trim();
-        sendMessage(text);
-        input.value = '';
-        input.style.height = 'auto';
+        if (!text) return;
+
+        /* Route to multi-agent pipeline when in multiagent mode */
+        if (state.currentMode === 'multiagent') {
+            import('./multiagent.js').then(function(m) { m.startMultiAgentMode(); });
+        } else {
+            sendMessage(text);
+            input.value = '';
+            input.style.height = 'auto';
+        }
     });
 
     input.addEventListener('keydown', (e) => {
@@ -33,6 +41,12 @@ export function initEventListeners() {
             e.preventDefault();
             const text = input.value.trim();
             if (text.startsWith('/')) {
+                /* Route multi-agent slash commands directly */
+                if (text === '/multiagent' || text === '/team') {
+                    import('./multiagent.js').then(function(m) { m.startMultiAgentMode(); });
+                    input.value = '';
+                    return;
+                }
                 handleSlashCommand(text);
                 input.value = '';
                 return;
@@ -57,7 +71,17 @@ export function initEventListeners() {
         btn.addEventListener('click', () => setMode(btn.dataset.mode));
     });
 
+    /* Bind standard quick actions first */
     bindQuickActions();
+
+    /* Override quick actions for multi-agent commands — onclick replaces
+       the handler set by bindQuickActions since it's a property, not addEventListener */
+    document.querySelectorAll('.quick-action[data-cmd="/multiagent"], .quick-action[data-cmd="/team"]').forEach(function(btn) {
+        btn.onclick = function() {
+            import('./multiagent.js').then(function(m) { m.startMultiAgentMode(); });
+        };
+    });
+
     document.getElementById('qa-settings').addEventListener('click', () => openModal('settings-modal'));
 
     document.getElementById('btn-settings').addEventListener('click', () => openModal('settings-modal'));
@@ -128,7 +152,7 @@ export function initEventListeners() {
             if (e.target === overlay) closeModal(overlay.id);
         });
     });
-   
+
     document.getElementById('btn-connect-folder').addEventListener('click', connectFolder);
     document.getElementById('btn-refresh-folder').addEventListener('click', refreshFolder);
     document.getElementById('btn-reset-settings').addEventListener('click', function() {

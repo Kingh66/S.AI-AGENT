@@ -64,6 +64,7 @@
                     <button class="mode-btn" data-mode="explain"><i class="fas fa-graduation-cap"></i> Code Explainer</button>
                     <button class="mode-btn" data-mode="selfimprove"><i class="fas fa-brain"></i> Self-Improve</button>
                     <button class="mode-btn" data-mode="custom"><i class="fas fa-sliders"></i> Custom Mode</button>
+                    <button class="mode-btn" data-mode="multiagent"><i class="fas fa-users"></i> Multi-Agent Team</button>
                 </div>
             </div>
             <div class="sidebar-section">
@@ -122,6 +123,10 @@
                         <span class="range-value" id="q-voice-rate-val">1.0</span>
                     </div>
                 </div>
+            </div>
+            <div class="sidebar-section" id="multiagent-settings-container" style="display:none">
+                <h4><i class="fas fa-robot" style="margin-right:4px"></i> Multi-Agent Mode</h4>
+                <div id="multiagent-settings"></div>
             </div>
         </div>
     </aside>
@@ -238,6 +243,7 @@
                 <button class="preset-chip" data-preset="improve">Code Improve</button>
                 <button class="preset-chip" data-preset="debug">Debug</button>
                 <button class="preset-chip" data-preset="explain">Explain</button>
+                <button class="preset-chip" data-preset="multiagent">Multi-Agent</button>
             </div>
             <div class="form-group">
                 <textarea class="form-textarea" id="s-prompt" rows="12"></textarea>
