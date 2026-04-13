@@ -39,13 +39,6 @@ export function buildPayload(messages, overrideModel) {
 
     var isReasoning = model.indexOf('deepseek-r1') > -1 || model.indexOf('qwq') > -1 || model.indexOf('o1') > -1 || model.indexOf('reasoner') > -1;
 
-    var baseModel = model.replace(':free', '');
-    if (state.settings.provider === 'openrouter' && maxTokens <= 4096) {
-        if (baseModel.indexOf('step-3.5') > -1 || baseModel.indexOf('mimo') > -1 || baseModel.indexOf('minimax') > -1 || baseModel.indexOf('glm-5') > -1 || baseModel.indexOf('nemotron') > -1) {
-            maxTokens = 16384;
-        }
-    }
-
     return {
         model: model,
         messages: messages,
