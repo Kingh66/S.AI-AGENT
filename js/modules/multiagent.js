@@ -1,12 +1,15 @@
 /* ═══════════════════════════════════════
    MULTI-AGENT ORCHESTRATION
    Planner → Coder → Critic → Tester flow
-   Self-contained payload — does NOT depend
-   on connection.js buildPayload to prevent
-   token-boost credit errors
+   Self-contained payload + chat rendering
+   + smart file context (truncated per agent)
+   + auto-retry on 402 with token reduction
    ═══════════════════════════════════════ */
 import { state } from './state.js';
-import { toast, setConnectionStatus, autoResize } from './ui.js';
+import { toast, setConnectionStatus, autoResize, getTimeStr, highlightCodeBlocks } from './ui.js';
+import { removeWelcome, addUserMessage } from './messages.js';
+import { parseMarkdown } from './markdown.js';
+import { getFileContext, isConnected } from './filesystem.js';
 
 /* ── Agent definitions ── */
 export var AGENTS = {
@@ -16,7 +19,7 @@ export var AGENTS = {
         defaultModel: 'stepfun/step-3.5-flash',
         fallbackModels: ['xiaomi/mimo-v2-pro', 'minimax/minimax-m2.7'],
         maxTokens: 4096,
-        prompt: 'You are S.ai\'s Planner agent. Your ONLY responsibility is to understand the task and create a detailed, step-by-step implementation plan.\n\nCRITICAL RULES:\n1. Analyze the task thoroughly before planning\n2. Break complex tasks into 3-7 actionable steps\n3. Each step must be specific, testable, and independent\n4. Consider file structure, dependencies, and integration points\n5. Identify potential risks and edge cases\n6. Output format: EXACTLY this structure:\n\n## PLAN\n**Objective:** [Clear one-sentence goal]\n\n**Steps:**\n1. [Step 1 description - specific action]\n2. [Step 2 description]\n3. ...\n\n**Files to create/modify:**\n- file1.ext (purpose)\n- file2.ext (purpose)\n\n**Dependencies:**\n- [List any external requirements]\n\n**Risks:**\n- [Potential issues and mitigation]\n\nNEVER write code. NEVER review code. ONLY plan.',
+        prompt: 'You are S.ai\'s Planner agent. Your ONLY responsibility is to understand the task and create a detailed, step-by-step implementation plan.\n\nCRITICAL RULES:\n1. If a workspace file tree is provided, use it to understand the project structure\n2. Reference specific file paths in your plan\n3. Break complex tasks into 3-7 actionable steps\n4. Each step must be specific, testable, and independent\n5. Consider file structure, dependencies, and integration points\n6. Output format: EXACTLY this structure:\n\n## PLAN\n**Objective:** [Clear one-sentence goal]\n\n**Steps:**\n1. [Step 1 description - specific action, referencing actual files]\n2. [Step 2 description]\n3. ...\n\n**Files to create/modify:**\n- path/to/file.ext (purpose)\n- path/to/file.ext (purpose)\n\n**Dependencies:**\n- [List any external requirements]\n\n**Risks:**\n- [Potential issues and mitigation]\n\nNEVER write code. NEVER review code. ONLY plan.',
 
         parsePlan: function(text) {
             var planMatch = text.match(/##\s*PLAN([\s\S]*?)(?=##\s*(?!PLAN)|$)/i);
@@ -103,7 +106,7 @@ export var AGENTS = {
         fallbackModels: ['stepfun/step-3.5-flash', 'minimax/minimax-m2.7', 'z-ai/glm-5-turbo'],
         maxTokens: 4096,
         currentModel: null,
-        prompt: 'You are S.ai\'s Coder agent. Your ONLY responsibility is to write complete, production-ready code based on the Planner\'s plan.\n\nCRITICAL RULES:\n1. Follow the plan EXACTLY - do not deviate\n2. Write COMPLETE files - never use "...", "// rest unchanged", or "// existing code"\n3. Every file must be self-contained and runnable\n4. Include all necessary imports, error handling, and edge cases\n5. Add clear comments for complex logic\n6. Use modern best practices and patterns\n7. For each file, output:\n\nfile:path/to/filename.ext\n// FULL FILE CONTENT - NO OMISSIONS\n[complete code]\n\n8. If modifying existing files, read the provided context and integrate seamlessly\n9. NEVER hallucinate imports - only use imports that exist in the context\n10. After writing ALL files, add: <|INTEGRATION_CHECK|>\n\nOutput format: One or more file blocks, then <|INTEGRATION_CHECK|>',
+        prompt: 'You are S.ai\'s Coder agent. Your ONLY responsibility is to write complete, production-ready code based on the Planner\'s plan.\n\nCRITICAL RULES:\n1. Follow the plan EXACTLY - do not deviate\n2. If workspace files are provided, READ THEM to understand existing code\n3. When modifying existing files, output the COMPLETE file — never "...", "// rest unchanged"\n4. Every file must be self-contained and runnable\n5. Include all necessary imports, error handling, and edge cases\n6. For each file, output:\n\nfile:path/to/filename.ext\n// FULL FILE CONTENT - NO OMISSIONS\n[complete code]\n\n7. NEVER hallucinate imports\n8. After writing ALL files, add: <|INTEGRATION_CHECK|>',
 
         validateOutput: function(text) {
             var lazyPatterns = [/\.\.\.[\s\S]*?\.\.\./, /\/\/\s*\.\.\.[\s\S]*?\/\/\s*\.\.\./, /\/\*\s*\.\.\.[\s\S]*?\*\//, /#\s*\.\.\.[\s\S]*?#\s*\.\.\./];
@@ -129,7 +132,7 @@ export var AGENTS = {
         defaultModel: 'minimax/minimax-m2.7',
         fallbackModels: ['stepfun/step-3.5-flash', 'xiaomi/mimo-v2-pro'],
         maxTokens: 2048,
-        prompt: 'You are S.ai\'s Critic agent - the FINAL quality gate. Your approval is REQUIRED before code is accepted.\n\nCRITICAL RULES:\n1. You have ABSOLUTE AUTHORITY - your decision cannot be overridden\n2. Be STRICT - reject if ANY of these exist:\n   - Missing error handling\n   - Race conditions\n   - Memory leaks (unclosed resources, event listeners not cleaned)\n   - Security vulnerabilities\n   - Broken imports or dependencies\n   - Incomplete implementations ("..." or "// rest")\n   - Poor naming or unclear logic\n   - Missing edge case handling\n3. Review ALL files as a complete system\n4. Check integration between files\n5. Verify the plan was followed exactly\n\nOutput format: EXACTLY one of these:\n\nAPPROVED\n[Brief validation: "All files complete, integration correct, no issues"]\n\nREJECTED\n[Detailed reasons, numbered]\n1. [Issue with file X]\n2. [Integration problem]\n3. ...\n\nIf rejected, the code goes back to Coder with your feedback.\n\nREMEMBER: Your job is to prevent broken code from being accepted. If in doubt, REJECT.',
+        prompt: 'You are S.ai\'s Critic agent - the FINAL quality gate.\n\nOutput format: EXACTLY one of these:\n\nAPPROVED\n[Brief validation]\n\nREJECTED\n[Detailed reasons, numbered]\n\nIf in doubt, REJECT.',
 
         parseDecision: function(text) {
             var isApproved = text.trim().toUpperCase().indexOf('APPROVED') === 0;
@@ -147,7 +150,7 @@ export var AGENTS = {
         defaultModel: 'stepfun/step-3.5-flash',
         fallbackModels: ['xiaomi/mimo-v2-pro', 'minimax/minimax-m2.7'],
         maxTokens: 4096,
-        prompt: 'You are S.ai\'s Tester agent. Your job is to validate the code works correctly.\n\nCRITICAL RULES:\n1. Generate unit tests for all major functions\n2. Test edge cases and error conditions\n3. Verify integration points\n4. Check for performance issues\n5. Output format:\n\n## TEST PLAN\n[Brief test strategy]\n\n## TEST FILES\nfile:tests/test_<component>.ext\n// COMPLETE test code with assertions\n[test code]\n\n## VALIDATION RESULT\nPASS | FAIL | NEEDS_REVIEW\n\n[Reasoning]\n\nIf tests fail, output FAIL with specific failures.',
+        prompt: 'You are S.ai\'s Tester agent.\n\nOutput format:\n\n## VALIDATION RESULT\nPASS | FAIL | NEEDS_REVIEW\n\n[Reasoning]',
 
         parseResult: function(text) {
             var resultMatch = text.match(/## VALIDATION RESULT\s+(PASS|FAIL|NEEDS_REVIEW)/i);
@@ -174,13 +177,9 @@ export var multiAgentState = {
     activeLoop: null
 };
 
-/* ═════════════════════════════════════════
+/* ═══════════════════════════════════════
    SELF-CONTAINED API HELPERS
-   These do NOT import connection.js at all.
-   They build their own payload to guarantee
-   max_tokens is NEVER auto-boosted to 16384.
    ═══════════════════════════════════════ */
-
 function getApiUrl() {
     var endpoint = (state.settings.endpoint || '').replace(/\/+$/, '');
     var provider = state.settings.provider;
@@ -194,22 +193,10 @@ function isOllamaProvider() {
 }
 
 function buildAgentPayload(messages, model, maxTokens) {
-    /* NEVER auto-boost. Use exactly what the caller passes. */
     if (isOllamaProvider()) {
-        return {
-            model: model,
-            messages: messages,
-            stream: true,
-            options: { temperature: 0.7, num_predict: maxTokens }
-        };
+        return { model: model, messages: messages, stream: true, options: { temperature: 0.7, num_predict: maxTokens } };
     }
-    return {
-        model: model,
-        messages: messages,
-        stream: true,
-        temperature: 0.7,
-        max_tokens: maxTokens
-    };
+    return { model: model, messages: messages, stream: true, temperature: 0.7, max_tokens: maxTokens };
 }
 
 function buildAgentHeaders() {
@@ -222,6 +209,128 @@ function buildAgentHeaders() {
         h['X-Title'] = 'S.ai Coding Agent';
     }
     return h;
+}
+
+/* ═══════════════════════════════════════
+   SMART FILE CONTEXT — Per-agent truncation
+   Regular chat sends ALL files (223KB).
+   Multi-agent CANNOT afford that — 4 sequential
+   calls would blow any credit budget.
+   
+   Planner: file tree only (~1KB)
+   Coder:   file tree + most relevant files (~15KB cap)
+   Critic:  only the code the coder produced (via taskContext, not raw files)
+   Tester:  only the code the coder produced (via taskContext, not raw files)
+   ═══════════════════════════════════════ */
+function getSmartFileContext(agentName) {
+    var fullCtx = getFileContext();
+    if (!fullCtx) return '';
+
+    /* ── Planner: just the file tree, no file contents ──
+       The tree ends at the first "--- FILE:" line */
+    if (agentName === 'planner') {
+        var lines = fullCtx.split('\n');
+        var treeLines = [];
+        for (var i = 0; i < lines.length; i++) {
+            if (lines[i].indexOf('--- FILE:') > -1) break;
+            treeLines.push(lines[i]);
+        }
+        var tree = treeLines.join('\n').trim();
+        if (tree.length < 50) return '';
+        return tree + '\n\nNote: Full file contents will be provided to the Coder agent. Plan based on the file tree and task description.';
+    }
+
+    /* ── Coder: file tree + truncated file contents ──
+       Cap at 15KB to keep input tokens manageable */
+    if (agentName === 'coder') {
+        var MAX_CODER_CTX = 15000;
+        if (fullCtx.length <= MAX_CODER_CTX) return fullCtx;
+        /* Find a good truncation point — don't cut mid-file */
+        var truncated = fullCtx.substring(0, MAX_CODER_CTX);
+        var lastFileEnd = truncated.lastIndexOf('--- END FILE ---');
+        if (lastFileEnd > 5000) {
+            truncated = truncated.substring(0, lastFileEnd + '--- END FILE ---'.length);
+        }
+        return truncated + '\n\n[... ' + (fullCtx.length - truncated.length) + ' more characters truncated to fit token budget. Ask the user to paste specific files if you need them.]';
+    }
+
+    /* ── Critic and Tester: NO raw file context ──
+       They receive the coder's output via taskContext,
+       which is much smaller and only contains the files
+       that were actually created/modified. */
+    return '';
+}
+
+/* ═══════════════════════════════════════
+   CHAT RENDERING
+   ═══════════════════════════════════════ */
+var AGENT_ICONS = {
+    planner: 'fa-map',
+    coder: 'fa-code',
+    critic: 'fa-gavel',
+    tester: 'fa-flask-vial',
+    system: 'fa-flag-checkered'
+};
+
+var AGENT_NAMES = {
+    planner: 'Planner',
+    coder: 'Coder',
+    critic: 'Critic',
+    tester: 'Tester',
+    system: 'Result'
+};
+
+var STATUS_HTML = {
+    success: '<span style="color:#00d4aa;font-size:0.75rem;font-weight:700"><i class="fas fa-check-circle"></i> Done</span>',
+    warning: '<span style="color:#f0c040;font-size:0.75rem;font-weight:700"><i class="fas fa-triangle-exclamation"></i> Rejected</span>',
+    error:   '<span style="color:#ff4757;font-size:0.75rem;font-weight:700"><i class="fas fa-circle-xmark"></i> Failed</span>'
+};
+
+function scrollMessages() {
+    var msgs = document.getElementById('messages');
+    msgs.scrollTop = msgs.scrollHeight;
+}
+
+function showAgentWorking(agentName) {
+    removeWelcome();
+    var msgs = document.getElementById('messages');
+    var div = document.createElement('div');
+    div.className = 'message bot';
+    var uid = 'aw-' + agentName + '-' + Date.now();
+    div.id = uid;
+    div.innerHTML =
+        '<div class="msg-avatar" style="background:rgba(0,212,170,0.12)"><i class="fas ' + (AGENT_ICONS[agentName] || 'fa-robot') + '"></i></div>' +
+        '<div class="msg-body"><div class="msg-meta">' +
+        '<span class="msg-name" style="color:var(--accent)">' + (AGENT_NAMES[agentName] || agentName) + ' Agent</span>' +
+        '<span style="color:var(--yellow);font-size:0.75rem;font-weight:600"><i class="fas fa-spinner fa-spin"></i> Working...</span>' +
+        '<span class="msg-time">' + getTimeStr() + '</span>' +
+        '</div><div class="msg-content"><div class="typing-indicator"><span></span><span></span><span></span></div></div></div>';
+    msgs.appendChild(div);
+    scrollMessages();
+    return uid;
+}
+
+function removeWorking(uid) {
+    if (!uid) return;
+    var el = document.getElementById(uid);
+    if (el) el.remove();
+}
+
+function renderAgentMessage(agentName, content, status) {
+    removeWelcome();
+    var msgs = document.getElementById('messages');
+    var div = document.createElement('div');
+    div.className = 'message bot';
+    div.innerHTML =
+        '<div class="msg-avatar" style="background:rgba(0,212,170,0.12)"><i class="fas ' + (AGENT_ICONS[agentName] || 'fa-robot') + '"></i></div>' +
+        '<div class="msg-body"><div class="msg-meta">' +
+        '<span class="msg-name" style="color:var(--accent)">' + (AGENT_NAMES[agentName] || agentName) + ' Agent</span>' +
+        (STATUS_HTML[status] || '') +
+        '<span class="msg-time">' + getTimeStr() + '</span>' +
+        '</div><div class="msg-content">' + parseMarkdown(content) + '</div></div>';
+    msgs.appendChild(div);
+    highlightCodeBlocks(div);
+    scrollMessages();
 }
 
 /* ── Orchestrator ── */
@@ -304,93 +413,98 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
         ? (state.settings.maxCoderAttempts || multiAgentState.maxCoderAttempts)
         : 2;
 
-    while (attempts < maxAttempts && !(result && result.success)) {
-        attempts++;
-        lastError = 'Attempt ' + attempts + ' failed';
+    var workingId = showAgentWorking(agentName);
 
-        try {
-            result = await this.executeAgentCall(agentName, model, prompt);
+    try {
+        while (attempts < maxAttempts && !(result && result.success)) {
+            attempts++;
+            lastError = 'Attempt ' + attempts + ' failed';
 
-            if (!result.success && !result.error) {
-                result.error = agentName + ' returned failure with no details';
-            }
-            lastError = result.error || lastError;
+            try {
+                result = await this.executeAgentCall(agentName, model, prompt);
 
-            /* Coder fallback on failure */
-            if (agentName === 'coder' && !result.success && attempts < maxAttempts) {
-                model = this.getNextCoderFallback(agent, model);
-                if (model) {
-                    toast('Coder failed, switching to fallback: ' + model, 'info');
-                    continue;
+                if (!result.success && !result.error) {
+                    result.error = agentName + ' returned failure with no details';
                 }
-            }
+                lastError = result.error || lastError;
 
-            /* Critic rejection handling */
-            if (agentName === 'critic' && result.decision === 'REJECTED') {
-                multiAgentState.criticRejections++;
-                var maxRejections = state.settings.maxCriticRejections || multiAgentState.maxCriticRejections;
-
-                if (multiAgentState.criticRejections >= maxRejections) {
-                    toast('Critic rejected ' + maxRejections + ' times — task failed', 'error');
-                    return { success: false, error: 'Critic rejected ' + maxRejections + ' times. Last feedback: ' + (result.feedback || 'none') };
-                }
-
-                toast('Critic rejected — sending back to Coder with feedback', 'info');
-                this.currentAgentIndex = 1;
-                var coderPrompt = this.buildAgentPrompt('coder', null, result.feedback);
-                return await this.runAgent('coder', coderPrompt);
-            }
-
-        } catch (error) {
-            lastError = error.message || error.name || String(error);
-            console.warn('Agent ' + agentName + ' attempt ' + attempts + ' error:', lastError);
-
-            if (error.name === 'AbortError') {
-                return { success: false, error: 'Task aborted by user' };
-            }
-
-            /* ── 402: Insufficient credits — FAIL FAST, never retry ── */
-            if (lastError.indexOf('HTTP 402') > -1 || lastError.indexOf('credits') > -1 || lastError.indexOf('afford') > -1) {
-                var affordMatch = lastError.match(/can only afford (\d+)/);
-                var reqMatch = lastError.match(/requested up to (\d+)/);
-                var detail = 'Insufficient OpenRouter credits.';
-                if (affordMatch) detail += ' You can afford ' + affordMatch[1] + ' tokens.';
-                if (reqMatch) detail += ' Requested: ' + reqMatch[1] + '.';
-                detail += ' Set Max Tokens to ' + (affordMatch ? Math.floor(parseInt(affordMatch[1]) / 5) : '400') + ' in sidebar Quick Settings, or add credits.';
-                toast(detail, 'error');
-                return { success: false, error: detail };
-            }
-
-            /* Invalid model — skip to fallback */
-            if (lastError.indexOf('is not a valid model ID') > -1 || lastError.indexOf('HTTP 404') > -1) {
-                toast('Model "' + model + '" is invalid or removed, trying fallback...', 'error');
-                if (agentName === 'coder') {
+                if (agentName === 'coder' && !result.success && attempts < maxAttempts) {
                     model = this.getNextCoderFallback(agent, model);
-                    if (model && attempts < maxAttempts) continue;
-                } else {
-                    var fallbacks = agent.fallbackModels || [];
-                    if (fallbacks.length > 0) {
-                        model = fallbacks[0];
-                        if (attempts < maxAttempts) continue;
+                    if (model) {
+                        toast('Coder failed, switching to fallback: ' + model, 'info');
+                        continue;
                     }
                 }
-            }
 
-            if (attempts < maxAttempts) {
-                toast(agentName + ' attempt ' + attempts + ' failed, retrying...', 'info');
-                await this.delay(1000 * attempts);
-            } else {
-                result = { success: false, error: lastError };
+                if (agentName === 'critic' && result.decision === 'REJECTED') {
+                    removeWorking(workingId);
+                    workingId = null;
+                    renderAgentMessage('critic', result.content, 'warning');
+
+                    multiAgentState.criticRejections++;
+                    var maxRejections = state.settings.maxCriticRejections || multiAgentState.maxCriticRejections;
+
+                    if (multiAgentState.criticRejections >= maxRejections) {
+                        toast('Critic rejected ' + maxRejections + ' times — task failed', 'error');
+                        return { success: false, error: 'Critic rejected ' + maxRejections + ' times.' };
+                    }
+
+                    toast('Critic rejected — sending back to Coder', 'info');
+                    this.currentAgentIndex = 1;
+                    var coderPrompt = this.buildAgentPrompt('coder', null, result.feedback);
+                    return await this.runAgent('coder', coderPrompt);
+                }
+
+            } catch (error) {
+                lastError = error.message || error.name || String(error);
+                console.warn('Agent ' + agentName + ' attempt ' + attempts + ' error:', lastError);
+
+                if (error.name === 'AbortError') {
+                    return { success: false, error: 'Task aborted by user' };
+                }
+
+                /* 402 is now handled INSIDE executeAgentCall with auto-retry.
+                   If it still reaches here, it means all retries exhausted. */
+                if (lastError.indexOf('HTTP 402') > -1 || lastError.indexOf('credits') > -1) {
+                    return { success: false, error: lastError };
+                }
+
+                if (lastError.indexOf('is not a valid model ID') > -1 || lastError.indexOf('HTTP 404') > -1) {
+                    toast('Model "' + model + '" invalid, trying fallback...', 'error');
+                    if (agentName === 'coder') {
+                        model = this.getNextCoderFallback(agent, model);
+                        if (model && attempts < maxAttempts) continue;
+                    } else {
+                        var fallbacks = agent.fallbackModels || [];
+                        if (fallbacks.length > 0) {
+                            model = fallbacks[0];
+                            if (attempts < maxAttempts) continue;
+                        }
+                    }
+                }
+
+                if (attempts < maxAttempts) {
+                    toast(agentName + ' attempt ' + attempts + ' failed, retrying...', 'info');
+                    await this.delay(1000 * attempts);
+                } else {
+                    result = { success: false, error: lastError };
+                }
             }
         }
-    }
 
-    if (!result) {
-        result = { success: false, error: lastError };
-    }
+        if (!result) {
+            result = { success: false, error: lastError };
+        }
 
-    if (result.success) {
-        this.taskContext = this.accumulateContext(agentName, result.content);
+        if (result.success) {
+            removeWorking(workingId);
+            workingId = null;
+            renderAgentMessage(agentName, result.content, 'success');
+            this.taskContext = this.accumulateContext(agentName, result.content);
+        }
+
+    } finally {
+        removeWorking(workingId);
     }
 
     return result;
@@ -401,43 +515,87 @@ MultiAgentOrchestrator.prototype.selectModelForAgent = function(agent, agentName
         var configured = state.settings.agentModels[agentName];
         if (configured) return configured;
     }
-    if (agentName === 'coder' && agent.currentModel) {
-        return agent.currentModel;
-    }
+    if (agentName === 'coder' && agent.currentModel) return agent.currentModel;
     return agent.defaultModel;
 };
 
 MultiAgentOrchestrator.prototype.getNextCoderFallback = function(agent, currentModel) {
     var configuredFallback = (state.settings.agentModels || {}).coderFallback;
-    if (configuredFallback && configuredFallback !== currentModel) {
-        return configuredFallback;
-    }
+    if (configuredFallback && configuredFallback !== currentModel) return configuredFallback;
     var fallbacks = agent.fallbackModels.filter(function(m) { return m !== currentModel; });
     return fallbacks.length > 0 ? fallbacks[0] : null;
 };
 
 /* ═══════════════════════════════════════
-   SELF-CONTAINED EXECUTE — NO connection.js
-   This function builds its own fetch payload.
-   It does NOT call conn.buildPayload().
-   It does NOT call conn.getApiUrl().
-   It does NOT call conn.buildHeaders().
-   This is intentional — it guarantees max_tokens
-   is NEVER auto-boosted to 16384.
+   SELF-CONTAINED EXECUTE
+   - NO connection.js dependency
+   - Smart per-agent file context
+   - AUTO-RETRY on 402 with token reduction
+     (1800 → 900 → 450 → 200)
    ═══════════════════════════════════════ */
 MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, model, prompt) {
     var self = this;
     var agent = AGENTS[agentName];
     var timeoutMs = 120000;
 
-    /* ── Token budget: min of agent default and user setting ──
-       Multi-agent makes 4 calls, so each call gets its own budget.
-       The user's "Max Tokens" slider caps everything. */
+    /* Build system message with SMART file context */
+    var systemContent = agent.prompt;
+
+    var projectCtx = document.getElementById('project-context');
+    if (projectCtx && projectCtx.value.trim()) {
+        systemContent += '\n\n--- PROJECT CONTEXT ---\n' + projectCtx.value.trim() + '\n--- END CONTEXT ---';
+    }
+
+    var fileCtx = getSmartFileContext(agentName);
+    if (fileCtx) {
+        systemContent += '\n\n' + fileCtx;
+    }
+
     var userMax = state.settings.maxTokens || 4096;
     var agentBudget = agent.maxTokens || 4096;
-    var finalMaxTokens = Math.min(userMax, agentBudget);
+    var startTokens = Math.min(userMax, agentBudget);
 
-    console.log('[MultiAgent] ' + agentName + ' using model=' + model + ' max_tokens=' + finalMaxTokens);
+    var fileCount = fileCtx ? (fileCtx.match(/--- FILE:/g) || []).length : 0;
+    console.log('[MultiAgent] ' + agentName + ' model=' + model + ' startTokens=' + startTokens + ' fileCtx=' + fileCtx.length + ' chars ' + fileCount + ' files');
+
+    /* ── 402 AUTO-RETRY LOOP ──
+       If we get a 402, halve the tokens and try again.
+       This adapts to whatever credit balance the user has. */
+    var MAX_402_RETRIES = 4;
+    var currentTokens = startTokens;
+
+    for (var retry402 = 0; retry402 < MAX_402_RETRIES; retry402++) {
+        try {
+            var result = await this._doFetch(agentName, model, systemContent, prompt, currentTokens, timeoutMs);
+
+            if (retry402 > 0) {
+                toast(agentName + ' succeeded with ' + currentTokens + ' tokens (reduced from ' + startTokens + ')', 'success');
+            }
+            return result;
+
+        } catch (error) {
+            var errMsg = error.message || '';
+
+            /* Only auto-retry on 402 */
+            if (errMsg.indexOf('HTTP 402') > -1 && retry402 < MAX_402_RETRIES - 1) {
+                currentTokens = Math.max(100, Math.floor(currentTokens / 2));
+                toast('Credits low — reducing tokens to ' + currentTokens + ' and retrying...', 'info');
+                await this.delay(500);
+                continue;
+            }
+
+            /* All retries exhausted or different error — throw */
+            throw error;
+        }
+    }
+
+    /* Should not reach here, but safety net */
+    throw new Error(agentName + ' failed after ' + MAX_402_RETRIES + ' attempts');
+};
+
+/* ── Actual fetch call (extracted for 402 retry loop) ── */
+MultiAgentOrchestrator.prototype._doFetch = function(agentName, model, systemContent, prompt, maxTokens, timeoutMs) {
+    var self = this;
 
     return new Promise(function(resolve, reject) {
         var timeoutId = setTimeout(function() {
@@ -445,7 +603,7 @@ MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, mo
         }, timeoutMs);
 
         var agentMessages = [
-            { role: 'system', content: agent.prompt }
+            { role: 'system', content: systemContent }
         ];
 
         var recentCtx = multiAgentState.conversationHistory.slice(-6);
@@ -454,8 +612,7 @@ MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, mo
         }
         agentMessages.push({ role: 'user', content: prompt });
 
-        /* Build payload RIGHT HERE — no connection.js dependency */
-        var payload = buildAgentPayload(agentMessages, model, finalMaxTokens);
+        var payload = buildAgentPayload(agentMessages, model, maxTokens);
         var headers = buildAgentHeaders();
         var url = getApiUrl();
         var useOllama = isOllamaProvider();
@@ -539,21 +696,10 @@ MultiAgentOrchestrator.prototype.parseAgentResult = function(agentName, content)
         case 'planner':
             var plan = AGENTS.planner.parsePlan(content);
             if (!plan) {
-                return {
-                    success: false,
-                    content: content,
-                    agent: agentName,
-                    error: 'Planner could not extract a valid plan. Response did not contain recognizable plan structure.'
-                };
+                return { success: false, content: content, agent: agentName, error: 'Planner could not extract a valid plan.' };
             }
             if (!plan.steps || plan.steps.length === 0) {
-                return {
-                    success: false,
-                    content: content,
-                    plan: plan,
-                    agent: agentName,
-                    error: 'Plan has no actionable steps. Found ' + plan.files.length + ' files but no steps to implement them.'
-                };
+                return { success: false, content: content, plan: plan, agent: agentName, error: 'Plan has no actionable steps. Found ' + plan.files.length + ' files but no steps.' };
             }
             return { success: true, content: content, plan: plan, agent: agentName };
 
@@ -610,7 +756,7 @@ MultiAgentOrchestrator.prototype.buildAgentPrompt = function(agentName, plan, cr
                 }
             }
             if (criticFeedback) {
-                prompt += '## CRITIC FEEDBACK — YOU MUST FIX THESE ISSUES\n' + criticFeedback + '\n\n';
+                prompt += '## CRITIC FEEDBACK — FIX THESE ISSUES\n' + criticFeedback + '\n\n';
             }
             if (this.taskContext) {
                 prompt += '## WORKSPACE CONTEXT\n' + this.taskContext + '\n\n';
@@ -620,14 +766,12 @@ MultiAgentOrchestrator.prototype.buildAgentPrompt = function(agentName, plan, cr
 
         case 'critic':
             var critiquePrompt = 'Review this code:\n\n';
-            if (this.taskContext) {
-                critiquePrompt += this.taskContext + '\n\n';
-            }
-            critiquePrompt += 'Apply strict standards. APPROVE only if code is production-ready. REJECT with specific numbered issues if not.';
+            if (this.taskContext) critiquePrompt += this.taskContext + '\n\n';
+            critiquePrompt += 'APPROVE only if production-ready. REJECT with numbered issues if not.';
             return critiquePrompt;
 
         case 'tester':
-            return 'Validate the implemented code:\n\n' + (this.taskContext || 'No code context available') + '\n\nGenerate tests and report PASS/FAIL.';
+            return 'Validate the implemented code:\n\n' + (this.taskContext || 'No code context available') + '\n\nReport PASS/FAIL.';
 
         default:
             return multiAgentState.currentTask ? multiAgentState.currentTask.userPrompt : 'No task';
@@ -659,8 +803,10 @@ MultiAgentOrchestrator.prototype.completeTask = function(status, error) {
 
         if (status === 'success') {
             toast('Multi-agent task completed in ' + (duration / 1000).toFixed(1) + 's', 'success');
+            renderAgentMessage('system', '**Task Complete**\n\nAll agents finished in ' + (duration / 1000).toFixed(1) + 's.', 'success');
         } else {
             toast('Multi-agent task failed: ' + (error || 'unknown'), 'error');
+            renderAgentMessage('system', '**Task Failed**\n\n' + (error || 'Unknown error'), 'error');
         }
     }
 
@@ -676,9 +822,7 @@ MultiAgentOrchestrator.prototype.completeTask = function(status, error) {
 };
 
 MultiAgentOrchestrator.prototype.abort = function() {
-    if (this.abortController) {
-        this.abortController.abort();
-    }
+    if (this.abortController) this.abortController.abort();
     this.completeTask('aborted', 'Task aborted by user');
 };
 
@@ -700,19 +844,18 @@ export function startMultiAgentMode() {
         return;
     }
 
-    /* ── HARD PRE-FLIGHT CHECK ──
-       If max_tokens is above a safe threshold, block the task and
-       tell the user exactly what to change. This prevents wasting
-       credits on a guaranteed 402 failure. */
-    var userMax = state.settings.maxTokens || 4096;
-    if (state.settings.provider === 'openrouter' && userMax > 1800) {
-        toast('Your Max Tokens is set to ' + userMax + '. Multi-agent makes 4 API calls (planner+coder+critic+tester). Lower Max Tokens in the sidebar to 400-1800 to fit your credit balance, or add credits at openrouter.ai/settings/credits', 'error');
-        return;
+    /* Soft warning if no workspace — don't block */
+    if (!isConnected()) {
+        toast('No workspace folder connected. Agents will work without file context.', 'info');
     }
+
+    /* NO hard block on max tokens anymore — the 402 auto-retry handles it */
 
     input.value = '';
     input.style.height = 'auto';
     autoResize(input);
+
+    addUserMessage(prompt);
 
     showMultiAgentStatus();
 
@@ -733,10 +876,7 @@ function showMultiAgentStatus() {
     actionsEl.insertAdjacentElement('beforebegin', statusEl);
 
     var updateLoop = setInterval(function() {
-        if (!multiAgentState.isActive) {
-            clearInterval(updateLoop);
-            return;
-        }
+        if (!multiAgentState.isActive) { clearInterval(updateLoop); return; }
         var agent = multiAgentState.currentAgent ? AGENTS[multiAgentState.currentAgent] : null;
         var name = agent ? agent.name : 'Initializing';
         statusEl.innerHTML = '<i class="fas fa-network-wired" style="animation:sai-spin 1s linear infinite"></i> <span>Multi-Agent: ' + name + '</span>';
@@ -748,7 +888,6 @@ function removeMultiAgentStatus() {
     if (el) el.remove();
 }
 
-/* Spin animation (only add once) */
 if (!document.getElementById('sai-spin-style')) {
     var spinStyle = document.createElement('style');
     spinStyle.id = 'sai-spin-style';
