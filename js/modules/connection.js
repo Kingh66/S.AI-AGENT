@@ -1,7 +1,7 @@
-/* ═══════════════════════════════════════
+/* ═══════════════════════════════════════════════════
    CONNECTION — LLM API calls, streaming
    Hard token cap prevents 402 on free tier
-   ═══════════════════════════════════════ */
+   ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { FILE_SYSTEM_INSTRUCTIONS } from './config.js';
 import { getFileContext } from './filesystem.js';
@@ -15,21 +15,16 @@ import { setConnectionStatus, toast } from './ui.js';
 var FETCH_TIMEOUT = 110000;
 var STREAM_STALL_TIMEOUT = 60000;
 
-/* ── Hard limits — nothing outside this range ever leaves this file ── */
+/* ── Hard limits ── */
 var MIN_MAX_TOKENS = 256;
 var MAX_MAX_TOKENS = 32768;
 var DEFAULT_MAX_TOKENS = 4096;
 
-/* ═══════════════════════════════════════
-   TOKEN ESTIMATOR — chars → tokens (safe)
-   1 token ≈ 3.5 chars for English/code
-   ═══════════════════════════════════════ */
 function estimateTokens(text) {
     if (!text) return 0;
     return Math.ceil(text.length / 3.5);
 }
 
-/* ── Clamp helper — used everywhere maxTokens is read ── */
 function clampMaxTokens(val) {
     if (typeof val !== 'number' || isNaN(val) || val < MIN_MAX_TOKENS) return DEFAULT_MAX_TOKENS;
     if (val > MAX_MAX_TOKENS) return MAX_MAX_TOKENS;
@@ -78,13 +73,6 @@ export function buildHeaders() {
     return h;
 }
 
-/* ═══════════════════════════════════════
-   SAFE CONTEXT BUILDER
-   Three-stage token reduction:
-   1. Skip file context for trivial messages
-   2. If over budget, strip file context
-   3. If still over, truncate history
-   ═══════════════════════════════════════ */
 function isTrivialMessage(text) {
     var t = text.trim().toLowerCase();
     var trivial = [
@@ -175,7 +163,6 @@ function buildSafeMessages(userText, systemPrompt) {
 }
 
 export async function sendMessage(userText, isAutoContinue) {
-    /* ── User clicked STOP while streaming ── */
     if (state.isStreaming && !isAutoContinue) {
         if (state.abortController) state.abortController.abort();
         state.abortController = null;
@@ -196,13 +183,9 @@ export async function sendMessage(userText, isAutoContinue) {
         state.activeTask.loopCount = 0;
     }
 
-    /* ═══════════════════════════════════════
-       SAFE CONTEXT BUILDING — prevents 402
-       ═══════════════════════════════════════ */
     var systemPrompt = buildSafeSystemPrompt(userText);
     var messages = buildSafeMessages(userText, systemPrompt);
 
-    /* Clamp maxTokens for the log too — shows the REAL value being sent */
     var actualMaxTokens = clampMaxTokens(state.settings.maxTokens);
 
     var totalEstTokens = 0;
@@ -347,16 +330,36 @@ export async function sendMessage(userText, isAutoContinue) {
                         var content = delta.content || null;
 
                         if (reasoning) {
-                            if (!isThinkingPhase) isThinkingPhase = true;
-                            thinkingContent += reasoning;
-                            showThinkingBlock(thinkingContent);
+                            /* ── KEY FIX: Check if model is a REAL reasoning model ──
+                               Known reasoning models (deepseek-r1, qwq, o1, reasoner):
+                                 → show thinking block, save only content to buffer.
+                               
+                               Free models (step-3.5-flash, mimo-v2-pro, minimax, etc.) abuse
+                               reasoning_content to send the START of their actual response,
+                               then switch to content. If we put it in a thinking block,
+                               it gets wiped on finalization and those chars are lost.
+                               
+                               Solution: for non-reasoning models, dump reasoning_content
+                               directly into the stream buffer alongside content. No thinking block. */
+                            var isKnownReasoner = model.indexOf('deepseek-r1') > -1 ||
+                                                  model.indexOf('qwq') > -1 ||
+                                                  model.indexOf('o1') > -1 ||
+                                                  model.indexOf('reasoner') > -1;
+
+                            if (isKnownReasoner) {
+                                /* Real reasoning model — use thinking block, save only content to buffer */
+                                if (!isThinkingPhase) isThinkingPhase = true;
+                                thinkingContent += reasoning;
+                                showThinkingBlock(thinkingContent);
+                            } else {
+                                /* NOT a reasoning model — dump everything to stream buffer.
+                                   This prevents free models from losing first characters
+                                   by sending them as reasoning_content instead of content. */
+                                appendStreamChunk(reasoning);
+                            }
                         }
 
                         if (content) {
-                            if (isThinkingPhase) {
-                                isThinkingPhase = false;
-                                closeThinkingBlock();
-                            }
                             appendStreamChunk(content);
                         }
                     } catch (e) { }

@@ -1,17 +1,21 @@
-/* ═══════════════════════════════════════
+/* ═════════════════════════════════════════
    MESSAGES — Rendering, streaming, actions
-   Ultra-fast native bypass + Lightweight streaming parser
+   textContent streaming (zero char loss),
+   safety net on empty buffer recovery
    ═══════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { parseMarkdown } from './markdown.js';
 import { highlightCodeBlocks, getTimeStr } from './ui.js';
 
-/* ── Fast-stream state ── */
 let backtickCount = 0;
 let streamPre = null;
+let streamTextNode = null;
 let renderTimer = null;
 const RENDER_THROTTLE = 25;
 let lastRenderTime = 0;
+
+/* Track whether we've received any real text this response */
+let receivedAnyRealText = false;
 
 export function removeWelcome() {
     const w = document.getElementById('welcome-state');
@@ -40,9 +44,6 @@ export function addBotMessageStart() {
     div.className = 'message bot';
     div.id = 'streaming-msg';
 
-    /* Build the COMPLETE structure in one innerHTML call —
-       no create-then-replace-then-reappend pattern that can
-       orphan the content element and corrupt its state. */
     div.innerHTML =
         '<div class="msg-avatar">S</div>' +
         '<div class="msg-body">' +
@@ -58,29 +59,32 @@ export function addBotMessageStart() {
 
     msgs.appendChild(div);
 
-    /* Grab the reference AFTER the DOM is built — guaranteed intact */
     state.streamElement = div.querySelector('.msg-content');
     state.streamBuffer = '';
     state.isRenderScheduled = false;
 
-    /* Reset fast-stream state */
     backtickCount = 0;
     streamPre = null;
+    streamTextNode = null;
     lastRenderTime = 0;
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+
+    /* Reset for each new response */
+    receivedAnyRealText = false;
 
     fastScroll();
 }
 
 export function appendStreamChunk(chunk) {
-    /* Defensive: ensure chunk is a string, strip any null/BOM bytes
-       that some models sneak in as the first character */
     if (typeof chunk !== 'string') chunk = String(chunk);
-    chunk = chunk.replace(/^\u0000+/, '').replace(/^\uFEFF/, '');
+    chunk = chunk.replace(/^[\u0000-\u001F\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\uFFFD]+/, '');
+    if (chunk.length === 0) return;
+
+    /* Mark that we received actual text this response */
+    receivedAnyRealText = true;
 
     state.streamBuffer += chunk;
 
-    /* ⚡ Count triple-backticks in THIS chunk only — O(len(chunk)) not O(total) */
     for (let i = 0; i < chunk.length - 2; i++) {
         if (chunk[i] === '`' && chunk[i + 1] === '`' && chunk[i + 2] === '`') {
             backtickCount++;
@@ -89,7 +93,6 @@ export function appendStreamChunk(chunk) {
     }
     var inCode = (backtickCount % 2 !== 0);
 
-    /* Schedule a throttled render — batches rapid chunks */
     if (!state.isRenderScheduled) {
         state.isRenderScheduled = true;
 
@@ -104,44 +107,29 @@ export function appendStreamChunk(chunk) {
             if (!state.streamElement) return;
 
             if (inCode) {
-                /* ⚡ ULTRA-FAST PATH: Raw native text dump. Zero JS parsing. */
                 if (!streamPre) {
                     streamPre = document.createElement('pre');
                     streamPre.className = 'streaming-code-pre';
                     state.streamElement.innerHTML = '';
                     state.streamElement.appendChild(streamPre);
+                    streamTextNode = null;
                 }
                 streamPre.textContent = state.streamBuffer;
             } else {
-                /* 🚀 FAST PATH: Lightweight streaming parser */
                 streamPre = null;
-                state.streamElement.innerHTML = parseMarkdownStreaming(state.streamBuffer);
+                if (!streamTextNode) {
+                    streamTextNode = document.createElement('span');
+                    state.streamElement.appendChild(streamTextNode);
+                }
+                streamTextNode.textContent = state.streamBuffer;
             }
 
-            /* Streaming cursor */
             appendCursor(state.streamElement);
             fastScroll();
         }, delay);
     }
 }
 
-/* ── Lightweight markdown parser for LIVE streaming ── */
-function parseMarkdownStreaming(text) {
-    var html = escapeHtml(text);
-    html = html.replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>');
-    html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
-    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-    html = html.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
-    html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-    html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-    html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-    html = html.replace(/^---+$/gm, '<hr>');
-    html = html.replace(/\n/g, '<br>');
-    return html;
-}
-
-/* ── Streaming cursor ── */
 function appendCursor(container) {
     var cursor = container.querySelector('.streaming-cursor');
     if (!cursor) {
@@ -156,20 +144,64 @@ function removeCursor(container) {
     if (cursor) cursor.remove();
 }
 
-/* ── Finalize: full parse + syntax highlight ── */
 export function finalizeStream() {
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
     state.isRenderScheduled = false;
 
     backtickCount = 0;
     streamPre = null;
+    streamTextNode = null;
 
     if (state.streamElement) {
         removeCursor(state.streamElement);
         state.streamElement.classList.remove('streaming-active');
 
-        /* Strip any leading garbage before the final parse */
-        var clean = state.streamBuffer.replace(/^\u0000+/, '').replace(/^\uFEFF/, '');
+        var clean = state.streamBuffer.replace(/^[\u0000-\u001F\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\uFFFD]+/, '');
+
+        /* ── SAFETY NET: Buffer empty but we received data ──
+           Sometimes the model sends ALL text as reasoning_content and zero
+           content. Or all chunks have parse errors. Result: empty buffer,
+           nothing renders, user sees blank message.
+           
+           Recovery attempts in order:
+           1. If thinking block exists in DOM, grab its text
+           2. If streamTextNode exists in DOM (orphaned), grab its text
+           3. Last resort: show a fallback message           */
+        if (clean.length === 0 && receivedAnyRealText) {
+            console.warn('[Messages] Buffer is empty but data was received. Attempting recovery...');
+
+            /* Try thinking block */
+            var thinkBlock = document.getElementById('sai-thinking-block');
+            if (thinkBlock) {
+                var thinkText = thinkBlock.querySelector('.thinking-text');
+                if (thinkText) {
+                    var recovered = thinkText.textContent || '';
+                    if (recovered.length > 5) {
+                        console.warn('[Messages] Recovered ' + recovered.length + ' chars from thinking block');
+                        clean = recovered;
+                    }
+                }
+            }
+
+            /* Try orphaned streamTextNode (shouldn't happen but safety check) */
+            if (clean.length === 0) {
+                var orphan = document.querySelector('.streaming-code-pre, .streaming-code-block, .msg-content span');
+                if (orphan) {
+                    var recovered2 = orphan.textContent || '';
+                    if (recovered2.length > 5) {
+                        console.warn('[Messages] Recovered ' + recovered2.length + ' chars from orphan stream node');
+                        clean = recovered2;
+                    }
+                }
+            }
+
+            /* Last resort: fallback message */
+            if (clean.length === 0) {
+                console.error('[Messages] COMPLETELY empty after receiving data. Model returned no text at all.');
+                clean = '⚠️ The model returned an empty response. Try again or switch models.';
+            }
+        }
+
         state.streamElement.innerHTML = parseMarkdown(clean);
         highlightCodeBlocks(state.streamElement);
         state.conversationHistory.push({ role: 'assistant', content: clean });
