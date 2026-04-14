@@ -1,6 +1,6 @@
 /* ═══════════════════════════════════════════════════
    CONNECTION — LLM API calls, streaming
-   Hard token cap prevents 402 on free tier
+   Hard token cap + 402 auto-retry + thinking hidden
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { FILE_SYSTEM_INSTRUCTIONS } from './config.js';
@@ -18,7 +18,10 @@ var STREAM_STALL_TIMEOUT = 60000;
 /* ── Hard limits ── */
 var MIN_MAX_TOKENS = 256;
 var MAX_MAX_TOKENS = 32768;
-var DEFAULT_MAX_TOKENS = 4096;
+var DEFAULT_MAX_TOKENS = 2048;
+
+/* ── 402 retry safety margin ── */
+var TOKEN_402_SAFETY_MARGIN = 150;
 
 function estimateTokens(text) {
     if (!text) return 0;
@@ -29,6 +32,41 @@ function clampMaxTokens(val) {
     if (typeof val !== 'number' || isNaN(val) || val < MIN_MAX_TOKENS) return DEFAULT_MAX_TOKENS;
     if (val > MAX_MAX_TOKENS) return MAX_MAX_TOKENS;
     return val;
+}
+
+/* ═══════════════════════════════════════
+   402 ERROR PARSER
+   ═══════════════════════════════════════ */
+function parse402Affordable(errText) {
+    if (!errText) return null;
+
+    try {
+        var parsed = JSON.parse(errText);
+        var msg = parsed.error && parsed.error.message ? parsed.error.message : '';
+        if (msg) errText = msg;
+    } catch (e) { }
+
+    var patterns = [
+        /can only afford\s+([\d,]+)/i,
+        /afford\s+up to\s+([\d,]+)/i,
+        /maximum\s+([\d,]+)\s*tokens.*allowed/i,
+        /limit.*?([\d,]+)\s*tokens/i
+    ];
+
+    for (var i = 0; i < patterns.length; i++) {
+        var match = errText.match(patterns[i]);
+        if (match) {
+            var numStr = match[1].replace(/,/g, '');
+            var num = parseInt(numStr, 10);
+            if (num && num > 0) {
+                var safe = num - TOKEN_402_SAFETY_MARGIN;
+                if (safe < MIN_MAX_TOKENS) safe = MIN_MAX_TOKENS;
+                return safe;
+            }
+        }
+    }
+
+    return 1024;
 }
 
 export function getApiUrl() {
@@ -43,10 +81,10 @@ export function isOllamaProvider() {
     return state.settings.provider === 'ollama';
 }
 
-export function buildPayload(messages, overrideModel) {
+export function buildPayload(messages, overrideModel, overrideMaxTokens) {
     var model = overrideModel || state.settings.model || 'gpt-3.5-turbo';
     var temperature = state.settings.temperature;
-    var maxTokens = clampMaxTokens(state.settings.maxTokens);
+    var maxTokens = clampMaxTokens(overrideMaxTokens != null ? overrideMaxTokens : state.settings.maxTokens);
 
     if (isOllamaProvider()) {
         return { model: model, messages: messages, stream: true, options: { temperature: temperature, num_predict: maxTokens } };
@@ -115,7 +153,6 @@ function buildSafeMessages(userText, systemPrompt) {
     var maxInputTokens = estimateTokens(state.settings.contextBudget || 60000);
     var safeLimit = Math.floor(maxInputTokens * 0.8);
 
-    var stripped = false;
     if (sysTokens > safeLimit) {
         console.warn('[Connection] System prompt (' + sysTokens + ' tokens) exceeds safe limit (' + safeLimit + '). Stripping file context.');
 
@@ -126,73 +163,47 @@ function buildSafeMessages(userText, systemPrompt) {
         var strippedTokens = estimateTokens(sys);
         if (strippedTokens <= safeLimit) {
             systemPrompt = sys;
-            sysTokens = strippedTokens;
-            stripped = true;
-            toast('File context stripped — too large for your budget. Increase Context Budget in Settings or start a new chat.', 'info');
+            toast('File context stripped — too large for your budget.', 'info');
         } else {
             systemPrompt = state.settings.systemPrompt;
-            sysTokens = estimateTokens(systemPrompt);
-            if (sysTokens > safeLimit) {
-                var maxSysChars = Math.floor(safeLimit * 3.5);
-                systemPrompt = systemPrompt.substring(0, maxSysChars) + '\n\n[System prompt truncated to fit token budget]';
-                sysTokens = safeLimit;
+            var st = estimateTokens(systemPrompt);
+            if (st > safeLimit) {
+                systemPrompt = systemPrompt.substring(0, Math.floor(safeLimit * 3.5)) + '\n\n[System prompt truncated]';
                 toast('System prompt truncated to fit budget.', 'error');
             }
-            stripped = true;
         }
     }
 
-    var remainingTokens = safeLimit - sysTokens;
+    var remainingTokens = safeLimit - estimateTokens(systemPrompt);
     var historySlice = [];
 
     for (var i = state.conversationHistory.length - 1; i >= 0; i--) {
         var msgTokens = estimateTokens(state.conversationHistory[i].content);
-        if (historySlice.length > 0 && (remainingTokens - msgTokens) < 500) {
-            break;
-        }
+        if (historySlice.length > 0 && (remainingTokens - msgTokens) < 500) break;
         historySlice.unshift(state.conversationHistory[i]);
         remainingTokens -= msgTokens;
     }
 
     var trimmedCount = state.conversationHistory.length - historySlice.length;
     if (trimmedCount > 0) {
-        console.log('[Connection] Trimmed ' + trimmedCount + ' old messages from history to fit budget');
+        console.log('[Connection] Trimmed ' + trimmedCount + ' old messages from history');
     }
 
     return [{ role: 'system', content: systemPrompt }].concat(historySlice);
 }
 
-export async function sendMessage(userText, isAutoContinue) {
-    if (state.isStreaming && !isAutoContinue) {
-        if (state.abortController) state.abortController.abort();
-        state.abortController = null;
-        state.activeTask.isRunning = false;
-        state.activeTask.loopCount = 0;
-        return;
-    }
-
-    if (!isAutoContinue) {
-        if (!userText.trim()) return;
-        if (!state.settings.apiKey) { toast('No API key set. Open Settings.', 'error'); return; }
-        if (!state.settings.model) { toast('No model selected. Open Settings and click Fetch Models.', 'error'); return; }
-
-        addUserMessage(userText);
-        state.conversationHistory.push({ role: 'user', content: userText });
-
-        state.activeTask.isRunning = true;
-        state.activeTask.loopCount = 0;
-    }
-
-    var systemPrompt = buildSafeSystemPrompt(userText);
-    var messages = buildSafeMessages(userText, systemPrompt);
-
-    var actualMaxTokens = clampMaxTokens(state.settings.maxTokens);
+/* ═══════════════════════════════════════════════════
+   CORE STREAMING LOGIC
+   ═══════════════════════════════════════════════════ */
+async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
+    var model = state.settings.model || 'gpt-3.5-turbo';
+    var actualMaxTokens = clampMaxTokens(overrideMaxTokens != null ? overrideMaxTokens : state.settings.maxTokens);
 
     var totalEstTokens = 0;
     for (var m = 0; m < messages.length; m++) {
         totalEstTokens += estimateTokens(messages[m].content);
     }
-    console.log('[Connection] Sending ~' + totalEstTokens + ' input tokens + ' + actualMaxTokens + ' max output tokens');
+    console.log('[Connection] Sending ~' + totalEstTokens + ' input + ' + actualMaxTokens + ' output tokens');
 
     state.isStreaming = true;
     state.abortController = new AbortController();
@@ -234,7 +245,6 @@ export async function sendMessage(userText, isAutoContinue) {
     var fetchTimeoutId = setTimeout(function () {
         if (state.isStreaming && state.abortController) {
             abortSource = 'timeout';
-            console.warn('Fetch timeout (' + FETCH_TIMEOUT + 'ms). Aborting...');
             state.abortController.abort();
         }
     }, FETCH_TIMEOUT);
@@ -242,7 +252,6 @@ export async function sendMessage(userText, isAutoContinue) {
     var stallWatchdog = setInterval(function () {
         if (state.isStreaming && firstTokenReceived && (Date.now() - lastChunkTime > STREAM_STALL_TIMEOUT)) {
             abortSource = 'stall';
-            console.warn('Stream stalled (no data for ' + STREAM_STALL_TIMEOUT / 1000 + 's). Force-finalizing...');
             if (state.abortController) state.abortController.abort();
         }
     }, 5000);
@@ -257,28 +266,60 @@ export async function sendMessage(userText, isAutoContinue) {
         var res = await fetch(getApiUrl(), {
             method: 'POST',
             headers: buildHeaders(),
-            body: JSON.stringify(buildPayload(messages)),
+            body: JSON.stringify(buildPayload(messages, null, actualMaxTokens)),
             signal: state.abortController.signal
         });
 
         clearTimeout(fetchTimeoutId);
         fetchTimeoutId = null;
 
+        /* ═══════════════════════════════════════
+           402 — AUTO-RETRY with reduced tokens
+           ═══════════════════════════════════════ */
+        if (res.status === 402) {
+            var err402Text = await res.text().catch(function () { return ''; });
+            var affordableTokens = parse402Affordable(err402Text);
+
+            console.warn('[Connection] 402. Affordable tokens: ' + affordableTokens);
+
+            if (affordableTokens && affordableTokens < actualMaxTokens && affordableTokens >= MIN_MAX_TOKENS) {
+                clearInterval(stallWatchdog);
+                if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
+                if (fetchTimeoutId) { clearTimeout(fetchTimeoutId); fetchTimeoutId = null; }
+
+                var streamMsg = document.getElementById('streaming-msg');
+                if (streamMsg && !isAutoContinue) streamMsg.remove();
+
+                state.isStreaming = false;
+                state.streamElement = null;
+                state.streamBuffer = '';
+                state.thinkingContent = '';
+
+                state.settings.maxTokens = affordableTokens;
+                import('./storage.js').then(function (s) { s.saveSettings(); });
+
+                var tokensInput = document.getElementById('q-tokens');
+                if (tokensInput) tokensInput.value = affordableTokens;
+
+                toast('Auto-reduced max tokens to ' + affordableTokens + ' (free tier limit). Retrying...', 'info');
+                setConnectionStatus('connecting', 'Retrying with ' + affordableTokens + ' tokens...');
+
+                await new Promise(function (r) { setTimeout(r, 800); });
+                return executeStream(messages, affordableTokens, isAutoContinue);
+            } else {
+                throw new Error('INSUFFICIENT_CREDITS: Free tier balance too low. Reduce max_tokens or add credits at openrouter.ai/settings/credits');
+            }
+        }
+
         if (!res.ok) {
             var errText = await res.text().catch(function () { return ''; });
             var status = res.status;
 
-            if (status === 429) {
-                throw new Error('RATE_LIMIT:' + errText.substring(0, 300));
-            } else if (status === 401 || status === 403) {
-                throw new Error('AUTH_ERROR:' + status + ': ' + errText.substring(0, 200));
-            } else if (status === 502 || status === 503 || status === 504) {
-                throw new Error('SERVER_OVERLOAD:' + status + ': ' + errText.substring(0, 200));
-            } else if (status >= 500) {
-                throw new Error('SERVER_ERROR:' + status + ': ' + errText.substring(0, 300));
-            } else {
-                throw new Error('HTTP ' + status + ': ' + errText.substring(0, 300));
-            }
+            if (status === 429) throw new Error('RATE_LIMIT:' + errText.substring(0, 300));
+            else if (status === 401 || status === 403) throw new Error('AUTH_ERROR:' + status + ': ' + errText.substring(0, 200));
+            else if (status === 502 || status === 503 || status === 504) throw new Error('SERVER_OVERLOAD:' + status + ': ' + errText.substring(0, 200));
+            else if (status >= 500) throw new Error('SERVER_ERROR:' + status + ': ' + errText.substring(0, 300));
+            else throw new Error('HTTP ' + status + ': ' + errText.substring(0, 300));
         }
 
         var reader = res.body.getReader();
@@ -292,11 +333,7 @@ export async function sendMessage(userText, isAutoContinue) {
                 firstTokenReceived = true;
                 clearInterval(thinkTimer);
                 thinkTimer = null;
-                if (isAutoContinue) {
-                    setConnectionStatus('connecting', 'Task loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + '...');
-                } else {
-                    setConnectionStatus('connecting', 'Generating...');
-                }
+                setConnectionStatus('connecting', isAutoContinue ? 'Task loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + '...' : 'Generating...');
             }
 
             lastChunkTime = Date.now();
@@ -329,34 +366,17 @@ export async function sendMessage(userText, isAutoContinue) {
                         var reasoning = delta.reasoning_content || delta.reasoning || delta.thinking || null;
                         var content = delta.content || null;
 
+                        /* ═══════════════════════════════════════
+                           REASONING CONTENT — ALWAYS hidden
+                           Free models (step-3.5-flash, mimo, etc.)
+                           abuse reasoning_content for chain-of-thought.
+                           NEVER dump it into the visible stream buffer.
+                           Always route to the collapsible thinking block.
+                           ═══════════════════════════════════════ */
                         if (reasoning) {
-                            /* ── KEY FIX: Check if model is a REAL reasoning model ──
-                               Known reasoning models (deepseek-r1, qwq, o1, reasoner):
-                                 → show thinking block, save only content to buffer.
-                               
-                               Free models (step-3.5-flash, mimo-v2-pro, minimax, etc.) abuse
-                               reasoning_content to send the START of their actual response,
-                               then switch to content. If we put it in a thinking block,
-                               it gets wiped on finalization and those chars are lost.
-                               
-                               Solution: for non-reasoning models, dump reasoning_content
-                               directly into the stream buffer alongside content. No thinking block. */
-                            var isKnownReasoner = model.indexOf('deepseek-r1') > -1 ||
-                                                  model.indexOf('qwq') > -1 ||
-                                                  model.indexOf('o1') > -1 ||
-                                                  model.indexOf('reasoner') > -1;
-
-                            if (isKnownReasoner) {
-                                /* Real reasoning model — use thinking block, save only content to buffer */
-                                if (!isThinkingPhase) isThinkingPhase = true;
-                                thinkingContent += reasoning;
-                                showThinkingBlock(thinkingContent);
-                            } else {
-                                /* NOT a reasoning model — dump everything to stream buffer.
-                                   This prevents free models from losing first characters
-                                   by sending them as reasoning_content instead of content. */
-                                appendStreamChunk(reasoning);
-                            }
+                            if (!isThinkingPhase) isThinkingPhase = true;
+                            thinkingContent += reasoning;
+                            showThinkingBlock(thinkingContent);
                         }
 
                         if (content) {
@@ -367,8 +387,14 @@ export async function sendMessage(userText, isAutoContinue) {
             }
         }
 
+        /* ═══════════════════════════════════════
+           STREAM COMPLETE — save thinking to state
+           BEFORE finalizeStream wipes the DOM
+           ═══════════════════════════════════════ */
+        state.thinkingContent = thinkingContent;
         if (isThinkingPhase) closeThinkingBlock();
         finalizeStream();
+
         clearInterval(stallWatchdog);
         if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
 
@@ -406,6 +432,8 @@ export async function sendMessage(userText, isAutoContinue) {
         }
 
     } catch (error) {
+        /* Save thinking even on error in case we need recovery */
+        state.thinkingContent = thinkingContent;
         closeThinkingBlock();
         clearInterval(stallWatchdog);
         if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
@@ -418,7 +446,7 @@ export async function sendMessage(userText, isAutoContinue) {
                 state.activeTask.loopCount = 0;
                 state.isStreaming = false;
                 updateSendButton();
-                toast('Request timed out (' + (FETCH_TIMEOUT / 1000) + 's) — model may be overloaded. Try again or switch models.', 'error');
+                toast('Request timed out (' + (FETCH_TIMEOUT / 1000) + 's). Try again or switch models.', 'error');
                 setConnectionStatus('disconnected', 'Timeout');
 
             } else if (abortSource === 'stall') {
@@ -429,7 +457,7 @@ export async function sendMessage(userText, isAutoContinue) {
                 if (state.activeTask.isRunning && (finishReason === 'length' || stallTag) && state.activeTask.loopCount < state.activeTask.maxLoops) {
                     state.activeTask.loopCount++;
                     toast('Stream stalled. Auto-continuing (' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')...', 'error');
-                    setConnectionStatus('connecting', 'Stall recovery (loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')...');
+                    setConnectionStatus('connecting', 'Stall recovery...');
 
                     state.conversationHistory.push({
                         role: 'user',
@@ -441,7 +469,7 @@ export async function sendMessage(userText, isAutoContinue) {
                     state.activeTask.loopCount = 0;
                     state.isStreaming = false;
                     updateSendButton();
-                    toast('Stream stalled — no data for ' + (STREAM_STALL_TIMEOUT / 1000) + 's. Model may be overloaded.', 'error');
+                    toast('Stream stalled — no data for ' + (STREAM_STALL_TIMEOUT / 1000) + 's.', 'error');
                     setConnectionStatus('connected', 'Connected — ' + state.settings.model);
                 }
 
@@ -458,22 +486,28 @@ export async function sendMessage(userText, isAutoContinue) {
 
         var errMsg = error.message || '';
 
-        if (errMsg.indexOf('RATE_LIMIT:') === 0) {
-            var rateDetail = errMsg.replace('RATE_LIMIT:', '');
+        if (errMsg.indexOf('INSUFFICIENT_CREDITS:') === 0) {
             state.activeTask.isRunning = false;
             state.activeTask.loopCount = 0;
             state.isStreaming = false;
             updateSendButton();
-            toast('Rate limited by provider. Wait a moment or switch models.', 'error');
+            toast('Insufficient credits. ' + errMsg.replace('INSUFFICIENT_CREDITS:', '').substring(0, 120), 'error');
+            setConnectionStatus('disconnected', 'No Credits');
+
+        } else if (errMsg.indexOf('RATE_LIMIT:') === 0) {
+            state.activeTask.isRunning = false;
+            state.activeTask.loopCount = 0;
+            state.isStreaming = false;
+            updateSendButton();
+            toast('Rate limited. Wait a moment or switch models.', 'error');
             setConnectionStatus('disconnected', 'Rate Limited');
-            state.lastError = { type: 'rate_limit', detail: rateDetail };
 
         } else if (errMsg.indexOf('AUTH_ERROR:') === 0) {
             state.activeTask.isRunning = false;
             state.activeTask.loopCount = 0;
             state.isStreaming = false;
             updateSendButton();
-            toast('Authentication failed. Check your API key in Settings.', 'error');
+            toast('Authentication failed. Check your API key.', 'error');
             setConnectionStatus('disconnected', 'Auth Error');
 
         } else if (errMsg.indexOf('SERVER_OVERLOAD:') === 0) {
@@ -481,17 +515,15 @@ export async function sendMessage(userText, isAutoContinue) {
             state.activeTask.loopCount = 0;
             state.isStreaming = false;
             updateSendButton();
-            toast('Provider overloaded (502/503/504). Try again in a moment.', 'error');
+            toast('Provider overloaded (502/503/504). Try again shortly.', 'error');
             setConnectionStatus('disconnected', 'Server Overloaded');
-            state.lastError = { type: 'server_overload', detail: errMsg.replace('SERVER_OVERLOAD:', '') };
 
         } else if (errMsg.indexOf('SERVER_ERROR:') === 0) {
             state.activeTask.isRunning = false;
             state.activeTask.loopCount = 0;
             state.isStreaming = false;
             updateSendButton();
-            var serverDetail = errMsg.replace('SERVER_ERROR:', '');
-            toast('Server error: ' + serverDetail.substring(0, 100), 'error');
+            toast('Server error: ' + errMsg.replace('SERVER_ERROR:', '').substring(0, 100), 'error');
             setConnectionStatus('disconnected', 'Server Error');
 
         } else {
@@ -499,9 +531,8 @@ export async function sendMessage(userText, isAutoContinue) {
             state.activeTask.loopCount = 0;
             state.isStreaming = false;
             updateSendButton();
-
             var msg = errMsg.indexOf('Failed to fetch') > -1 || errMsg.indexOf('NetworkError') > -1
-                ? 'Cannot reach the LLM endpoint. Check your connection and endpoint URL.' : errMsg;
+                ? 'Cannot reach the LLM endpoint. Check connection and URL.' : errMsg;
             toast(msg, 'error');
             setConnectionStatus('disconnected', 'Connection Error');
         }
@@ -520,26 +551,55 @@ export async function sendMessage(userText, isAutoContinue) {
     }
 }
 
-/* ── Thinking block management ── */
+/* ═══════════════════════════════════════
+   PUBLIC sendMessage
+   ═══════════════════════════════════════ */
+export async function sendMessage(userText, isAutoContinue) {
+    if (state.isStreaming && !isAutoContinue) {
+        if (state.abortController) state.abortController.abort();
+        state.abortController = null;
+        state.activeTask.isRunning = false;
+        state.activeTask.loopCount = 0;
+        return;
+    }
+
+    if (!isAutoContinue) {
+        if (!userText.trim()) return;
+        if (!state.settings.apiKey) { toast('No API key set. Open Settings.', 'error'); return; }
+        if (!state.settings.model) { toast('No model selected. Open Settings.', 'error'); return; }
+
+        addUserMessage(userText);
+        state.conversationHistory.push({ role: 'user', content: userText });
+
+        state.activeTask.isRunning = true;
+        state.activeTask.loopCount = 0;
+    }
+
+    var systemPrompt = buildSafeSystemPrompt(userText);
+    var messages = buildSafeMessages(userText, systemPrompt);
+
+    return executeStream(messages, null, isAutoContinue);
+}
+
+/* ── Thinking block (streaming phase only — gets replaced on finalization) ── */
 function showThinkingBlock(text) {
     if (!state.streamElement) return;
     var el = state.streamElement;
-    var thinkingId = 'sai-thinking-block';
     var display = text.length > 800 ? '...' + text.slice(-800) : text;
     display = display.replace(/\n/g, '<br>');
 
-    var existing = document.getElementById(thinkingId);
+    var existing = document.getElementById('sai-thinking-block');
     if (existing) {
         existing.querySelector('.thinking-text').innerHTML = display;
         existing.scrollTop = existing.scrollHeight;
     } else {
         var block = document.createElement('div');
-        block.id = thinkingId;
+        block.id = 'sai-thinking-block';
         block.className = 'thinking-block';
         block.innerHTML =
             '<div class="thinking-header">' +
             '<span class="thinking-label"><i class="fas fa-brain"></i> Thinking...</span>' +
-            '<button class="thinking-toggle" onclick="toggleThinkingBlock()" title="Toggle thinking"><i class="fas fa-chevron-down"></i></button>' +
+            '<button class="thinking-toggle" onclick="toggleThinkingBlock(this)" title="Toggle thinking"><i class="fas fa-chevron-down"></i></button>' +
             '</div>' +
             '<div class="thinking-text">' + display + '</div>';
         el.insertBefore(block, el.firstChild);
@@ -550,32 +610,13 @@ function closeThinkingBlock() {
     var existing = document.getElementById('sai-thinking-block');
     if (existing) {
         var label = existing.querySelector('.thinking-label');
-        if (label) label.innerHTML = '<i class="fas fa-brain"></i> Thought for ' + formatThinkTime(thinkingContent.length);
-        var toggle = existing.querySelector('.thinking-toggle');
-        if (toggle) toggle.style.display = '';
+        if (label) {
+            var charCount = state.thinkingContent ? state.thinkingContent.length : 0;
+            var secs = Math.max(1, Math.round(charCount / 15));
+            var timeStr = secs < 60 ? secs + 's' : Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
+            label.innerHTML = '<i class="fas fa-brain"></i> Thought for ' + timeStr;
+        }
     }
-}
-
-window.toggleThinkingBlock = function () {
-    var block = document.getElementById('sai-thinking-block');
-    if (!block) return;
-    var textEl = block.querySelector('.thinking-text');
-    var icon = block.querySelector('.thinking-toggle i');
-    if (textEl.style.display === 'none') {
-        textEl.style.display = 'block';
-        icon.className = 'fas fa-chevron-down';
-    } else {
-        textEl.style.display = 'none';
-        icon.className = 'fas fa-chevron-right';
-    }
-};
-
-function formatThinkTime(charCount) {
-    var secs = Math.max(1, Math.round(charCount / 15));
-    if (secs < 60) return secs + 's';
-    var mins = Math.floor(secs / 60);
-    var remSecs = secs % 60;
-    return mins + 'm ' + remSecs + 's';
 }
 
 /* ── Test Connection ── */
@@ -605,7 +646,21 @@ export async function testConnection() {
         var r = await fetch(getApiUrl(), { method: 'POST', headers: h, body: body });
         if (!r.ok) {
             var e = await r.text().catch(function () { return ''; });
-            if (r.status === 429) throw new Error('Rate limited. Wait a moment and try again.');
+
+            if (r.status === 402) {
+                var affordable = parse402Affordable(e);
+                if (affordable) {
+                    state.settings.maxTokens = affordable;
+                    import('./storage.js').then(function (s) { s.saveSettings(); });
+                    var tokensInput = document.getElementById('q-tokens');
+                    if (tokensInput) tokensInput.value = affordable;
+                    toast('Test passed but credits low — max tokens set to ' + affordable, 'info');
+                    setConnectionStatus('connected', 'Connected — ' + model + ' (' + affordable + ' tok)');
+                    return true;
+                }
+            }
+
+            if (r.status === 429) throw new Error('Rate limited. Wait and try again.');
             if (r.status === 401 || r.status === 403) throw new Error('Authentication failed. Check your API key.');
             throw new Error('HTTP ' + r.status + ': ' + e.substring(0, 200));
         }
@@ -657,9 +712,7 @@ export async function fetchModels() {
             toast('No models found.', 'error');
             listEl.style.display = 'none';
         } else {
-            listEl.innerHTML = models.map(function (m) {
-                return '<option value="' + m + '">' + m + '</option>';
-            }).join('');
+            listEl.innerHTML = models.map(function (m) { return '<option value="' + m + '">' + m + '</option>'; }).join('');
             listEl.style.display = 'block';
             toast('Found ' + models.length + ' model(s)', 'success');
             if (!state.settings.model) {
@@ -693,9 +746,7 @@ async function fetchOpenRouterModels() {
 
         for (var x = 0; x < allModels.length; x++) {
             var ctx = allModels[x].context_length;
-            if (ctx) {
-                state.modelContextLimits[allModels[x].id] = Math.floor(ctx * 3.5);
-            }
+            if (ctx) state.modelContextLimits[allModels[x].id] = Math.floor(ctx * 3.5);
         }
 
         var topTierIds = [

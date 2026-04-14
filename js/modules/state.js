@@ -14,6 +14,7 @@ export const state = {
     sidebarOpen: false,
     currentChatId: null,
     abortController: null,
+    thinkingContent: '',
 
     settings: {
         provider: 'openrouter',
@@ -21,7 +22,7 @@ export const state = {
         apiKey: '',
         model: '',
         temperature: 0.7,
-        maxTokens: 4096,
+        maxTokens: 2048,
         contextBudget: 60000,
         systemPrompt: '',
     },

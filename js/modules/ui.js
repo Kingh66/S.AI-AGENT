@@ -197,8 +197,8 @@ function injectMaxTokensPresets() {
     presetWrap.id = 'max-tokens-presets';
     presetWrap.style.cssText = 'display:flex;gap:6px;margin-top:6px;flex-wrap:wrap';
     presetWrap.innerHTML =
-        '<button type="button" class="mtk-preset-btn" data-val="2048" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">2K</button>' +
-        '<button type="button" class="mtk-preset-btn" data-val="4096" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--accent);background:rgba(0,212,170,0.1);color:var(--accent);cursor:pointer;transition:all 0.15s;font-weight:600">4K</button>' +
+        '<button type="button" class="mtk-preset-btn" data-val="2048" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--accent);background:rgba(0,212,170,0.1);color:var(--accent);cursor:pointer;transition:all 0.15s;font-weight:600">2K</button>' +
+        '<button type="button" class="mtk-preset-btn" data-val="4096" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">4K</button>' +
         '<button type="button" class="mtk-preset-btn" data-val="8192" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">8K</button>' +
         '<button type="button" class="mtk-preset-btn" data-val="16384" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">16K</button>' +
         '<button type="button" class="mtk-preset-btn" data-val="32768" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">32K</button>';

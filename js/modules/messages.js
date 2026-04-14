@@ -1,8 +1,8 @@
-/* ═════════════════════════════════════════
+/* ═══════════════════════════════════════════════════
    MESSAGES — Rendering, streaming, actions
    textContent streaming (zero char loss),
-   safety net on empty buffer recovery
-   ═══════════════════════════════════════ */
+   thinking block survives finalization
+   ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { parseMarkdown } from './markdown.js';
 import { highlightCodeBlocks, getTimeStr } from './ui.js';
@@ -62,6 +62,7 @@ export function addBotMessageStart() {
     state.streamElement = div.querySelector('.msg-content');
     state.streamBuffer = '';
     state.isRenderScheduled = false;
+    state.thinkingContent = '';
 
     backtickCount = 0;
     streamPre = null;
@@ -106,11 +107,15 @@ export function appendStreamChunk(chunk) {
 
             if (!state.streamElement) return;
 
+            /* During streaming, skip over any thinking block that was injected */
+            var thinkBlock = state.streamElement.querySelector('.thinking-block');
+
             if (inCode) {
                 if (!streamPre) {
                     streamPre = document.createElement('pre');
                     streamPre.className = 'streaming-code-pre';
-                    state.streamElement.innerHTML = '';
+                    /* Clear only non-thinking children */
+                    clearNonThinkingChildren(state.streamElement);
                     state.streamElement.appendChild(streamPre);
                     streamTextNode = null;
                 }
@@ -119,6 +124,7 @@ export function appendStreamChunk(chunk) {
                 streamPre = null;
                 if (!streamTextNode) {
                     streamTextNode = document.createElement('span');
+                    clearNonThinkingChildren(state.streamElement);
                     state.streamElement.appendChild(streamTextNode);
                 }
                 streamTextNode.textContent = state.streamBuffer;
@@ -127,6 +133,16 @@ export function appendStreamChunk(chunk) {
             appendCursor(state.streamElement);
             fastScroll();
         }, delay);
+    }
+}
+
+/* Remove all children except the thinking block */
+function clearNonThinkingChildren(container) {
+    var children = Array.from(container.children);
+    for (var i = 0; i < children.length; i++) {
+        if (!children[i].classList.contains('thinking-block')) {
+            children[i].remove();
+        }
     }
 }
 
@@ -144,6 +160,34 @@ function removeCursor(container) {
     if (cursor) cursor.remove();
 }
 
+/* ═══════════════════════════════════════
+   Build a collapsed thinking block for
+   post-finalization injection
+   ═══════════════════════════════════════ */
+function buildFinalThinkingBlock(text) {
+    if (!text || text.length < 10) return '';
+    var display = text.length > 1200 ? '...' + text.slice(-1200) : text;
+    display = escapeHtml(display).replace(/\n/g, '<br>');
+    var timeStr = formatThinkTimeChars(text.length);
+    var uid = 'think-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6);
+
+    return '<div class="thinking-block" id="' + uid + '">' +
+        '<div class="thinking-header">' +
+        '<span class="thinking-label"><i class="fas fa-brain"></i> Thought for ' + timeStr + '</span>' +
+        '<button class="thinking-toggle" onclick="toggleThinkingBlock(this)" title="Toggle thinking"><i class="fas fa-chevron-right"></i></button>' +
+        '</div>' +
+        '<div class="thinking-text" style="display:none;max-height:300px;overflow-y:auto">' + display + '</div>' +
+        '</div>';
+}
+
+function formatThinkTimeChars(charCount) {
+    var secs = Math.max(1, Math.round(charCount / 15));
+    if (secs < 60) return secs + 's';
+    var mins = Math.floor(secs / 60);
+    var remSecs = secs % 60;
+    return mins + 'm ' + remSecs + 's';
+}
+
 export function finalizeStream() {
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
     state.isRenderScheduled = false;
@@ -158,52 +202,33 @@ export function finalizeStream() {
 
         var clean = state.streamBuffer.replace(/^[\u0000-\u001F\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\uFFFD]+/, '');
 
-        /* ── SAFETY NET: Buffer empty but we received data ──
-           Sometimes the model sends ALL text as reasoning_content and zero
-           content. Or all chunks have parse errors. Result: empty buffer,
-           nothing renders, user sees blank message.
-           
-           Recovery attempts in order:
-           1. If thinking block exists in DOM, grab its text
-           2. If streamTextNode exists in DOM (orphaned), grab its text
-           3. Last resort: show a fallback message           */
+        /* ── SAFETY NET: Buffer empty but we received data ── */
         if (clean.length === 0 && receivedAnyRealText) {
             console.warn('[Messages] Buffer is empty but data was received. Attempting recovery...');
 
-            /* Try thinking block */
-            var thinkBlock = document.getElementById('sai-thinking-block');
-            if (thinkBlock) {
-                var thinkText = thinkBlock.querySelector('.thinking-text');
-                if (thinkText) {
-                    var recovered = thinkText.textContent || '';
-                    if (recovered.length > 5) {
-                        console.warn('[Messages] Recovered ' + recovered.length + ' chars from thinking block');
-                        clean = recovered;
-                    }
-                }
-            }
-
-            /* Try orphaned streamTextNode (shouldn't happen but safety check) */
-            if (clean.length === 0) {
-                var orphan = document.querySelector('.streaming-code-pre, .streaming-code-block, .msg-content span');
-                if (orphan) {
-                    var recovered2 = orphan.textContent || '';
-                    if (recovered2.length > 5) {
-                        console.warn('[Messages] Recovered ' + recovered2.length + ' chars from orphan stream node');
-                        clean = recovered2;
-                    }
-                }
-            }
-
-            /* Last resort: fallback message */
-            if (clean.length === 0) {
-                console.error('[Messages] COMPLETELY empty after receiving data. Model returned no text at all.');
+            /* Recover from state-saved thinking content */
+            if (state.thinkingContent && state.thinkingContent.length > 10) {
+                console.warn('[Messages] Model sent only reasoning_content, no actual content.');
+                clean = '⚠️ The model returned only internal reasoning with no response. Try again or switch models.';
+            } else {
+                console.error('[Messages] COMPLETELY empty after receiving data.');
                 clean = '⚠️ The model returned an empty response. Try again or switch models.';
             }
         }
 
-        state.streamElement.innerHTML = parseMarkdown(clean);
+        /* ── Re-inject thinking block after innerHTML replace ── */
+        var thinkHtml = '';
+        if (state.thinkingContent && state.thinkingContent.length > 10) {
+            thinkHtml = buildFinalThinkingBlock(state.thinkingContent);
+        }
+        state.thinkingContent = '';
+
+        /* Replace content — thinking block is NOT in streamBuffer so it won't duplicate */
+        state.streamElement.innerHTML = thinkHtml + parseMarkdown(clean);
+
+        /* Re-highlight any code blocks */
         highlightCodeBlocks(state.streamElement);
+
         state.conversationHistory.push({ role: 'assistant', content: clean });
 
         if (voiceState.isVoiceChat) {
@@ -229,6 +254,31 @@ export function finalizeStream() {
         updateSendButton();
     }
 }
+
+/* ═══════════════════════════════════════
+   Thinking block toggle — works both during
+   streaming (by ID) and after finalization
+   (by element reference)
+   ═══════════════════════════════════════ */
+window.toggleThinkingBlock = function (el) {
+    var block;
+    if (el && el.closest) {
+        block = el.closest('.thinking-block');
+    } else {
+        block = document.getElementById('sai-thinking-block');
+    }
+    if (!block) return;
+    var textEl = block.querySelector('.thinking-text');
+    var icon = block.querySelector('.thinking-toggle i');
+    if (!textEl || !icon) return;
+    if (textEl.style.display === 'none') {
+        textEl.style.display = 'block';
+        icon.className = 'fas fa-chevron-down';
+    } else {
+        textEl.style.display = 'none';
+        icon.className = 'fas fa-chevron-right';
+    }
+};
 
 function fastScroll() {
     var msgs = document.getElementById('messages');
