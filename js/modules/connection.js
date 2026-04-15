@@ -257,23 +257,27 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     var abortSource = null;
 
     var thinkStartTime = Date.now();
+    /* Ollama: update status every 2s instead of 500ms to reduce DOM writes */
+    var thinkInterval = isOllamaProvider() ? 2000 : 500;
     var thinkTimer = setInterval(function () {
         if (!firstTokenReceived && state.isStreaming) {
             var elapsed = ((Date.now() - thinkStartTime) / 1000).toFixed(0);
             setConnectionStatus('connecting', isAutoContinue ? 'File ' + (state.activeTask.loopCount + 1) + '... ' + elapsed + 's' : 'Thinking... ' + elapsed + 's');
         }
-    }, 500);
+    }, thinkInterval);
 
     var fetchTimeoutId = setTimeout(function () {
         if (state.isStreaming && state.abortController) { abortSource = 'timeout'; state.abortController.abort(); }
     }, FETCH_TIMEOUT);
 
+        /* Ollama: check stall every 10s instead of 5s — local models can have natural pauses */
+    var stallInterval = isOllamaProvider() ? 10000 : 5000;
     var stallWatchdog = setInterval(function () {
         if (state.isStreaming && firstTokenReceived && (Date.now() - lastChunkTime > STREAM_STALL_TIMEOUT)) {
             abortSource = 'stall';
             if (state.abortController) state.abortController.abort();
         }
-    }, 5000);
+    }, stallInterval);
 
     var originalAbort = state.abortController.abort.bind(state.abortController);
     state.abortController.abort = function () { if (!abortSource) abortSource = 'user'; originalAbort(); };

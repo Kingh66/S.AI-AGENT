@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════
    MESSAGES — Rendering, streaming, actions
-   textContent streaming (zero char loss),
-   thinking block survives finalization
+   Optimized for Ollama: slower throttle, debounced scroll,
+   no thinking block overhead
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { parseMarkdown } from './markdown.js';
@@ -11,11 +11,39 @@ let backtickCount = 0;
 let streamPre = null;
 let streamTextNode = null;
 let renderTimer = null;
-const RENDER_THROTTLE = 25;
-let lastRenderTime = 0;
 
-/* Track whether we've received any real text this response */
+/* ── Dynamic throttle: 25ms for cloud, 100ms for Ollama ── */
+function getRenderThrottle() {
+    if (state.settings && state.settings.provider === 'ollama') return 100;
+    return 25;
+}
+
+let lastRenderTime = 0;
 let receivedAnyRealText = false;
+
+/* ── Debounced scroll — max 1 scroll per 80ms instead of every render ── */
+let scrollRaf = null;
+function fastScroll() {
+    if (scrollRaf) return;
+    scrollRaf = requestAnimationFrame(function () {
+        scrollRaf = null;
+        var msgs = document.getElementById('messages');
+        if (msgs) msgs.scrollTop = msgs.scrollHeight;
+    });
+}
+
+/* ── Detect Ollama once per session, not every chunk ── */
+let _isOllama = null;
+function isOllamaSession() {
+    if (_isOllama !== null) return _isOllama;
+    _isOllama = (state.settings && state.settings.provider === 'ollama');
+    return _isOllama;
+}
+
+/* Reset cached Ollama flag when provider changes */
+export function invalidateOllamaCache() {
+    _isOllama = null;
+}
 
 export function removeWelcome() {
     const w = document.getElementById('welcome-state');
@@ -70,7 +98,6 @@ export function addBotMessageStart() {
     lastRenderTime = 0;
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
 
-    /* Reset for each new response */
     receivedAnyRealText = false;
 
     fastScroll();
@@ -81,7 +108,6 @@ export function appendStreamChunk(chunk) {
     chunk = chunk.replace(/^[\u0000-\u001F\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\uFFFD]+/, '');
     if (chunk.length === 0) return;
 
-    /* Mark that we received actual text this response */
     receivedAnyRealText = true;
 
     state.streamBuffer += chunk;
@@ -98,7 +124,8 @@ export function appendStreamChunk(chunk) {
         state.isRenderScheduled = true;
 
         var now = performance.now();
-        var delay = Math.max(0, RENDER_THROTTLE - (now - lastRenderTime));
+        var throttle = getRenderThrottle();
+        var delay = Math.max(0, throttle - (now - lastRenderTime));
 
         renderTimer = setTimeout(function () {
             lastRenderTime = performance.now();
@@ -107,14 +134,16 @@ export function appendStreamChunk(chunk) {
 
             if (!state.streamElement) return;
 
-            /* During streaming, skip over any thinking block that was injected */
-            var thinkBlock = state.streamElement.querySelector('.thinking-block');
+            /* Ollama qwen2.5-coder never produces reasoning_content — skip thinking block check entirely */
+            if (!isOllamaSession()) {
+                var thinkBlock = state.streamElement.querySelector('.thinking-block');
+                if (thinkBlock) thinkBlock.remove();
+            }
 
             if (inCode) {
                 if (!streamPre) {
                     streamPre = document.createElement('pre');
                     streamPre.className = 'streaming-code-pre';
-                    /* Clear only non-thinking children */
                     clearNonThinkingChildren(state.streamElement);
                     state.streamElement.appendChild(streamPre);
                     streamTextNode = null;
@@ -136,7 +165,6 @@ export function appendStreamChunk(chunk) {
     }
 }
 
-/* Remove all children except the thinking block */
 function clearNonThinkingChildren(container) {
     var children = Array.from(container.children);
     for (var i = 0; i < children.length; i++) {
@@ -160,12 +188,10 @@ function removeCursor(container) {
     if (cursor) cursor.remove();
 }
 
-/* ═══════════════════════════════════════
-   Build a collapsed thinking block for
-   post-finalization injection
-   ═══════════════════════════════════════ */
 function buildFinalThinkingBlock(text) {
     if (!text || text.length < 10) return '';
+    /* Skip thinking block for Ollama — these models don't produce it */
+    if (isOllamaSession()) return '';
     var display = text.length > 1200 ? '...' + text.slice(-1200) : text;
     display = escapeHtml(display).replace(/\n/g, '<br>');
     var timeStr = formatThinkTimeChars(text.length);
@@ -202,32 +228,28 @@ export function finalizeStream() {
 
         var clean = state.streamBuffer.replace(/^[\u0000-\u001F\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\uFFFD]+/, '');
 
-        /* ── SAFETY NET: Buffer empty but we received data ── */
         if (clean.length === 0 && receivedAnyRealText) {
-            console.warn('[Messages] Buffer is empty but data was received. Attempting recovery...');
-
-            /* Recover from state-saved thinking content */
+            console.warn('[Messages] Buffer empty but data was received. Recovery...');
             if (state.thinkingContent && state.thinkingContent.length > 10) {
-                console.warn('[Messages] Model sent only reasoning_content, no actual content.');
                 clean = '⚠️ The model returned only internal reasoning with no response. Try again or switch models.';
             } else {
-                console.error('[Messages] COMPLETELY empty after receiving data.');
                 clean = '⚠️ The model returned an empty response. Try again or switch models.';
             }
         }
 
-        /* ── Re-inject thinking block after innerHTML replace ── */
         var thinkHtml = '';
         if (state.thinkingContent && state.thinkingContent.length > 10) {
             thinkHtml = buildFinalThinkingBlock(state.thinkingContent);
         }
         state.thinkingContent = '';
 
-        /* Replace content — thinking block is NOT in streamBuffer so it won't duplicate */
         state.streamElement.innerHTML = thinkHtml + parseMarkdown(clean);
 
-        /* Re-highlight any code blocks */
-        highlightCodeBlocks(state.streamElement);
+        /* Defer code highlighting to next frame so finalizeStream returns fast */
+        var el = state.streamElement;
+        requestAnimationFrame(function () {
+            highlightCodeBlocks(el);
+        });
 
         state.conversationHistory.push({ role: 'assistant', content: clean });
 
@@ -255,11 +277,6 @@ export function finalizeStream() {
     }
 }
 
-/* ═══════════════════════════════════════
-   Thinking block toggle — works both during
-   streaming (by ID) and after finalization
-   (by element reference)
-   ═══════════════════════════════════════ */
 window.toggleThinkingBlock = function (el) {
     var block;
     if (el && el.closest) {
@@ -279,11 +296,6 @@ window.toggleThinkingBlock = function (el) {
         icon.className = 'fas fa-chevron-right';
     }
 };
-
-function fastScroll() {
-    var msgs = document.getElementById('messages');
-    msgs.scrollTop = msgs.scrollHeight;
-}
 
 export function updateSendButton() {
     var btn = document.getElementById('send-btn');

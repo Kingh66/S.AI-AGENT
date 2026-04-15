@@ -13,7 +13,6 @@ export async function runBoot() {
         div.innerHTML = line.text + '<span class="boot-cursor"></span>';
         body.appendChild(div);
 
-        /* Remove cursor from all previous lines */
         const allLines = body.querySelectorAll('.boot-line');
         allLines.forEach((el, i) => {
             if (i < allLines.length - 1) {
@@ -27,19 +26,35 @@ export async function runBoot() {
 
     await delay(800);
     
-    /* Hide boot screen and show main app */
     document.getElementById('boot-screen').classList.add('hidden');
     document.getElementById('app').style.display = 'flex';
 
-    /* Initialize the futuristic neural wave background from effects.js */
+    /* ── Skip heavy canvas animation for Ollama (saves CPU for inference) ── */
+    var isOllama = false;
     try {
-        const { initBackground } = await import('./effects.js');
-        initBackground();
-    } catch (e) {
-        console.warn('Background effects failed to load:', e);
+        var saved = localStorage.getItem('sai_settings');
+        if (saved) {
+            var parsed = JSON.parse(saved);
+            isOllama = parsed.provider === 'ollama';
+        }
+    } catch (e) {}
+
+    if (isOllama) {
+        /* Lightweight static background instead of animated canvas */
+        var appEl = document.getElementById('app');
+        if (appEl) {
+            appEl.style.background = 'radial-gradient(ellipse at 20% 50%, rgba(0,212,170,0.03) 0%, transparent 60%), radial-gradient(ellipse at 80% 20%, rgba(0,150,255,0.02) 0%, transparent 50%), var(--bg)';
+        }
+        console.log('[Boot] Ollama detected — skipped canvas animation to save CPU');
+    } else {
+        try {
+            const { initBackground } = await import('./effects.js');
+            initBackground();
+        } catch (e) {
+            console.warn('Background effects failed to load:', e);
+        }
     }
 
-    /* Initialize voice after app is visible */
     import('./voice.js').then(({ initVoice }) => initVoice());
 }
 
