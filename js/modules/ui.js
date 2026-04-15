@@ -47,7 +47,12 @@ export function highlightCodeBlocks(container) {
     if (!container) return;
     container.querySelectorAll('pre code').forEach(function(block) {
         if (!block.classList.contains('prism-highlighted')) {
-            Prism.highlightElement(block);
+            try {
+                Prism.highlightElement(block);
+            } catch (e) {
+                console.warn('[Prism] highlightElement failed for ' + block.className + ':', e.message);
+                block.className = block.className.replace(/language-[\w-]+/g, '');
+            }
             block.classList.add('prism-highlighted');
         }
     });
@@ -121,19 +126,19 @@ function injectContextBudgetUI() {
         '</label>' +
         '<div style="width:100%">' +
         '<div style="display:flex;align-items:center;gap:8px">' +
-        '<input type="range" id="q-context-budget" min="10000" max="500000" step="5000" value="60000" style="flex:1">' +
-        '<span id="q-context-budget-val" style="min-width:90px;text-align:right;font-size:0.8rem;color:var(--accent);font-weight:600;white-space:nowrap">60K chars</span>' +
+        '<input type="range" id="q-context-budget" min="10000" max="500000" step="5000" value="25000" style="flex:1">' +
+        '<span id="q-context-budget-val" style="min-width:90px;text-align:right;font-size:0.8rem;color:var(--accent);font-weight:600;white-space:nowrap">25K chars</span>' +
         '</div>' +
-        '<div id="q-context-budget-tokens" style="font-size:0.6rem;color:var(--text-muted);margin-top:1px">~17K tokens</div>' +
+        '<div id="q-context-budget-tokens" style="font-size:0.6rem;color:var(--text-muted);margin-top:1px">~7K tokens</div>' +
         '<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">' +
-        '<button type="button" class="ctx-preset-btn" data-val="30000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">Ultra Safe</button>' +
-        '<button type="button" class="ctx-preset-btn" data-val="60000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--accent);background:rgba(0,212,170,0.1);color:var(--accent);cursor:pointer;transition:all 0.15s;font-weight:600">Free Tier</button>' +
-        '<button type="button" class="ctx-preset-btn" data-val="120000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">Standard</button>' +
-        '<button type="button" class="ctx-preset-btn" data-val="250000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">Large Folder</button>' +
+        '<button type="button" class="ctx-preset-btn" data-val="15000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">Ultra Safe</button>' +
+        '<button type="button" class="ctx-preset-btn" data-val="25000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--accent);background:rgba(0,212,170,0.1);color:var(--accent);cursor:pointer;transition:all 0.15s;font-weight:600">Free Safe</button>' +
+        '<button type="button" class="ctx-preset-btn" data-val="60000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">Standard</button>' +
+        '<button type="button" class="ctx-preset-btn" data-val="120000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">Large Folder</button>' +
         '<button type="button" class="ctx-preset-btn" data-val="500000" style="padding:3px 10px;font-size:0.65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;transition:all 0.15s">Maximum</button>' +
         '</div>' +
         '<div style="font-size:0.58rem;color:var(--text-muted);margin-top:4px;line-height:1.4">' +
-        'Free tier on OpenRouter typically allows ~30K input tokens. "Free Tier" preset (60K chars ≈ 17K tokens) leaves room for system prompt + chat history. Increase only if you have credits.' +
+        'Free tier: ~20-30K input tokens. "Free Safe" preset (25K chars ≈ 7K tokens) leaves room for system prompt + history. Increase only if using Ollama or paid credits.' +
         '</div>' +
         '</div>';
 
@@ -209,7 +214,6 @@ function injectMaxTokensPresets() {
         btn.addEventListener('click', function() {
             var v = parseInt(this.dataset.val);
             tokensRow.value = v;
-            /* Was crashing here — q-tokens-val may not exist in HTML */
             safeText('q-tokens-val', v);
             highlightMtkPreset(v);
         });
@@ -251,17 +255,16 @@ export function populateSettingsUI() {
     safeVal('q-temp', state.settings.temperature);
     safeText('q-temp-val', state.settings.temperature);
     safeVal('q-tokens', state.settings.maxTokens);
-    /* BUG FIX: was writing temperature here instead of maxTokens */
     safeText('q-tokens-val', state.settings.maxTokens);
     safeVal('s-prompt', state.settings.systemPrompt);
     safeVal('q-voice-lang', voiceState.lang);
     safeVal('q-voice-rate', voiceState.rate);
     safeText('q-voice-rate-val', voiceState.rate.toFixed(1));
 
-    /* Context budget slider */
+    /* Context budget slider — default 25K for free tier safety */
     var ctxSlider = document.getElementById('q-context-budget');
     if (ctxSlider) {
-        var cb = state.settings.contextBudget || 60000;
+        var cb = state.settings.contextBudget || 25000;
         ctxSlider.value = cb;
         safeText('q-context-budget-val', fmtBudgetChars(cb) + ' chars');
         safeText('q-context-budget-tokens', '~' + fmtBudgetTokens(cb));

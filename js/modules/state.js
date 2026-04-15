@@ -22,7 +22,7 @@ export const state = {
         apiKey: '',
         model: '',
         temperature: 0.7,
-        maxTokens: 2048,
+        maxTokens: 4096,
         contextBudget: 60000,
         systemPrompt: '',
     },

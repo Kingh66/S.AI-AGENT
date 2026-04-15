@@ -1,27 +1,28 @@
 /* ═══════════════════════════════════════════════════
    CONNECTION — LLM API calls, streaming
-   Hard token cap + 402 auto-retry + thinking hidden
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { FILE_SYSTEM_INSTRUCTIONS } from './config.js';
-import { getFileContext } from './filesystem.js';
+import { getSmartFileContext } from './smart-context.js';
 import {
     removeWelcome, addUserMessage, addBotMessageStart,
     appendStreamChunk, finalizeStream, updateSendButton
 } from './messages.js';
 import { setConnectionStatus, toast } from './ui.js';
 
-/* ── Timeout constants ── */
 var FETCH_TIMEOUT = 110000;
 var STREAM_STALL_TIMEOUT = 60000;
-
-/* ── Hard limits ── */
 var MIN_MAX_TOKENS = 256;
 var MAX_MAX_TOKENS = 32768;
-var DEFAULT_MAX_TOKENS = 2048;
-
-/* ── 402 retry safety margin ── */
+var DEFAULT_MAX_TOKENS = 4096;
 var TOKEN_402_SAFETY_MARGIN = 150;
+var MIN_RETRY_TOKENS = 32;
+
+var CONTINUATION_MODES = ['custom', 'selfimprove', 'multiagent'];
+
+var CONTINUE_MSG_FILE = 'OUTPUT NEXT FILE: One file block only. <|CONTINUE_TASK|> if more files remain, end normally if last. No commentary.';
+
+var CONTINUE_MSG_STALL = 'OUTPUT NEXT FILE: Previous output cut off. One file block only. <|CONTINUE_TASK|> if more remain, end normally if last. No commentary.';
 
 function estimateTokens(text) {
     if (!text) return 0;
@@ -35,38 +36,53 @@ function clampMaxTokens(val) {
 }
 
 /* ═══════════════════════════════════════
-   402 ERROR PARSER
+   402 PARSER — Always extracts a number, floors at minimum
    ═══════════════════════════════════════ */
 function parse402Affordable(errText) {
     if (!errText) return null;
-
     try {
         var parsed = JSON.parse(errText);
         var msg = parsed.error && parsed.error.message ? parsed.error.message : '';
         if (msg) errText = msg;
     } catch (e) { }
-
     var patterns = [
         /can only afford\s+([\d,]+)/i,
         /afford\s+up to\s+([\d,]+)/i,
         /maximum\s+([\d,]+)\s*tokens.*allowed/i,
         /limit.*?([\d,]+)\s*tokens/i
     ];
-
     for (var i = 0; i < patterns.length; i++) {
         var match = errText.match(patterns[i]);
         if (match) {
-            var numStr = match[1].replace(/,/g, '');
-            var num = parseInt(numStr, 10);
-            if (num && num > 0) {
-                var safe = num - TOKEN_402_SAFETY_MARGIN;
-                if (safe < MIN_MAX_TOKENS) safe = MIN_MAX_TOKENS;
-                return safe;
-            }
+            var num = parseInt(match[1].replace(/,/g, ''), 10);
+            if (num && num > 0) return num;
         }
     }
+    return null;
+}
 
-    return 1024;
+/* ═══════════════════════════════════════════════════
+   402 HANDLER — Always retries at least once
+   ═══════════════════════════════════════════════════ */
+var FALLBACK_RETRY_TOKENS = 128;
+
+function resolveRetryTokens(errText, actualMaxTokens, isRetry) {
+    var extracted = parse402Affordable(errText);
+    var retryAmount = extracted != null
+        ? Math.max(extracted - TOKEN_402_SAFETY_MARGIN, MIN_RETRY_TOKENS)
+        : FALLBACK_RETRY_TOKENS;
+
+    if (!isRetry && retryAmount < actualMaxTokens) {
+        return retryAmount;
+    }
+
+    if (retryAmount >= MIN_MAX_TOKENS) {
+        state.settings.maxTokens = retryAmount;
+        import('./storage.js').then(function (s) { s.saveSettings(); });
+        var tokensInput = document.getElementById('q-tokens');
+        if (tokensInput) tokensInput.value = retryAmount;
+    }
+    return null;
 }
 
 export function getApiUrl() {
@@ -113,36 +129,55 @@ export function buildHeaders() {
 
 function isTrivialMessage(text) {
     var t = text.trim().toLowerCase();
-    var trivial = [
-        'hi', 'hello', 'hey', 'hola', 'yo', 'sup', 'howdy',
+    var greetings = ['hi', 'hello', 'hey', 'hola', 'yo', 'sup', 'howdy',
         'thanks', 'thank you', 'thx', 'ty', 'cheers',
         'ok', 'okay', 'sure', 'yeah', 'yep', 'yes',
         'bye', 'goodbye', 'see ya', 'later', 'cya',
-        'lol', 'lmao', 'haha', 'nice', 'cool', 'great',
-        'what can you do', 'who are you', 'help'
-    ];
-    for (var i = 0; i < trivial.length; i++) {
-        if (t === trivial[i]) return true;
-    }
-    if (t.length < 15 && t.indexOf('fix') === -1 && t.indexOf('bug') === -1 &&
-        t.indexOf('error') === -1 && t.indexOf('code') === -1 && t.indexOf('file') === -1 &&
-        t.indexOf('function') === -1 && t.indexOf('class') === -1 && t.indexOf('```') === -1) {
-        return true;
+        'lol', 'lmao', 'haha', 'nice', 'cool', 'great'];
+    for (var i = 0; i < greetings.length; i++) {
+        if (t === greetings[i]) return true;
     }
     return false;
 }
 
-function buildSafeSystemPrompt(userText) {
+function isNewProjectRequest(text) {
+    var t = text.toLowerCase();
+    if (/\bfix\b/.test(t) && /\b(error|bug|issue|broken)\b/.test(t)) return false;
+    if (/\b(modify|update|change|refactor|improve)\b/.test(t) && /\b(this|the|existing|current)\b/.test(t)) return false;
+    if (/\.js\b|\.py\b|\.html\b|\.css\b|\.ts\b/.test(t) && /\b(file|in|from)\b/.test(t)) return false;
+    var newWords = ['code a ', 'code simple ', 'create a ', 'build a ', 'make a ', 'write a ',
+        'design a ', 'develop a ', 'simple ', 'basic ', 'new project', 'new app',
+        'new website', 'new page', 'new system', 'landing page'];
+    for (var i = 0; i < newWords.length; i++) {
+        if (t.indexOf(newWords[i]) > -1) return true;
+    }
+    return false;
+}
+
+async function buildSafeSystemPrompt(userText) {
     var sys = state.settings.systemPrompt;
     var ctx = document.getElementById('project-context').value.trim();
     if (ctx) sys += '\n\n--- PROJECT CONTEXT ---\n' + ctx + '\n--- END CONTEXT ---';
 
     if (isTrivialMessage(userText)) {
-        console.log('[Connection] Trivial message detected — skipping file context');
+        console.log('[Connection] Trivial greeting — using minimal system prompt');
+        return 'You are S.ai, a helpful assistant. Respond briefly and conversationally. No code, no markdown, just a friendly reply.';
+    }
+
+    if (isNewProjectRequest(userText)) {
+        console.log('[Connection] New project request — skipping workspace file context to avoid confusion');
         return sys;
     }
 
-    var fileCtx = getFileContext();
+    var budget = state.settings.contextBudget || 25000;
+    if (isOllamaProvider()) {
+        /* Ollama has no token limits — skip smart scoring, dump all files fast */
+        var { getFileContext } = await import('./filesystem.js');
+        var fileCtx = getFileContext();
+    } else {
+        var { getSmartFileContext } = await import('./smart-context.js');
+        var fileCtx = await getSmartFileContext(userText, budget);
+    }
     if (fileCtx) sys += '\n\n' + FILE_SYSTEM_INSTRUCTIONS + '\n\n' + fileCtx;
 
     return sys;
@@ -150,16 +185,14 @@ function buildSafeSystemPrompt(userText) {
 
 function buildSafeMessages(userText, systemPrompt) {
     var sysTokens = estimateTokens(systemPrompt);
-    var maxInputTokens = estimateTokens(state.settings.contextBudget || 60000);
+    var maxInputTokens = estimateTokens(state.settings.contextBudget || 25000);
     var safeLimit = Math.floor(maxInputTokens * 0.8);
 
     if (sysTokens > safeLimit) {
         console.warn('[Connection] System prompt (' + sysTokens + ' tokens) exceeds safe limit (' + safeLimit + '). Stripping file context.');
-
         var sys = state.settings.systemPrompt;
         var ctx = document.getElementById('project-context').value.trim();
         if (ctx) sys += '\n\n--- PROJECT CONTEXT ---\n' + ctx + '\n--- END CONTEXT ---';
-
         var strippedTokens = estimateTokens(sys);
         if (strippedTokens <= safeLimit) {
             systemPrompt = sys;
@@ -176,33 +209,24 @@ function buildSafeMessages(userText, systemPrompt) {
 
     var remainingTokens = safeLimit - estimateTokens(systemPrompt);
     var historySlice = [];
-
     for (var i = state.conversationHistory.length - 1; i >= 0; i--) {
         var msgTokens = estimateTokens(state.conversationHistory[i].content);
         if (historySlice.length > 0 && (remainingTokens - msgTokens) < 500) break;
         historySlice.unshift(state.conversationHistory[i]);
         remainingTokens -= msgTokens;
     }
-
     var trimmedCount = state.conversationHistory.length - historySlice.length;
-    if (trimmedCount > 0) {
-        console.log('[Connection] Trimmed ' + trimmedCount + ' old messages from history');
-    }
+    if (trimmedCount > 0) console.log('[Connection] Trimmed ' + trimmedCount + ' old messages from history');
 
     return [{ role: 'system', content: systemPrompt }].concat(historySlice);
 }
 
-/* ═══════════════════════════════════════════════════
-   CORE STREAMING LOGIC
-   ═══════════════════════════════════════════════════ */
 async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     var model = state.settings.model || 'gpt-3.5-turbo';
     var actualMaxTokens = clampMaxTokens(overrideMaxTokens != null ? overrideMaxTokens : state.settings.maxTokens);
 
     var totalEstTokens = 0;
-    for (var m = 0; m < messages.length; m++) {
-        totalEstTokens += estimateTokens(messages[m].content);
-    }
+    for (var m = 0; m < messages.length; m++) totalEstTokens += estimateTokens(messages[m].content);
     console.log('[Connection] Sending ~' + totalEstTokens + ' input + ' + actualMaxTokens + ' output tokens');
 
     state.isStreaming = true;
@@ -221,11 +245,9 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         }
     }
 
-    setConnectionStatus('connecting', isAutoContinue ? 'Task loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + '...' : 'Generating...');
+    setConnectionStatus('connecting', isAutoContinue ? 'File ' + (state.activeTask.loopCount + 1) + '...' : 'Generating...');
 
-    if (voiceState.isVoiceChat) {
-        import('./voice.js').then(function (m) { m.setVoiceMode('thinking'); });
-    }
+    if (voiceState.isVoiceChat) import('./voice.js').then(function (m) { m.setVoiceMode('thinking'); });
 
     var thinkingContent = '';
     var isThinkingPhase = false;
@@ -238,15 +260,12 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     var thinkTimer = setInterval(function () {
         if (!firstTokenReceived && state.isStreaming) {
             var elapsed = ((Date.now() - thinkStartTime) / 1000).toFixed(0);
-            setConnectionStatus('connecting', 'Thinking... ' + elapsed + 's');
+            setConnectionStatus('connecting', isAutoContinue ? 'File ' + (state.activeTask.loopCount + 1) + '... ' + elapsed + 's' : 'Thinking... ' + elapsed + 's');
         }
     }, 500);
 
     var fetchTimeoutId = setTimeout(function () {
-        if (state.isStreaming && state.abortController) {
-            abortSource = 'timeout';
-            state.abortController.abort();
-        }
+        if (state.isStreaming && state.abortController) { abortSource = 'timeout'; state.abortController.abort(); }
     }, FETCH_TIMEOUT);
 
     var stallWatchdog = setInterval(function () {
@@ -257,10 +276,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     }, 5000);
 
     var originalAbort = state.abortController.abort.bind(state.abortController);
-    state.abortController.abort = function () {
-        if (!abortSource) abortSource = 'user';
-        originalAbort();
-    };
+    state.abortController.abort = function () { if (!abortSource) abortSource = 'user'; originalAbort(); };
 
     try {
         var res = await fetch(getApiUrl(), {
@@ -273,16 +289,11 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         clearTimeout(fetchTimeoutId);
         fetchTimeoutId = null;
 
-        /* ═══════════════════════════════════════
-           402 — AUTO-RETRY with reduced tokens
-           ═══════════════════════════════════════ */
         if (res.status === 402) {
             var err402Text = await res.text().catch(function () { return ''; });
-            var affordableTokens = parse402Affordable(err402Text);
+            var retryTokens = resolveRetryTokens(err402Text, actualMaxTokens, overrideMaxTokens != null);
 
-            console.warn('[Connection] 402. Affordable tokens: ' + affordableTokens);
-
-            if (affordableTokens && affordableTokens < actualMaxTokens && affordableTokens >= MIN_MAX_TOKENS) {
+            if (retryTokens != null) {
                 clearInterval(stallWatchdog);
                 if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
                 if (fetchTimeoutId) { clearTimeout(fetchTimeoutId); fetchTimeoutId = null; }
@@ -295,26 +306,21 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                 state.streamBuffer = '';
                 state.thinkingContent = '';
 
-                state.settings.maxTokens = affordableTokens;
-                import('./storage.js').then(function (s) { s.saveSettings(); });
-
-                var tokensInput = document.getElementById('q-tokens');
-                if (tokensInput) tokensInput.value = affordableTokens;
-
-                toast('Auto-reduced max tokens to ' + affordableTokens + ' (free tier limit). Retrying...', 'info');
-                setConnectionStatus('connecting', 'Retrying with ' + affordableTokens + ' tokens...');
-
+                toast('Free tier limit hit. Auto-adjusting to ' + retryTokens + ' tokens...', 'info');
+                setConnectionStatus('connecting', 'Retrying with ' + retryTokens + ' tokens...');
                 await new Promise(function (r) { setTimeout(r, 800); });
-                return executeStream(messages, affordableTokens, isAutoContinue);
+                return executeStream(messages, retryTokens, isAutoContinue);
             } else {
-                throw new Error('INSUFFICIENT_CREDITS: Free tier balance too low. Reduce max_tokens or add credits at openrouter.ai/settings/credits');
+                var reason = (overrideMaxTokens != null)
+                    ? 'Auto-retry failed even at reduced tokens. Balance too low.'
+                    : 'Balance too low for any response.';
+                throw new Error('INSUFFICIENT_CREDITS: ' + reason + ' Wait for free tier refill (usually ~24h), or reduce Max Tokens in Settings, or add credits at openrouter.ai/settings/credits');
             }
         }
 
         if (!res.ok) {
             var errText = await res.text().catch(function () { return ''; });
             var status = res.status;
-
             if (status === 429) throw new Error('RATE_LIMIT:' + errText.substring(0, 300));
             else if (status === 401 || status === 403) throw new Error('AUTH_ERROR:' + status + ': ' + errText.substring(0, 200));
             else if (status === 502 || status === 503 || status === 504) throw new Error('SERVER_OVERLOAD:' + status + ': ' + errText.substring(0, 200));
@@ -333,7 +339,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                 firstTokenReceived = true;
                 clearInterval(thinkTimer);
                 thinkTimer = null;
-                setConnectionStatus('connecting', isAutoContinue ? 'Task loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + '...' : 'Generating...');
+                setConnectionStatus('connecting', isAutoContinue ? 'File ' + (state.activeTask.loopCount + 1) + '...' : 'Generating...');
             }
 
             lastChunkTime = Date.now();
@@ -358,48 +364,27 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                         var parsed = JSON.parse(data);
                         if (!parsed.choices || !parsed.choices[0]) continue;
                         var delta = parsed.choices[0].delta;
-
-                        if (parsed.choices[0].finish_reason) {
-                            finishReason = parsed.choices[0].finish_reason;
-                        }
-
+                        if (parsed.choices[0].finish_reason) finishReason = parsed.choices[0].finish_reason;
                         var reasoning = delta.reasoning_content || delta.reasoning || delta.thinking || null;
                         var content = delta.content || null;
-
-                        /* ═══════════════════════════════════════
-                           REASONING CONTENT — ALWAYS hidden
-                           Free models (step-3.5-flash, mimo, etc.)
-                           abuse reasoning_content for chain-of-thought.
-                           NEVER dump it into the visible stream buffer.
-                           Always route to the collapsible thinking block.
-                           ═══════════════════════════════════════ */
                         if (reasoning) {
                             if (!isThinkingPhase) isThinkingPhase = true;
                             thinkingContent += reasoning;
                             showThinkingBlock(thinkingContent);
                         }
-
-                        if (content) {
-                            appendStreamChunk(content);
-                        }
+                        if (content) appendStreamChunk(content);
                     } catch (e) { }
                 }
             }
         }
 
-        /* ═══════════════════════════════════════
-           STREAM COMPLETE — save thinking to state
-           BEFORE finalizeStream wipes the DOM
-           ═══════════════════════════════════════ */
         state.thinkingContent = thinkingContent;
         if (isThinkingPhase) closeThinkingBlock();
         finalizeStream();
-
         clearInterval(stallWatchdog);
         if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
 
         var hitLimit = (finishReason === 'length');
-
         var lastResponse = state.conversationHistory[state.conversationHistory.length - 1];
         var hasContinueTag = lastResponse && lastResponse.content.indexOf('<|CONTINUE_TASK|>') !== -1;
 
@@ -410,14 +395,9 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
 
         if (state.activeTask.isRunning && hitLimit && state.activeTask.loopCount < state.activeTask.maxLoops) {
             state.activeTask.loopCount++;
-            toast('Task loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + '...', 'info');
-            setConnectionStatus('connecting', 'Continuing (loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')...');
-
-            state.conversationHistory.push({
-                role: 'user',
-                content: 'SYSTEM OVERRIDE: Continue your work. If you created new files, you MUST now output the files that import them to complete the integration. Do not repeat finished code.'
-            });
-
+            toast('File ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + '...', 'info');
+            setConnectionStatus('connecting', 'Requesting file ' + (state.activeTask.loopCount + 1) + '...');
+            state.conversationHistory.push({ role: 'user', content: CONTINUE_MSG_FILE });
             setTimeout(function () { sendMessage('', true); }, 1000);
         } else {
             state.activeTask.isRunning = false;
@@ -425,14 +405,11 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             state.isStreaming = false;
             updateSendButton();
             setConnectionStatus('connected', 'Connected — ' + state.settings.model);
-
-            if (state.conversationHistory.length > 30) {
-                state.conversationHistory = state.conversationHistory.slice(-20);
-            }
+            if (hitLimit && !isAutoContinue) toast('Response truncated. Type "continue" to get the rest.', 'info');
+            if (state.conversationHistory.length > 30) state.conversationHistory = state.conversationHistory.slice(-20);
         }
 
     } catch (error) {
-        /* Save thinking even on error in case we need recovery */
         state.thinkingContent = thinkingContent;
         closeThinkingBlock();
         clearInterval(stallWatchdog);
@@ -440,44 +417,30 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
 
         if (error.name === 'AbortError') {
             finalizeStream();
-
             if (abortSource === 'timeout') {
-                state.activeTask.isRunning = false;
-                state.activeTask.loopCount = 0;
-                state.isStreaming = false;
-                updateSendButton();
-                toast('Request timed out (' + (FETCH_TIMEOUT / 1000) + 's). Try again or switch models.', 'error');
+                state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
+                state.isStreaming = false; updateSendButton();
+                toast('Request timed out. Try again or switch models.', 'error');
                 setConnectionStatus('disconnected', 'Timeout');
-
             } else if (abortSource === 'stall') {
                 var stallLastResponse = state.conversationHistory[state.conversationHistory.length - 1];
                 var stallTag = stallLastResponse && stallLastResponse.content.indexOf('<|CONTINUE_TASK|>') !== -1;
                 if (stallTag) stallLastResponse.content = stallLastResponse.content.replace('<|CONTINUE_TASK|>', '');
-
                 if (state.activeTask.isRunning && (finishReason === 'length' || stallTag) && state.activeTask.loopCount < state.activeTask.maxLoops) {
                     state.activeTask.loopCount++;
-                    toast('Stream stalled. Auto-continuing (' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')...', 'error');
-                    setConnectionStatus('connecting', 'Stall recovery...');
-
-                    state.conversationHistory.push({
-                        role: 'user',
-                        content: 'SYSTEM OVERRIDE: Continue your work. If you created new files, you MUST now output the files that import them to complete the integration. Do not repeat finished code.'
-                    });
+                    toast('Stalled. Requesting next file (' + state.activeTask.loopCount + ')...', 'error');
+                    state.conversationHistory.push({ role: 'user', content: CONTINUE_MSG_STALL });
                     setTimeout(function () { sendMessage('', true); }, 1500);
                 } else {
-                    state.activeTask.isRunning = false;
-                    state.activeTask.loopCount = 0;
-                    state.isStreaming = false;
-                    updateSendButton();
-                    toast('Stream stalled — no data for ' + (STREAM_STALL_TIMEOUT / 1000) + 's.', 'error');
+                    state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
+                    state.isStreaming = false; updateSendButton();
+                    if (finishReason === 'length' && !isAutoContinue) toast('Response truncated. Type "continue".', 'info');
+                    else toast('Stream stalled for 60s.', 'error');
                     setConnectionStatus('connected', 'Connected — ' + state.settings.model);
                 }
-
             } else {
-                state.activeTask.isRunning = false;
-                state.activeTask.loopCount = 0;
-                state.isStreaming = false;
-                updateSendButton();
+                state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
+                state.isStreaming = false; updateSendButton();
                 toast('Response stopped', 'info');
                 setConnectionStatus('connected', 'Connected — ' + state.settings.model);
             }
@@ -485,65 +448,45 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         }
 
         var errMsg = error.message || '';
-
         if (errMsg.indexOf('INSUFFICIENT_CREDITS:') === 0) {
-            state.activeTask.isRunning = false;
-            state.activeTask.loopCount = 0;
-            state.isStreaming = false;
-            updateSendButton();
-            toast('Insufficient credits. ' + errMsg.replace('INSUFFICIENT_CREDITS:', '').substring(0, 120), 'error');
+            state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
+            state.isStreaming = false; updateSendButton();
+            toast('Insufficient credits. ' + errMsg.replace('INSUFFICIENT_CREDITS:', '').substring(0, 140), 'error');
             setConnectionStatus('disconnected', 'No Credits');
-
         } else if (errMsg.indexOf('RATE_LIMIT:') === 0) {
-            state.activeTask.isRunning = false;
-            state.activeTask.loopCount = 0;
-            state.isStreaming = false;
-            updateSendButton();
-            toast('Rate limited. Wait a moment or switch models.', 'error');
+            state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
+            state.isStreaming = false; updateSendButton();
+            toast('Rate limited. Wait or switch models.', 'error');
             setConnectionStatus('disconnected', 'Rate Limited');
-
         } else if (errMsg.indexOf('AUTH_ERROR:') === 0) {
-            state.activeTask.isRunning = false;
-            state.activeTask.loopCount = 0;
-            state.isStreaming = false;
-            updateSendButton();
-            toast('Authentication failed. Check your API key.', 'error');
+            state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
+            state.isStreaming = false; updateSendButton();
+            toast('Auth failed. Check API key.', 'error');
             setConnectionStatus('disconnected', 'Auth Error');
-
         } else if (errMsg.indexOf('SERVER_OVERLOAD:') === 0) {
-            state.activeTask.isRunning = false;
-            state.activeTask.loopCount = 0;
-            state.isStreaming = false;
-            updateSendButton();
-            toast('Provider overloaded (502/503/504). Try again shortly.', 'error');
+            state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
+            state.isStreaming = false; updateSendButton();
+            toast('Provider overloaded (502/503/504).', 'error');
             setConnectionStatus('disconnected', 'Server Overloaded');
-
         } else if (errMsg.indexOf('SERVER_ERROR:') === 0) {
-            state.activeTask.isRunning = false;
-            state.activeTask.loopCount = 0;
-            state.isStreaming = false;
-            updateSendButton();
+            state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
+            state.isStreaming = false; updateSendButton();
             toast('Server error: ' + errMsg.replace('SERVER_ERROR:', '').substring(0, 100), 'error');
             setConnectionStatus('disconnected', 'Server Error');
-
         } else {
-            state.activeTask.isRunning = false;
-            state.activeTask.loopCount = 0;
-            state.isStreaming = false;
-            updateSendButton();
+            state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
+            state.isStreaming = false; updateSendButton();
             var msg = errMsg.indexOf('Failed to fetch') > -1 || errMsg.indexOf('NetworkError') > -1
-                ? 'Cannot reach the LLM endpoint. Check connection and URL.' : errMsg;
+                ? 'Cannot reach endpoint. Check connection.' : errMsg;
             toast(msg, 'error');
             setConnectionStatus('disconnected', 'Connection Error');
         }
-
         if (voiceState.isVoiceChat) import('./voice.js').then(function (m) { m.setVoiceMode('idle'); });
 
     } finally {
         clearInterval(stallWatchdog);
         if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
         if (fetchTimeoutId) { clearTimeout(fetchTimeoutId); fetchTimeoutId = null; }
-
         if (state.isStreaming && !state.activeTask.isRunning && !state.isRenderScheduled) {
             state.isStreaming = false;
             updateSendButton();
@@ -551,9 +494,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     }
 }
 
-/* ═══════════════════════════════════════
-   PUBLIC sendMessage
-   ═══════════════════════════════════════ */
 export async function sendMessage(userText, isAutoContinue) {
     if (state.isStreaming && !isAutoContinue) {
         if (state.abortController) state.abortController.abort();
@@ -565,29 +505,25 @@ export async function sendMessage(userText, isAutoContinue) {
 
     if (!isAutoContinue) {
         if (!userText.trim()) return;
-        if (!state.settings.apiKey) { toast('No API key set. Open Settings.', 'error'); return; }
+        if (state.settings.provider !== 'ollama' && !state.settings.apiKey) { toast('No API key set. Open Settings.', 'error'); return; }
         if (!state.settings.model) { toast('No model selected. Open Settings.', 'error'); return; }
 
         addUserMessage(userText);
         state.conversationHistory.push({ role: 'user', content: userText });
 
-        state.activeTask.isRunning = true;
+        state.activeTask.isRunning = CONTINUATION_MODES.indexOf(state.currentMode) !== -1;
         state.activeTask.loopCount = 0;
     }
 
-    var systemPrompt = buildSafeSystemPrompt(userText);
+    var systemPrompt = await buildSafeSystemPrompt(userText);
     var messages = buildSafeMessages(userText, systemPrompt);
-
     return executeStream(messages, null, isAutoContinue);
 }
 
-/* ── Thinking block (streaming phase only — gets replaced on finalization) ── */
 function showThinkingBlock(text) {
     if (!state.streamElement) return;
-    var el = state.streamElement;
     var display = text.length > 800 ? '...' + text.slice(-800) : text;
     display = display.replace(/\n/g, '<br>');
-
     var existing = document.getElementById('sai-thinking-block');
     if (existing) {
         existing.querySelector('.thinking-text').innerHTML = display;
@@ -602,7 +538,7 @@ function showThinkingBlock(text) {
             '<button class="thinking-toggle" onclick="toggleThinkingBlock(this)" title="Toggle thinking"><i class="fas fa-chevron-down"></i></button>' +
             '</div>' +
             '<div class="thinking-text">' + display + '</div>';
-        el.insertBefore(block, el.firstChild);
+        state.streamElement.insertBefore(block, state.streamElement.firstChild);
     }
 }
 
@@ -619,13 +555,11 @@ function closeThinkingBlock() {
     }
 }
 
-/* ── Test Connection ── */
 export async function testConnection() {
     var provider = state.settings.provider;
     var apiKey = state.settings.apiKey;
     var model = state.settings.model;
-
-    if (!apiKey) { toast('Enter your API key first', 'error'); return false; }
+    if (provider !== 'ollama' && !apiKey) { toast('Enter your API key first', 'error'); return false; }
     if (!model) { toast('Select a model first', 'error'); return false; }
 
     setConnectionStatus('connecting', 'Testing...');
@@ -635,41 +569,32 @@ export async function testConnection() {
         var h = { 'Content-Type': 'application/json' };
         if (apiKey) h['Authorization'] = 'Bearer ' + apiKey;
         if (provider === 'openrouter') { h['HTTP-Referer'] = window.location.href; h['X-Title'] = 'S.ai Coding Agent'; }
-
-        var body;
-        if (provider === 'ollama') {
-            body = JSON.stringify({ model: model, messages: [{ role: 'user', content: 'Hi' }], stream: false });
-        } else {
-            body = JSON.stringify({ model: model, messages: [{ role: 'user', content: 'Hi' }], max_tokens: 5 });
-        }
+        var body = provider === 'ollama'
+            ? JSON.stringify({ model: model, messages: [{ role: 'user', content: 'Hi' }], stream: false })
+            : JSON.stringify({ model: model, messages: [{ role: 'user', content: 'Hi' }], max_tokens: 5 });
 
         var r = await fetch(getApiUrl(), { method: 'POST', headers: h, body: body });
         if (!r.ok) {
             var e = await r.text().catch(function () { return ''; });
-
             if (r.status === 402) {
-                var affordable = parse402Affordable(e);
-                if (affordable) {
-                    state.settings.maxTokens = affordable;
-                    import('./storage.js').then(function (s) { s.saveSettings(); });
+                var retryTokens = resolveRetryTokens(e, null, false);
+                if (retryTokens != null) {
                     var tokensInput = document.getElementById('q-tokens');
-                    if (tokensInput) tokensInput.value = affordable;
-                    toast('Test passed but credits low — max tokens set to ' + affordable, 'info');
-                    setConnectionStatus('connected', 'Connected — ' + model + ' (' + affordable + ' tok)');
+                    if (tokensInput) tokensInput.value = retryTokens;
+                    toast('Credits low — test passed with ' + retryTokens + ' tokens. Consider setting Max Tokens to ' + retryTokens + ' in Settings.', 'info');
+                    setConnectionStatus('connected', 'Connected — ' + model + ' (' + retryTokens + ' tok limit)');
                     return true;
                 }
             }
-
-            if (r.status === 429) throw new Error('Rate limited. Wait and try again.');
-            if (r.status === 401 || r.status === 403) throw new Error('Authentication failed. Check your API key.');
+            if (r.status === 429) throw new Error('Rate limited.');
+            if (r.status === 401 || r.status === 403) throw new Error('Auth failed. Check your API key.');
             throw new Error('HTTP ' + r.status + ': ' + e.substring(0, 200));
         }
         var d = await r.json();
-
         if (provider === 'ollama') {
-            if (d.message && d.message.content) { setConnectionStatus('connected', 'Connected — ' + model); toast('Connection successful!', 'success'); return true; }
+            if (d.message && d.message.content) { setConnectionStatus('connected', 'Connected — ' + model); toast('Connected!', 'success'); return true; }
         } else {
-            if (d.choices && d.choices[0] && d.choices[0].message) { setConnectionStatus('connected', 'Connected — ' + model); toast('Connection successful!', 'success'); return true; }
+            if (d.choices && d.choices[0] && d.choices[0].message) { setConnectionStatus('connected', 'Connected — ' + model); toast('Connected!', 'success'); return true; }
         }
         throw new Error('Unexpected response');
     } catch (error) {
@@ -680,7 +605,6 @@ export async function testConnection() {
     }
 }
 
-/* ── Fetch Models ── */
 export async function fetchModels() {
     var provider = state.settings.provider;
     var endpoint = state.settings.endpoint;
@@ -691,42 +615,23 @@ export async function fetchModels() {
     btn.disabled = true;
 
     try {
-        if (provider === 'openrouter') {
-            await fetchOpenRouterModels();
-            return;
-        }
+        if (provider === 'openrouter') { await fetchOpenRouterModels(); return; }
         var url, h = {};
-        if (provider === 'ollama') {
-            url = endpoint + '/api/tags';
-        } else {
-            url = endpoint.replace(/\/+$/, '').replace(/\/v1$/, '') + '/v1/models';
-            if (apiKey) h['Authorization'] = 'Bearer ' + apiKey;
-        }
+        if (provider === 'ollama') { url = endpoint + '/api/tags'; }
+        else { url = endpoint.replace(/\/+$/, '').replace(/\/v1$/, '') + '/v1/models'; if (apiKey) h['Authorization'] = 'Bearer ' + apiKey; }
         var r = await fetch(url, { headers: h });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         var d = await r.json();
-        var models = provider === 'ollama'
-            ? (d.models || []).map(function (m) { return m.name; })
-            : (d.data || []).map(function (m) { return m.id; });
-        if (!models.length) {
-            toast('No models found.', 'error');
-            listEl.style.display = 'none';
-        } else {
+        var models = provider === 'ollama' ? (d.models || []).map(function (m) { return m.name; }) : (d.data || []).map(function (m) { return m.id; });
+        if (!models.length) { toast('No models found.', 'error'); listEl.style.display = 'none'; }
+        else {
             listEl.innerHTML = models.map(function (m) { return '<option value="' + m + '">' + m + '</option>'; }).join('');
             listEl.style.display = 'block';
             toast('Found ' + models.length + ' model(s)', 'success');
-            if (!state.settings.model) {
-                document.getElementById('s-model').value = models[0];
-                listEl.value = models[0];
-            }
+            if (!state.settings.model) { document.getElementById('s-model').value = models[0]; listEl.value = models[0]; }
         }
-    } catch (e) {
-        toast('Failed to fetch models: ' + e.message, 'error');
-        listEl.style.display = 'none';
-    } finally {
-        btn.innerHTML = '<i class="fas fa-refresh"></i> Fetch Models';
-        btn.disabled = false;
-    }
+    } catch (e) { toast('Failed to fetch models: ' + e.message, 'error'); listEl.style.display = 'none'; }
+    finally { btn.innerHTML = '<i class="fas fa-refresh"></i> Fetch Models'; btn.disabled = false; }
 }
 
 async function fetchOpenRouterModels() {
@@ -737,83 +642,38 @@ async function fetchOpenRouterModels() {
 
     try {
         var r = await fetch('https://openrouter.ai/api/v1/models', { headers: h });
-        if (!r.ok) {
-            var errBody = await r.text().catch(function () { return ''; });
-            throw new Error('HTTP ' + r.status + ': ' + errBody.substring(0, 200));
-        }
+        if (!r.ok) { var errBody = await r.text().catch(function () { return ''; }); throw new Error('HTTP ' + r.status + ': ' + errBody.substring(0, 200)); }
         var d = await r.json();
         var allModels = d.data || [];
 
-        for (var x = 0; x < allModels.length; x++) {
-            var ctx = allModels[x].context_length;
-            if (ctx) state.modelContextLimits[allModels[x].id] = Math.floor(ctx * 3.5);
-        }
+        for (var x = 0; x < allModels.length; x++) { var ctx = allModels[x].context_length; if (ctx) state.modelContextLimits[allModels[x].id] = Math.floor(ctx * 3.5); }
 
-        var topTierIds = [
-            'stepfun/step-3.5-flash', 'z-ai/glm-5-turbo', 'xiaomi/mimo-v2-pro',
-            'minimax/minimax-m2.7', 'minimax/minimax-m2.5',
-            'anthropic/claude-sonnet-4.6', 'anthropic/claude-opus-4.6',
-            'nvidia/nemotron-3-super'
-        ];
-
+        var topTierIds = ['stepfun/step-3.5-flash', 'z-ai/glm-5-turbo', 'xiaomi/mimo-v2-pro', 'minimax/minimax-m2.7', 'minimax/minimax-m2.5', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-opus-4.6', 'nvidia/nemotron-3-super'];
         var topTierModels = [];
-        for (var t = 0; t < topTierIds.length; t++) {
-            var found = allModels.find(function (m) { return m.id === topTierIds[t] || m.id === topTierIds[t] + ':free'; });
-            if (found) topTierModels.push(found);
-        }
-
-        var freeModels = allModels.filter(function (m) {
-            return m.id.indexOf(':free') > -1 && !topTierIds.some(function (id) { return m.id.startsWith(id); });
-        }).sort(function (a, b) { return a.id.localeCompare(b.id); });
-
-        var reasoningModels = allModels.filter(function (m) {
-            var id = m.id.toLowerCase();
-            return (id.indexOf('deepseek-r1') > -1 || id.indexOf('qwq') > -1 || id.indexOf('o1') > -1 || id.indexOf('reasoner') > -1) && !topTierIds.some(function (id) { return m.id.startsWith(id); });
-        }).sort(function (a, b) { return a.id.localeCompare(b.id); });
+        for (var t = 0; t < topTierIds.length; t++) { var found = allModels.find(function (m) { return m.id === topTierIds[t] || m.id === topTierIds[t] + ':free'; }); if (found) topTierModels.push(found); }
+        var freeModels = allModels.filter(function (m) { return m.id.indexOf(':free') > -1 && !topTierIds.some(function (id) { return m.id.startsWith(id); }); }).sort(function (a, b) { return a.id.localeCompare(b.id); });
+        var reasoningModels = allModels.filter(function (m) { var id = m.id.toLowerCase(); return (id.indexOf('deepseek-r1') > -1 || id.indexOf('qwq') > -1 || id.indexOf('o1') > -1 || id.indexOf('reasoner') > -1) && !topTierIds.some(function (id) { return m.id.startsWith(id); }); }).sort(function (a, b) { return a.id.localeCompare(b.id); });
 
         var html = '';
-
         if (topTierModels.length > 0) {
-            html += '<option disabled style="color:var(--accent);font-weight:700">── 🔥 Top Tier (Massive Context) ──</option>';
-            for (var i = 0; i < topTierModels.length; i++) {
-                var isFree = topTierModels[i].id.indexOf(':free') > -1;
-                var tag = isFree ? ' [FREE]' : ' [PAID]';
-                var ctxLabel = formatCtx(topTierModels[i].context_length);
-                html += '<option value="' + topTierModels[i].id + '">' + topTierModels[i].id + tag + ctxLabel + '</option>';
-            }
+            html += '<option disabled style="color:var(--accent);font-weight:700">── 🔥 Top Tier ──</option>';
+            for (var i = 0; i < topTierModels.length; i++) { var isFree = topTierModels[i].id.indexOf(':free') > -1; html += '<option value="' + topTierModels[i].id + '">' + topTierModels[i].id + (isFree ? ' [FREE]' : ' [PAID]') + formatCtx(topTierModels[i].context_length) + '</option>'; }
         }
-
         if (freeModels.length > 0) {
-            html += '<option disabled style="color:var(--green);font-weight:700">── Other Free Models ──</option>';
-            for (var j = 0; j < freeModels.length; j++) {
-                html += '<option value="' + freeModels[j].id + '">' + freeModels[j].id + formatCtx(freeModels[j].context_length) + '</option>';
-            }
+            html += '<option disabled style="color:var(--green);font-weight:700">── Other Free ──</option>';
+            for (var j = 0; j < freeModels.length; j++) html += '<option value="' + freeModels[j].id + '">' + freeModels[j].id + formatCtx(freeModels[j].context_length) + '</option>';
         }
-
         if (reasoningModels.length > 0) {
-            html += '<option disabled style="color:var(--cyan);font-weight:700">── Reasoning Models ──</option>';
-            for (var k = 0; k < reasoningModels.length; k++) {
-                html += '<option value="' + reasoningModels[k].id + '">' + reasoningModels[k].id + formatCtx(reasoningModels[k].context_length) + '</option>';
-            }
+            html += '<option disabled style="color:var(--cyan);font-weight:700">── Reasoning ──</option>';
+            for (var k = 0; k < reasoningModels.length; k++) html += '<option value="' + reasoningModels[k].id + '">' + reasoningModels[k].id + formatCtx(reasoningModels[k].context_length) + '</option>';
         }
 
         listEl.innerHTML = html;
         listEl.style.display = 'block';
-
         var curModel = document.getElementById('s-model').value;
-        if (!curModel && topTierModels.length > 0) {
-            var defaultModel = topTierModels[0].id;
-            document.getElementById('s-model').value = defaultModel;
-            listEl.value = defaultModel;
-            toast('Auto-selected: ' + defaultModel, 'success');
-        } else {
-            toast(topTierModels.length + ' top tier, ' + freeModels.length + ' free models loaded', 'success');
-        }
-
-    } catch (e) {
-        toast('Failed to fetch models: ' + e.message, 'error');
-        listEl.style.display = 'none';
-    }
+        if (!curModel && topTierModels.length > 0) { var defaultModel = topTierModels[0].id; document.getElementById('s-model').value = defaultModel; listEl.value = defaultModel; toast('Auto-selected: ' + defaultModel, 'success'); }
+        else toast(topTierModels.length + ' top tier, ' + freeModels.length + ' free loaded', 'success');
+    } catch (e) { toast('Failed: ' + e.message, 'error'); listEl.style.display = 'none'; }
 }
 
 function formatCtx(n) {
@@ -824,6 +684,4 @@ function formatCtx(n) {
     return '';
 }
 
-export function showOpenRouterModels() {
-    fetchOpenRouterModels();
-}
+export function showOpenRouterModels() { fetchOpenRouterModels(); }

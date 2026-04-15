@@ -359,3 +359,6 @@ export async function applyFileChange(btn) {
         btn.style.color = 'var(--green)';
     }
 }
+
+/* ── Export fileMap for smart-context scoring ── */
+export { fileMap, folderName };

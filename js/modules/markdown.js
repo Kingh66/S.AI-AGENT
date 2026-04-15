@@ -79,6 +79,21 @@ function renderCodeBlock(lang, code) {
             '</div>';
     }
 
+        /* Map common aliases to Prism language names */
+    var langAlias = {
+        'html': 'markup', 'htm': 'markup',
+        'js': 'javascript', 'mjs': 'javascript', 'cjs': 'javascript',
+        'ts': 'typescript', 'tsx': 'typescript', 'jsx': 'javascript',
+        'py': 'python', 'rb': 'ruby', 'rs': 'rust',
+        'sh': 'bash', 'zsh': 'bash', 'shell': 'bash',
+        'yml': 'yaml', 'md': 'markdown', 'sql': 'sql',
+        'java': 'java', 'kt': 'kotlin', 'dart': 'dart',
+        'go': 'go', 'c': 'c', 'h': 'c', 'cpp': 'cpp',
+        'cs': 'csharp', 'php': 'php', 'json': 'json',
+        'xml': 'markup'
+    };
+    var prismLang = langAlias[(lang || 'text').toLowerCase()] || (lang || 'text');
+
     return '<div class="code-block">' +
         '<div class="code-header">' +
         '<span>' + escapeHtml(lang || 'code') + '</span>' +
@@ -88,7 +103,7 @@ function renderCodeBlock(lang, code) {
         '<button class="copy-btn" onclick="copyCode(this)" title="Copy code">' +
         '<i class="fas fa-copy"></i> Copy</button>' +
         '</div></div>' +
-        '<pre><code class="language-' + escapeHtml(lang || 'text') + '">' + escaped + '</code></pre>' +
+        '<pre><code class="language-' + escapeHtml(prismLang) + '">' + escaped + '</code></pre>' +
         '</div>';
 }
 

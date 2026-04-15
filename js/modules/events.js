@@ -93,7 +93,10 @@ export function initEventListeners() {
     document.getElementById('mic-btn').addEventListener('click', toggleMic);
     document.getElementById('voice-stop-btn').addEventListener('click', stopVoiceChatCompletely);
 
-    document.getElementById('s-provider').addEventListener('change', updateProviderHint);
+    document.getElementById('s-provider').addEventListener('change', function () {
+        state.settings.provider = document.getElementById('s-provider').value;
+        updateProviderHint();
+    });
     document.getElementById('s-fetch-models').addEventListener('click', fetchModels);
     document.getElementById('s-models-list').addEventListener('change', (e) => {
         document.getElementById('s-model').value = e.target.value;

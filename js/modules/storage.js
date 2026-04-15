@@ -7,7 +7,7 @@ import { SYSTEM_PROMPTS, PROVIDER_DEFAULTS, MULTI_AGENT_CONFIG } from './config.
 import { toast } from './ui.js';
 
 /* ── Settings version — bump to force-clear all saved settings ── */
-var SETTINGS_VERSION = 4;
+var SETTINGS_VERSION = 5;
 
 var BAD_ENDPOINTS = [
     'http://localhost:8000/v1',
@@ -90,7 +90,7 @@ export function resetAllSettings() {
     state.settings.model = '';
     state.settings.temperature = 0.7;
     state.settings.maxTokens = 2048;
-    state.settings.contextBudget = 60000;
+    state.settings.contextBudget = 25000;
     state.settings.systemPrompt = SYSTEM_PROMPTS[state.currentMode];
     state.settings._version = SETTINGS_VERSION;
 
@@ -159,7 +159,7 @@ export function loadSettings() {
                 state.settings.model = keepModel;
                 state.settings.temperature = 0.7;
                 state.settings.maxTokens = 2048;
-                state.settings.contextBudget = 60000;
+                state.settings.contextBudget = 25000;
                 state.settings.systemPrompt = SYSTEM_PROMPTS[state.currentMode];
                 state.settings._version = SETTINGS_VERSION;
                 repaired = true;
@@ -197,7 +197,7 @@ export function loadSettings() {
 
     /* ── SANITY CLAMP: contextBudget ── */
     if (typeof state.settings.contextBudget !== 'number' || state.settings.contextBudget < 5000) {
-        state.settings.contextBudget = 60000;
+        state.settings.contextBudget = 25000;
         repaired = true;
     } else if (state.settings.contextBudget > 500000) {
         state.settings.contextBudget = 500000;
