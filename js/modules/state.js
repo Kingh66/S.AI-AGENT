@@ -23,7 +23,7 @@ export const state = {
         model: '',
         temperature: 0.7,
         maxTokens: 4096,
-        contextBudget: 60000,
+        contextBudget: 25000,
         systemPrompt: '',
     },
 

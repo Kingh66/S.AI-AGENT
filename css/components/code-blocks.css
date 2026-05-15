@@ -115,3 +115,36 @@
     transform: none;
     box-shadow: none;
 }
+
+/* ── EDIT BUTTON — inline edit before apply ── */
+.edit-btn {
+    background: transparent;
+    color: var(--text-muted);
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 0.72rem;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    transition: all 0.2s;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-weight: 500;
+}
+.edit-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: rgba(0, 212, 170, 0.08);
+}
+
+/* ── EDITING STATE ── */
+.file-block.editing {
+    border-color: rgba(0, 212, 170, 0.6);
+    box-shadow: inset 0 0 0 1px rgba(0, 212, 170, 0.2),
+                0 0 30px rgba(0, 212, 170, 0.1);
+}
+.edit-textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(0, 212, 170, 0.15);
+}

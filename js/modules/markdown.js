@@ -71,8 +71,8 @@ function renderCodeBlock(lang, code) {
             '<div class="code-actions">' +
             '<button class="apply-btn" onclick="applyFileChange(this)" title="Write this file to disk">' +
             '<i class="fas fa-check"></i> Apply</button>' +
-            '<button class="copy-btn" onclick="copyCode(this)" title="Copy code">' +
-            '<i class="fas fa-copy"></i> Copy</button>' +
+            '<button class="edit-btn" onclick="editFileCode(this)" title="Edit code before applying">' +
+            '<i class="fas fa-pen"></i> Edit</button>' +
             '</div></div>' +
             snippetWarning +
             '<pre><code class="language-' + syntaxLang + '">' + escaped + '</code></pre>' +

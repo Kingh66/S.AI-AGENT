@@ -169,16 +169,21 @@ async function buildSafeSystemPrompt(userText) {
         return sys;
     }
 
-    var budget = state.settings.contextBudget || 25000;
-    if (isOllamaProvider()) {
-        /* Ollama has no token limits — skip smart scoring, dump all files fast */
-        var { getFileContext } = await import('./filesystem.js');
-        var fileCtx = getFileContext();
-    } else {
-        var { getSmartFileContext } = await import('./smart-context.js');
-        var fileCtx = await getSmartFileContext(userText, budget);
+    try {
+        var budget = state.settings.contextBudget || 25000;
+        var fileCtx = '';
+        if (isOllamaProvider()) {
+            var { getFileContext } = await import('./filesystem.js');
+            fileCtx = getFileContext();
+        } else {
+            var { getSmartFileContext } = await import('./smart-context.js');
+            fileCtx = await getSmartFileContext(userText, budget);
+        }
+        if (fileCtx) sys += '\n\n' + FILE_SYSTEM_INSTRUCTIONS + '\n\n' + fileCtx;
+    } catch (fsError) {
+        console.warn('[Connection] File context build failed (non-fatal):', fsError.message);
+        /* Continue without file context rather than crashing */
     }
-    if (fileCtx) sys += '\n\n' + FILE_SYSTEM_INSTRUCTIONS + '\n\n' + fileCtx;
 
     return sys;
 }
@@ -390,10 +395,10 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
 
         var hitLimit = (finishReason === 'length');
         var lastResponse = state.conversationHistory[state.conversationHistory.length - 1];
-        var hasContinueTag = lastResponse && lastResponse.content.indexOf('<|CONTINUE_TASK|>') !== -1;
+        var hasContinueTag = lastResponse && lastResponse.content.match(/\|CONTINUE_TASK\|\s*$/);
 
         if (hasContinueTag) {
-            lastResponse.content = lastResponse.content.replace('<|CONTINUE_TASK|>', '');
+            lastResponse.content = lastResponse.content.replace(/\|CONTINUE_TASK\|\s*$/, '').trimEnd();
             hitLimit = true;
         }
 
@@ -428,8 +433,8 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                 setConnectionStatus('disconnected', 'Timeout');
             } else if (abortSource === 'stall') {
                 var stallLastResponse = state.conversationHistory[state.conversationHistory.length - 1];
-                var stallTag = stallLastResponse && stallLastResponse.content.indexOf('<|CONTINUE_TASK|>') !== -1;
-                if (stallTag) stallLastResponse.content = stallLastResponse.content.replace('<|CONTINUE_TASK|>', '');
+                var stallTag = stallLastResponse && stallLastResponse.content.match(/\|CONTINUE_TASK\|\s*$/);
+                if (stallTag) stallLastResponse.content = stallLastResponse.content.replace(/\|CONTINUE_TASK\|\s*$/, '').trimEnd();
                 if (state.activeTask.isRunning && (finishReason === 'length' || stallTag) && state.activeTask.loopCount < state.activeTask.maxLoops) {
                     state.activeTask.loopCount++;
                     toast('Stalled. Requesting next file (' + state.activeTask.loopCount + ')...', 'error');
@@ -491,37 +496,64 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         clearInterval(stallWatchdog);
         if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
         if (fetchTimeoutId) { clearTimeout(fetchTimeoutId); fetchTimeoutId = null; }
-        if (state.isStreaming && !state.activeTask.isRunning && !state.isRenderScheduled) {
-            state.isStreaming = false;
-            updateSendButton();
+        /* Safety: always clean up streaming state if no auto-continue is pending.
+           Check setTimeout pending state by verifying activeTask + isStreaming combo. */
+        if (state.isStreaming) {
+            if (!state.activeTask.isRunning) {
+                state.isStreaming = false;
+                updateSendButton();
+            } else if (!state.isRenderScheduled) {
+                /* Auto-continue was set but something went wrong —
+                   the setTimeout should handle it, but add a safety net */
+                if (!state.streamElement) {
+                    state.isStreaming = false;
+                    state.activeTask.isRunning = false;
+                    state.activeTask.loopCount = 0;
+                    updateSendButton();
+                }
+            }
         }
     }
 }
 
 export async function sendMessage(userText, isAutoContinue) {
-    if (state.isStreaming && !isAutoContinue) {
-        if (state.abortController) state.abortController.abort();
-        state.abortController = null;
+    try {
+        if (state.isStreaming && !isAutoContinue) {
+            if (state.abortController) state.abortController.abort();
+            state.abortController = null;
+            state.activeTask.isRunning = false;
+            state.activeTask.loopCount = 0;
+            return;
+        }
+
+        if (!isAutoContinue) {
+            if (!userText.trim()) return;
+            if (state.settings.provider !== 'ollama' && !state.settings.apiKey) { toast('No API key set. Open Settings.', 'error'); return; }
+            if (!state.settings.model) { toast('No model selected. Open Settings.', 'error'); return; }
+
+            addUserMessage(userText);
+            state.conversationHistory.push({ role: 'user', content: userText });
+
+            state.activeTask.isRunning = CONTINUATION_MODES.indexOf(state.currentMode) !== -1;
+            state.activeTask.loopCount = 0;
+        }
+
+        var systemPrompt = await buildSafeSystemPrompt(userText || '');
+        var messages = buildSafeMessages(userText || '', systemPrompt);
+        return executeStream(messages, null, isAutoContinue);
+    } catch (fatalError) {
+        /* Safety net: catch anything that slips through (filesystem errors, etc.)
+           Without this, the UI gets permanently stuck in "Generating..." */
+        console.error('[Connection] FATAL in sendMessage:', fatalError);
+        state.isStreaming = false;
         state.activeTask.isRunning = false;
         state.activeTask.loopCount = 0;
-        return;
+        state.streamElement = null;
+        state.streamBuffer = '';
+        updateSendButton();
+        setConnectionStatus('connected', 'Connected — ' + (state.settings.model || 'unknown'));
+        toast('Unexpected error: ' + (fatalError.message || 'unknown').substring(0, 100), 'error');
     }
-
-    if (!isAutoContinue) {
-        if (!userText.trim()) return;
-        if (state.settings.provider !== 'ollama' && !state.settings.apiKey) { toast('No API key set. Open Settings.', 'error'); return; }
-        if (!state.settings.model) { toast('No model selected. Open Settings.', 'error'); return; }
-
-        addUserMessage(userText);
-        state.conversationHistory.push({ role: 'user', content: userText });
-
-        state.activeTask.isRunning = CONTINUATION_MODES.indexOf(state.currentMode) !== -1;
-        state.activeTask.loopCount = 0;
-    }
-
-    var systemPrompt = await buildSafeSystemPrompt(userText);
-    var messages = buildSafeMessages(userText, systemPrompt);
-    return executeStream(messages, null, isAutoContinue);
 }
 
 function showThinkingBlock(text) {

@@ -332,11 +332,16 @@ function renderFolderUI() {
     });
 }
 
-/* ── Called from the Apply button in file code blocks ── */
+/* ── Called from the Apply button in file code blocks ──
+   Supports edit mode: if a textarea exists (user clicked Edit),
+   reads from textarea instead of the code element. ── */
 export async function applyFileChange(btn) {
     var block = btn.closest('.file-block');
     var filePath = block.dataset.filePath;
-    var code = block.querySelector('code').textContent;
+
+    /* Check for edit-mode textarea first */
+    var textarea = block.querySelector('.edit-textarea');
+    var code = textarea ? textarea.value : (block.querySelector('code') ? block.querySelector('code').textContent : '');
 
     var originalInfo = fileMap.get(filePath);
     if (originalInfo && originalInfo.content !== null) {
@@ -357,6 +362,28 @@ export async function applyFileChange(btn) {
         btn.innerHTML = '<i class="fas fa-check-double"></i> Applied';
         btn.disabled = true;
         btn.style.color = 'var(--green)';
+    }
+}
+
+/* ── Create a new folder in the workspace ── */
+export async function createFolder(path) {
+    if (!dirHandle) { toast('No workspace connected', 'error'); return false; }
+    try {
+        var parts = path.replace(/\/+$/, '').split('/');
+        var currentDir = dirHandle;
+        for (var i = 0; i < parts.length; i++) {
+            currentDir = await currentDir.getDirectoryHandle(parts[i], { create: true });
+        }
+        /* Re-scan to pick up the new folder */
+        fileMap.clear();
+        await scanDirectory(dirHandle, '');
+        renderFolderUI();
+        updateContextIndicator();
+        toast('Folder created: ' + path, 'success');
+        return true;
+    } catch (e) {
+        toast('Failed to create folder: ' + path + ' — ' + e.message, 'error');
+        return false;
     }
 }
 

@@ -331,6 +331,64 @@ export function useAsInput(btn) {
     import('./ui.js').then(function (m) { m.toast('Code loaded into input', 'success'); });
 }
 
+/* ── Edit file code inline before applying ── */
+export function editFileCode(btn) {
+    var block = btn.closest('.file-block');
+    if (!block) return;
+
+    /* If already editing, sync textarea → code and exit edit mode */
+    if (block.classList.contains('editing')) {
+        var textarea = block.querySelector('.edit-textarea');
+        if (textarea) {
+            var codeEl = block.querySelector('code');
+            if (codeEl) codeEl.textContent = textarea.value;
+            textarea.remove();
+        }
+        block.classList.remove('editing');
+        var pre = block.querySelector('pre');
+        if (pre) pre.style.display = '';
+        btn.innerHTML = '<i class="fas fa-pen"></i> Edit';
+        btn.style.color = '';
+        /* Re-highlight after sync */
+        var el = block.querySelector('code');
+        if (el) {
+            el.classList.remove('prism-highlighted');
+            requestAnimationFrame(function () { highlightCodeBlocks(block); });
+        }
+        return;
+    }
+
+    /* Enter edit mode: overlay textarea on the code block */
+    block.classList.add('editing');
+    var pre = block.querySelector('pre');
+    var currentCode = pre ? (pre.querySelector('code') ? pre.querySelector('code').textContent : '') : '';
+
+    var textarea = document.createElement('textarea');
+    textarea.className = 'edit-textarea';
+    textarea.value = currentCode;
+    textarea.spellcheck = false;
+    textarea.style.cssText = 'width:100%;min-height:200px;background:var(--bg-secondary,#1a1a2e);color:var(--text,#e0e0e0);border:1px solid var(--accent,#00d4aa);border-radius:6px;padding:12px;font-family:"JetBrains Mono",monospace;font-size:0.85rem;resize:vertical;tab-size:4;box-sizing:border-box;outline:none;';
+
+    if (pre) pre.style.display = 'none';
+    if (pre && pre.parentNode) {
+        pre.parentNode.insertBefore(textarea, pre);
+    }
+
+    btn.innerHTML = '<i class="fas fa-eye"></i> Preview';
+    btn.style.color = 'var(--accent,#00d4aa)';
+
+    /* Tab key inserts spaces instead of changing focus */
+    textarea.addEventListener('keydown', function (e) {
+        if (e.key === 'Tab') {
+            e.preventDefault();
+            var start = this.selectionStart;
+            var end = this.selectionEnd;
+            this.value = this.value.substring(0, start) + '    ' + this.value.substring(end);
+            this.selectionStart = this.selectionEnd = start + 4;
+        }
+    });
+}
+
 function escapeHtml(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
