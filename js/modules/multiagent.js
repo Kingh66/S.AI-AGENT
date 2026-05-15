@@ -185,6 +185,7 @@ function getApiUrl() {
     var provider = state.settings.provider;
     if (provider === 'ollama') return endpoint + '/api/chat';
     if (provider === 'openrouter') return 'https://openrouter.ai/api/v1/chat/completions';
+    if (provider === 'google-ai') return endpoint + '/chat/completions';
     return endpoint.replace(/\/v1$/, '') + '/v1/chat/completions';
 }
 
@@ -201,7 +202,9 @@ function buildAgentPayload(messages, model, maxTokens) {
 
 function buildAgentHeaders() {
     var h = { 'Content-Type': 'application/json' };
-    if (!isOllamaProvider() && state.settings.apiKey) {
+    if (state.settings.provider === 'google-ai') {
+        if (state.settings.apiKey) h['Authorization'] = 'Bearer ' + state.settings.apiKey;
+    } else if (!isOllamaProvider() && state.settings.apiKey) {
         h['Authorization'] = 'Bearer ' + state.settings.apiKey;
     }
     if (state.settings.provider === 'openrouter') {

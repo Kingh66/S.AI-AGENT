@@ -89,6 +89,9 @@ export function getApiUrl() {
     var endpoint = state.settings.endpoint.replace(/\/+$/, '');
     if (state.settings.provider === 'ollama') return endpoint + '/api/chat';
     if (state.settings.provider === 'openrouter') return 'https://openrouter.ai/api/v1/chat/completions';
+    /* Google AI Studio endpoint already ends with /openai — just append /chat/completions */
+    if (state.settings.provider === 'google-ai') return endpoint + '/chat/completions';
+    /* Generic OpenAI-compatible: strip trailing /v1, then append /v1/chat/completions */
     endpoint = endpoint.replace(/\/v1$/, '');
     return endpoint + '/v1/chat/completions';
 }
@@ -119,7 +122,12 @@ export function buildPayload(messages, overrideModel, overrideMaxTokens) {
 
 export function buildHeaders() {
     var h = { 'Content-Type': 'application/json' };
-    if (!isOllamaProvider() && state.settings.apiKey) h['Authorization'] = 'Bearer ' + state.settings.apiKey;
+    if (state.settings.provider === 'google-ai') {
+        /* Google AI Studio supports both x-goog-api-key and Bearer — prefer Bearer for OpenAI compat */
+        if (state.settings.apiKey) h['Authorization'] = 'Bearer ' + state.settings.apiKey;
+    } else if (!isOllamaProvider() && state.settings.apiKey) {
+        h['Authorization'] = 'Bearer ' + state.settings.apiKey;
+    }
     if (state.settings.provider === 'openrouter') {
         h['HTTP-Referer'] = window.location.href;
         h['X-Title'] = 'S.ai Coding Agent';
@@ -330,11 +338,40 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         if (!res.ok) {
             var errText = await res.text().catch(function () { return ''; });
             var status = res.status;
-            if (status === 429) throw new Error('RATE_LIMIT:' + errText.substring(0, 300));
+            /* Auto-retry on 429 (rate limit) — Gemini free tier recovers in a few seconds */
+            if (status === 429) {
+                var retryAfter = res.headers.get('retry-after');
+                var waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 5000;
+                console.log('[Connection] 429 rate limited. Waiting ' + waitMs + 'ms before retry...');
+                setConnectionStatus('disconnected', 'Rate limited — retrying...');
+                toast('Rate limited. Retrying in ' + (waitMs / 1000) + 's...', 'info');
+                await new Promise(function (r) { setTimeout(r, waitMs); });
+                /* Retry once */
+                try {
+                    var retryRes = await fetch(getApiUrl(), {
+                        method: 'POST', headers: buildHeaders(),
+                        body: JSON.stringify(buildPayload(messages, null, actualMaxTokens)),
+                        signal: state.abortController.signal
+                    });
+                    if (retryRes.ok) {
+                        /* Fall through — let the main streaming loop handle this response */
+                        res = retryRes;
+                        /* Clear the error so we don't throw */
+                        errText = '';
+                        status = 0;
+                    } else {
+                        throw new Error('RATE_LIMIT:' + errText.substring(0, 300));
+                    }
+                } catch (retryErr) {
+                    if (retryErr.message && retryErr.message.indexOf('RATE_LIMIT') > -1) throw retryErr;
+                    throw retryErr;
+                }
+            }
+            if (status === 402) throw new Error('INSUFFICIENT_CREDITS: ' + errText.substring(0, 300));
             else if (status === 401 || status === 403) throw new Error('AUTH_ERROR:' + status + ': ' + errText.substring(0, 200));
             else if (status === 502 || status === 503 || status === 504) throw new Error('SERVER_OVERLOAD:' + status + ': ' + errText.substring(0, 200));
             else if (status >= 500) throw new Error('SERVER_ERROR:' + status + ': ' + errText.substring(0, 300));
-            else throw new Error('HTTP ' + status + ': ' + errText.substring(0, 300));
+            else if (status !== 0) throw new Error('HTTP ' + status + ': ' + errText.substring(0, 300));
         }
 
         var reader = res.body.getReader();
@@ -603,7 +640,9 @@ export async function testConnection() {
 
     try {
         var h = { 'Content-Type': 'application/json' };
-        if (apiKey) h['Authorization'] = 'Bearer ' + apiKey;
+        if (provider === 'google-ai') {
+            if (apiKey) h['Authorization'] = 'Bearer ' + apiKey;
+        } else if (apiKey) h['Authorization'] = 'Bearer ' + apiKey;
         if (provider === 'openrouter') { h['HTTP-Referer'] = window.location.href; h['X-Title'] = 'S.ai Coding Agent'; }
         var body = provider === 'ollama'
             ? JSON.stringify({ model: model, messages: [{ role: 'user', content: 'Hi' }], stream: false })
@@ -652,6 +691,7 @@ export async function fetchModels() {
 
     try {
         if (provider === 'openrouter') { await fetchOpenRouterModels(); return; }
+        if (provider === 'google-ai') { await fetchGoogleAIModels(); return; }
         var url, h = {};
         if (provider === 'ollama') { url = endpoint + '/api/tags'; }
         else { url = endpoint.replace(/\/+$/, '').replace(/\/v1$/, '') + '/v1/models'; if (apiKey) h['Authorization'] = 'Bearer ' + apiKey; }
@@ -668,6 +708,38 @@ export async function fetchModels() {
         }
     } catch (e) { toast('Failed to fetch models: ' + e.message, 'error'); listEl.style.display = 'none'; }
     finally { btn.innerHTML = '<i class="fas fa-refresh"></i> Fetch Models'; btn.disabled = false; }
+}
+
+async function fetchGoogleAIModels() {
+    var listEl = document.getElementById('s-models-list');
+    var apiKey = state.settings.apiKey;
+    if (!apiKey) { toast('Enter your Google AI API key first', 'error'); listEl.style.display = 'none'; return; }
+    var h = { 'Content-Type': 'application/json' };
+    if (apiKey) h['x-goog-api-key'] = apiKey;
+
+    /* Known Gemini models — hardcoded so Fetch Models works even without the list endpoint */
+    var geminiModels = [
+        { id: 'models/gemini-2.0-flash', name: 'Gemini 2.0 Flash [FREE]', ctx: 1048576 },
+        { id: 'models/gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash Preview [FREE]', ctx: 1048576 },
+        { id: 'models/gemini-2.5-pro-preview-05-06', name: 'Gemini 2.5 Pro Preview [FREE]', ctx: 2097152 },
+        { id: 'models/gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash Lite [FREE]', ctx: 1048576 },
+        { id: 'models/gemini-1.5-flash', name: 'Gemini 1.5 Flash [FREE]', ctx: 1048576 },
+        { id: 'models/gemini-1.5-pro', name: 'Gemini 1.5 Pro [FREE]', ctx: 2097152 }
+    ];
+
+    var html = '';
+    html += '<option disabled style="color:var(--accent);font-weight:700">── 🌐 Google Gemini (Free) ──</option>';
+    for (var i = 0; i < geminiModels.length; i++) {
+        var m = geminiModels[i];
+        html += '<option value="' + m.id + '">' + m.name + formatCtx(m.ctx) + '</option>';
+        state.modelContextLimits[m.id] = Math.floor(m.ctx * 3.5);
+    }
+
+    listEl.innerHTML = html;
+    listEl.style.display = 'block';
+    var curModel = document.getElementById('s-model').value;
+    if (!curModel) { document.getElementById('s-model').value = geminiModels[0].id; listEl.value = geminiModels[0].id; }
+    toast('Loaded ' + geminiModels.length + ' Gemini models', 'success');
 }
 
 async function fetchOpenRouterModels() {

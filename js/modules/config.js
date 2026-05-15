@@ -63,6 +63,7 @@ export const MODE_INFO = {
 };
 
 export const PROVIDER_DEFAULTS = {
+    'google-ai': { endpoint: 'https://generativelanguage.googleapis.com/v1beta/openai', hint: 'Google AI Studio — free Gemini models, generous rate limits, no credit card needed', keyPlaceholder: 'AIza...', keyHint: 'Get your key at aistudio.google.com/apikey' },
     openrouter: { endpoint: 'https://openrouter.ai/api/v1', hint: 'OpenRouter — access hundreds of models through one API', keyPlaceholder: 'sk-or-v1-...', keyHint: 'Get your key at openrouter.ai/keys' },
     ollama: { endpoint: 'http://localhost:11434', hint: 'Runs locally at localhost:11434 — free, private, no API key needed', keyPlaceholder: 'Not needed for Ollama', keyHint: 'Leave empty for Ollama' },
     lmstudio: { endpoint: 'http://localhost:1234', hint: 'LM Studio local server — download models and serve locally', keyPlaceholder: 'Not needed for LM Studio', keyHint: 'Leave empty for LM Studio' },
@@ -71,6 +72,9 @@ export const PROVIDER_DEFAULTS = {
 };
 
 export const TOP_TIER_MODELS = {
+    'models/gemini-2.0-flash': { chars: 500000, tier: 'Free (Google AI Studio)' },
+    'models/gemini-2.5-flash-preview-05-20': { chars: 500000, tier: 'Free (Google AI Studio)' },
+    'models/gemini-2.5-pro-preview-05-06': { chars: 500000, tier: 'Free (Google AI Studio)' },
     'stepfun/step-3.5-flash': { chars: 3500000, tier: 'Free Unlimited' },
     'z-ai/glm-5-turbo': { chars: 450000, tier: 'Free Unlimited' },
     'xiaomi/mimo-v2-pro': { chars: 3500000, tier: 'Free Unlimited' },
