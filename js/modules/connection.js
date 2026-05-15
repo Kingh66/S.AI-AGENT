@@ -3,14 +3,26 @@
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { FILE_SYSTEM_INSTRUCTIONS } from './config.js';
-import { getSmartFileContext } from './smart-context.js';
 import {
     removeWelcome, addUserMessage, addBotMessageStart,
     appendStreamChunk, finalizeStream, updateSendButton
 } from './messages.js';
 import { setConnectionStatus, toast } from './ui.js';
 
-var FETCH_TIMEOUT = 110000;
+/* ═══════════════════════════════════════════════════
+   RATE LIMIT CONFIG — per-provider retry behavior
+   ═══════════════════════════════════════════════════ */
+var RATE_LIMIT_CONFIG = {
+    'google-ai':   { baseDelay: 12000, maxRetries: 4, backoffFactor: 2.0, minInterval: 4000, continueDelay: 6000 },
+    'openrouter':  { baseDelay: 5000,  maxRetries: 2, backoffFactor: 1.5, minInterval: 1500, continueDelay: 2000 },
+    'ollama':      { baseDelay: 2000,  maxRetries: 2, backoffFactor: 1.5, minInterval: 500,  continueDelay: 1000 },
+    'lmstudio':    { baseDelay: 2000,  maxRetries: 2, backoffFactor: 1.5, minInterval: 500,  continueDelay: 1000 },
+    'openai':      { baseDelay: 5000,  maxRetries: 2, backoffFactor: 2.0, minInterval: 1500, continueDelay: 2000 },
+    'openai-compat': { baseDelay: 5000, maxRetries: 2, backoffFactor: 2.0, minInterval: 1500, continueDelay: 2000 },
+    'default':     { baseDelay: 5000,  maxRetries: 2, backoffFactor: 2.0, minInterval: 2000, continueDelay: 2000 }
+};
+
+var FETCH_TIMEOUT = 120000;
 var STREAM_STALL_TIMEOUT = 60000;
 var MIN_MAX_TOKENS = 256;
 var MAX_MAX_TOKENS = 32768;
@@ -23,6 +35,120 @@ var CONTINUATION_MODES = ['custom', 'selfimprove', 'multiagent'];
 var CONTINUE_MSG_FILE = 'OUTPUT NEXT FILE: One file block only. <|CONTINUE_TASK|> if more files remain, end normally if last. No commentary.';
 
 var CONTINUE_MSG_STALL = 'OUTPUT NEXT FILE: Previous output cut off. One file block only. <|CONTINUE_TASK|> if more remain, end normally if last. No commentary.';
+
+/* ── Track last request time for client-side throttling ── */
+var _lastRequestTime = 0;
+
+function getRLConfig() {
+    return RATE_LIMIT_CONFIG[state.settings.provider] || RATE_LIMIT_CONFIG['default'];
+}
+
+function getFetchTimeout() {
+    var cfg = getRLConfig();
+    /* Add extra time to accommodate retries (each retry can take baseDelay * backoffFactor^attempt) */
+    var retryOverhead = 0;
+    for (var i = 0; i < cfg.maxRetries; i++) {
+        retryOverhead += cfg.baseDelay * Math.pow(cfg.backoffFactor, i);
+    }
+    return FETCH_TIMEOUT + Math.round(retryOverhead);
+}
+
+/* ── Client-side throttle — ensures minimum interval between requests ── */
+async function throttleRequest() {
+    var cfg = getRLConfig();
+    var elapsed = Date.now() - _lastRequestTime;
+    var wait = cfg.minInterval - elapsed;
+    if (wait > 0) {
+        console.log('[Connection] Throttling: waiting ' + wait + 'ms (min interval ' + cfg.minInterval + 'ms)');
+        await new Promise(function(r) { setTimeout(r, wait); });
+    }
+}
+
+/* ═══════════════════════════════════════════════════
+   FETCH WITH RATE-LIMIT RETRY
+   Exponential backoff with jitter for 429 responses.
+   Returns a non-429 response, or the last 429 if
+   all retries are exhausted.
+   ═══════════════════════════════════════════════════ */
+async function fetchWithRetry(url, options) {
+    var cfg = getRLConfig();
+    var lastResponse = null;
+    var last429Body = '';
+
+    for (var attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+        try {
+            var fetchOpts = Object.assign({}, options);
+            /* On retry, create a fresh AbortController if the old one was consumed */
+            if (attempt > 0 && state.abortController) {
+                /* Keep using the same abort controller so user-cancel still works */
+                fetchOpts.signal = state.abortController.signal;
+            }
+
+            var res = await fetch(url, fetchOpts);
+            _lastRequestTime = Date.now();
+
+            if (res.status !== 429) return res;
+
+            /* ── 429 received ── */
+            lastResponse = res;
+            last429Body = await res.text().catch(function() { return ''; });
+
+            if (attempt >= cfg.maxRetries) {
+                console.warn('[Connection] 429 rate limit: all ' + cfg.maxRetries + ' retries exhausted');
+                return res; /* Caller will handle the 429 */
+            }
+
+            /* Calculate delay with exponential backoff + jitter */
+            var delay = cfg.baseDelay * Math.pow(cfg.backoffFactor, attempt);
+            /* Add 0-30% jitter to prevent thundering herd */
+            delay += Math.round(Math.random() * delay * 0.3);
+            delay = Math.round(delay);
+
+            /* Check Retry-After header — server knows best */
+            var retryAfter = res.headers.get('retry-after');
+            if (retryAfter) {
+                var serverDelay = parseInt(retryAfter, 10) * 1000;
+                if (serverDelay > 0 && serverDelay < 300000) { /* Cap at 5 minutes */
+                    delay = Math.max(delay, serverDelay);
+                }
+            }
+
+            /* Try to parse quota reset time from Google AI error body */
+            try {
+                var parsed429 = JSON.parse(last429Body);
+                if (parsed429.error && parsed429.error.details) {
+                    for (var d = 0; d < parsed429.error.details.length; d++) {
+                        var detail = parsed429.error.details[d];
+                        if (detail['@type'] && detail['@type'].indexOf('QuotaFailure') > -1) {
+                            /* Google AI often includes retry delay in error details */
+                        }
+                        if (detail.retryDelay) {
+                            var googleDelay = parseInt(detail.retryDelay, 10) * 1000;
+                            if (googleDelay > 0) delay = Math.max(delay, googleDelay);
+                        }
+                    }
+                }
+            } catch (e) { /* Not JSON or no details — use calculated delay */ }
+
+            var delaySec = (delay / 1000).toFixed(1);
+            console.log('[Connection] 429 rate limited. Retry #' + (attempt + 1) + '/' + cfg.maxRetries + ' in ' + delaySec + 's');
+            setConnectionStatus('disconnected', 'Rate limited — retry #' + (attempt + 1) + ' in ' + delaySec + 's');
+            toast('Rate limited. Retrying in ' + delaySec + 's (attempt ' + (attempt + 1) + '/' + cfg.maxRetries + ')...', 'info');
+
+            await new Promise(function(r) { setTimeout(r, delay); });
+
+        } catch (fetchErr) {
+            /* AbortError = user cancelled or timeout — don't retry */
+            if (fetchErr.name === 'AbortError') throw fetchErr;
+            /* Network error on retry — throw */
+            if (attempt > 0) throw fetchErr;
+            /* First attempt network error — let caller handle */
+            throw fetchErr;
+        }
+    }
+
+    return lastResponse;
+}
 
 function estimateTokens(text) {
     if (!text) return 0;
@@ -123,7 +249,6 @@ export function buildPayload(messages, overrideModel, overrideMaxTokens) {
 export function buildHeaders() {
     var h = { 'Content-Type': 'application/json' };
     if (state.settings.provider === 'google-ai') {
-        /* Google AI Studio supports both x-goog-api-key and Bearer — prefer Bearer for OpenAI compat */
         if (state.settings.apiKey) h['Authorization'] = 'Bearer ' + state.settings.apiKey;
     } else if (!isOllamaProvider() && state.settings.apiKey) {
         h['Authorization'] = 'Bearer ' + state.settings.apiKey;
@@ -190,7 +315,6 @@ async function buildSafeSystemPrompt(userText) {
         if (fileCtx) sys += '\n\n' + FILE_SYSTEM_INSTRUCTIONS + '\n\n' + fileCtx;
     } catch (fsError) {
         console.warn('[Connection] File context build failed (non-fatal):', fsError.message);
-        /* Continue without file context rather than crashing */
     }
 
     return sys;
@@ -242,6 +366,9 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     for (var m = 0; m < messages.length; m++) totalEstTokens += estimateTokens(messages[m].content);
     console.log('[Connection] Sending ~' + totalEstTokens + ' input + ' + actualMaxTokens + ' output tokens');
 
+    /* ── Client-side throttle before any request ── */
+    await throttleRequest();
+
     state.isStreaming = true;
     state.abortController = new AbortController();
     updateSendButton();
@@ -270,7 +397,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     var abortSource = null;
 
     var thinkStartTime = Date.now();
-    /* Ollama: update status every 2s instead of 500ms to reduce DOM writes */
     var thinkInterval = isOllamaProvider() ? 2000 : 500;
     var thinkTimer = setInterval(function () {
         if (!firstTokenReceived && state.isStreaming) {
@@ -279,11 +405,11 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         }
     }, thinkInterval);
 
+    var currentFetchTimeout = getFetchTimeout();
     var fetchTimeoutId = setTimeout(function () {
         if (state.isStreaming && state.abortController) { abortSource = 'timeout'; state.abortController.abort(); }
-    }, FETCH_TIMEOUT);
+    }, currentFetchTimeout);
 
-        /* Ollama: check stall every 10s instead of 5s — local models can have natural pauses */
     var stallInterval = isOllamaProvider() ? 10000 : 5000;
     var stallWatchdog = setInterval(function () {
         if (state.isStreaming && firstTokenReceived && (Date.now() - lastChunkTime > STREAM_STALL_TIMEOUT)) {
@@ -296,7 +422,10 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     state.abortController.abort = function () { if (!abortSource) abortSource = 'user'; originalAbort(); };
 
     try {
-        var res = await fetch(getApiUrl(), {
+        /* ═══════════════════════════════════════════════════
+           FETCH with automatic 429 retry (exponential backoff)
+           ═══════════════════════════════════════════════════ */
+        var res = await fetchWithRetry(getApiUrl(), {
             method: 'POST',
             headers: buildHeaders(),
             body: JSON.stringify(buildPayload(messages, null, actualMaxTokens)),
@@ -306,6 +435,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         clearTimeout(fetchTimeoutId);
         fetchTimeoutId = null;
 
+        /* ── Handle 402 (insufficient credits) ── */
         if (res.status === 402) {
             var err402Text = await res.text().catch(function () { return ''; });
             var retryTokens = resolveRetryTokens(err402Text, actualMaxTokens, overrideMaxTokens != null);
@@ -335,45 +465,26 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             }
         }
 
+        /* ── Handle 429 (rate limit) after all retries exhausted ── */
+        if (res.status === 429) {
+            var err429Text = await res.text().catch(function () { return ''; });
+            throw new Error('RATE_LIMIT: All retries exhausted. ' + err429Text.substring(0, 200));
+        }
+
+        /* ── Handle other HTTP errors ── */
         if (!res.ok) {
             var errText = await res.text().catch(function () { return ''; });
             var status = res.status;
-            /* Auto-retry on 429 (rate limit) — Gemini free tier recovers in a few seconds */
-            if (status === 429) {
-                var retryAfter = res.headers.get('retry-after');
-                var waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 5000;
-                console.log('[Connection] 429 rate limited. Waiting ' + waitMs + 'ms before retry...');
-                setConnectionStatus('disconnected', 'Rate limited — retrying...');
-                toast('Rate limited. Retrying in ' + (waitMs / 1000) + 's...', 'info');
-                await new Promise(function (r) { setTimeout(r, waitMs); });
-                /* Retry once */
-                try {
-                    var retryRes = await fetch(getApiUrl(), {
-                        method: 'POST', headers: buildHeaders(),
-                        body: JSON.stringify(buildPayload(messages, null, actualMaxTokens)),
-                        signal: state.abortController.signal
-                    });
-                    if (retryRes.ok) {
-                        /* Fall through — let the main streaming loop handle this response */
-                        res = retryRes;
-                        /* Clear the error so we don't throw */
-                        errText = '';
-                        status = 0;
-                    } else {
-                        throw new Error('RATE_LIMIT:' + errText.substring(0, 300));
-                    }
-                } catch (retryErr) {
-                    if (retryErr.message && retryErr.message.indexOf('RATE_LIMIT') > -1) throw retryErr;
-                    throw retryErr;
-                }
-            }
-            if (status === 402) throw new Error('INSUFFICIENT_CREDITS: ' + errText.substring(0, 300));
-            else if (status === 401 || status === 403) throw new Error('AUTH_ERROR:' + status + ': ' + errText.substring(0, 200));
+
+            if (status === 401 || status === 403) throw new Error('AUTH_ERROR:' + status + ': ' + errText.substring(0, 200));
             else if (status === 502 || status === 503 || status === 504) throw new Error('SERVER_OVERLOAD:' + status + ': ' + errText.substring(0, 200));
             else if (status >= 500) throw new Error('SERVER_ERROR:' + status + ': ' + errText.substring(0, 300));
-            else if (status !== 0) throw new Error('HTTP ' + status + ': ' + errText.substring(0, 300));
+            else throw new Error('HTTP ' + status + ': ' + errText.substring(0, 300));
         }
 
+        /* ═══════════════════════════════════════
+           STREAM READING
+           ═══════════════════════════════════════ */
         var reader = res.body.getReader();
         var decoder = new TextDecoder();
 
@@ -444,7 +555,10 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             toast('File ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + '...', 'info');
             setConnectionStatus('connecting', 'Requesting file ' + (state.activeTask.loopCount + 1) + '...');
             state.conversationHistory.push({ role: 'user', content: CONTINUE_MSG_FILE });
-            setTimeout(function () { sendMessage('', true); }, 1000);
+
+            /* ── Provider-aware auto-continue delay ── */
+            var continueDelay = getRLConfig().continueDelay;
+            setTimeout(function () { sendMessage('', true); }, continueDelay);
         } else {
             state.activeTask.isRunning = false;
             state.activeTask.loopCount = 0;
@@ -476,7 +590,8 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                     state.activeTask.loopCount++;
                     toast('Stalled. Requesting next file (' + state.activeTask.loopCount + ')...', 'error');
                     state.conversationHistory.push({ role: 'user', content: CONTINUE_MSG_STALL });
-                    setTimeout(function () { sendMessage('', true); }, 1500);
+                    var stallContinueDelay = getRLConfig().continueDelay + 2000;
+                    setTimeout(function () { sendMessage('', true); }, stallContinueDelay);
                 } else {
                     state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
                     state.isStreaming = false; updateSendButton();
@@ -502,8 +617,18 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         } else if (errMsg.indexOf('RATE_LIMIT:') === 0) {
             state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
             state.isStreaming = false; updateSendButton();
-            toast('Rate limited. Wait or switch models.', 'error');
-            setConnectionStatus('disconnected', 'Rate Limited');
+            /* ── Better rate limit message with actionable advice ── */
+            var provider = state.settings.provider;
+            var advice = '';
+            if (provider === 'google-ai') {
+                advice = 'Gemini free tier: ~15 requests/min. Wait 60s, reduce conversation history, or switch to a lighter model (gemini-2.0-flash-lite).';
+            } else if (provider === 'openrouter') {
+                advice = 'Wait a few minutes or switch to a different free model.';
+            } else {
+                advice = 'Wait a minute and try again.';
+            }
+            toast('Rate limited after all retries. ' + advice, 'error');
+            setConnectionStatus('disconnected', 'Rate Limited — Wait ' + (provider === 'google-ai' ? '60s' : '30s'));
         } else if (errMsg.indexOf('AUTH_ERROR:') === 0) {
             state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
             state.isStreaming = false; updateSendButton();
@@ -533,21 +658,15 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         clearInterval(stallWatchdog);
         if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
         if (fetchTimeoutId) { clearTimeout(fetchTimeoutId); fetchTimeoutId = null; }
-        /* Safety: always clean up streaming state if no auto-continue is pending.
-           Check setTimeout pending state by verifying activeTask + isStreaming combo. */
         if (state.isStreaming) {
             if (!state.activeTask.isRunning) {
                 state.isStreaming = false;
                 updateSendButton();
-            } else if (!state.isRenderScheduled) {
-                /* Auto-continue was set but something went wrong —
-                   the setTimeout should handle it, but add a safety net */
-                if (!state.streamElement) {
-                    state.isStreaming = false;
-                    state.activeTask.isRunning = false;
-                    state.activeTask.loopCount = 0;
-                    updateSendButton();
-                }
+            } else if (!state.streamElement) {
+                state.isStreaming = false;
+                state.activeTask.isRunning = false;
+                state.activeTask.loopCount = 0;
+                updateSendButton();
             }
         }
     }
@@ -579,8 +698,6 @@ export async function sendMessage(userText, isAutoContinue) {
         var messages = buildSafeMessages(userText || '', systemPrompt);
         return executeStream(messages, null, isAutoContinue);
     } catch (fatalError) {
-        /* Safety net: catch anything that slips through (filesystem errors, etc.)
-           Without this, the UI gets permanently stuck in "Generating..." */
         console.error('[Connection] FATAL in sendMessage:', fatalError);
         state.isStreaming = false;
         state.activeTask.isRunning = false;
@@ -648,7 +765,14 @@ export async function testConnection() {
             ? JSON.stringify({ model: model, messages: [{ role: 'user', content: 'Hi' }], stream: false })
             : JSON.stringify({ model: model, messages: [{ role: 'user', content: 'Hi' }], max_tokens: 5 });
 
-        var r = await fetch(getApiUrl(), { method: 'POST', headers: h, body: body });
+        var r = await fetchWithRetry(getApiUrl(), { method: 'POST', headers: h, body: body });
+
+        if (r.status === 429) {
+            toast('Rate limited during test. Connection works but wait before sending messages.', 'info');
+            setConnectionStatus('connected', 'Connected — ' + model + ' (rate limited, wait 60s)');
+            return true;
+        }
+
         if (!r.ok) {
             var e = await r.text().catch(function () { return ''; });
             if (r.status === 402) {
@@ -656,12 +780,11 @@ export async function testConnection() {
                 if (retryTokens != null) {
                     var tokensInput = document.getElementById('q-tokens');
                     if (tokensInput) tokensInput.value = retryTokens;
-                    toast('Credits low — test passed with ' + retryTokens + ' tokens. Consider setting Max Tokens to ' + retryTokens + ' in Settings.', 'info');
+                    toast('Credits low — test passed with ' + retryTokens + ' tokens.', 'info');
                     setConnectionStatus('connected', 'Connected — ' + model + ' (' + retryTokens + ' tok limit)');
                     return true;
                 }
             }
-            if (r.status === 429) throw new Error('Rate limited.');
             if (r.status === 401 || r.status === 403) throw new Error('Auth failed. Check your API key.');
             throw new Error('HTTP ' + r.status + ': ' + e.substring(0, 200));
         }
@@ -714,10 +837,7 @@ async function fetchGoogleAIModels() {
     var listEl = document.getElementById('s-models-list');
     var apiKey = state.settings.apiKey;
     if (!apiKey) { toast('Enter your Google AI API key first', 'error'); listEl.style.display = 'none'; return; }
-    var h = { 'Content-Type': 'application/json' };
-    if (apiKey) h['x-goog-api-key'] = apiKey;
 
-    /* Known Gemini models — hardcoded so Fetch Models works even without the list endpoint */
     var geminiModels = [
         { id: 'models/gemini-2.0-flash', name: 'Gemini 2.0 Flash [FREE]', ctx: 1048576 },
         { id: 'models/gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash Preview [FREE]', ctx: 1048576 },

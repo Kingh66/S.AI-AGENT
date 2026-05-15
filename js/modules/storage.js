@@ -238,9 +238,10 @@ export function loadSettings() {
 
     var defaults = PROVIDER_DEFAULTS[state.settings.provider];
     if (defaults) {
-        var allEndpoints = [];
-        for (var key in PROVIDER_DEFAULTS) { allEndpoints.push(PROVIDER_DEFAULTS[key].endpoint); }
-        if (allEndpoints.indexOf(state.settings.endpoint) === -1) {
+        /* CRITICAL: Only check against the CURRENT provider's default endpoint.
+           Old logic checked ALL provider endpoints, so switching from OpenRouter
+           to Google AI would keep the OpenRouter URL since it was "valid". */
+        if (state.settings.endpoint !== defaults.endpoint) {
             state.settings.endpoint = defaults.endpoint;
             repaired = true;
         }

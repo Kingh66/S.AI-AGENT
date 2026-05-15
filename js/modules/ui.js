@@ -292,10 +292,8 @@ export function updateProviderHint() {
 
     var currentEndpoint = document.getElementById('s-endpoint');
     if (!currentEndpoint) return;
-    var allDefaults = Object.values(PROVIDER_DEFAULTS).map(function(d) { return d.endpoint; });
-    if (!currentEndpoint.value || allDefaults.indexOf(currentEndpoint.value) === -1) {
-        currentEndpoint.value = defaults.endpoint;
-    }
+    /* Always set endpoint to match the selected provider's default */
+    currentEndpoint.value = defaults.endpoint;
 }
 
 /* ═══════════════════════════════════════
