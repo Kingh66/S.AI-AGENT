@@ -5,7 +5,7 @@ import { state, voiceState } from './state.js';
 import { FILE_SYSTEM_INSTRUCTIONS } from './config.js';
 import {
     removeWelcome, addUserMessage, addBotMessageStart,
-    appendStreamChunk, finalizeStream, updateSendButton
+    appendStreamChunk, finalizeStream, updateSendButton, showContinueButton, removeContinueButton
 } from './messages.js';
 import { setConnectionStatus, toast } from './ui.js';
 
@@ -587,7 +587,11 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             state.isStreaming = false;
             updateSendButton();
             setConnectionStatus('connected', 'Connected — ' + state.settings.model);
-            if (hitLimit && !isAutoContinue) toast('Response truncated. Type "continue" to get the rest.', 'info');
+            if (hitLimit && !isAutoContinue) {
+                state.responseTruncated = true;
+                toast('Response truncated. Click Continue or type /continue', 'info');
+                showContinueButton();
+            }
             if (state.conversationHistory.length > 30) state.conversationHistory = state.conversationHistory.slice(-20);
         }
 
@@ -706,11 +710,20 @@ export async function sendMessage(userText, isAutoContinue) {
 
         if (!isAutoContinue) {
             if (!userText.trim()) return;
+            /* Intercept plain 'continue' when last response was truncated */
+            if (state.responseTruncated && /^continue$/i.test(userText.trim())) {
+                continueResponse();
+                return;
+            }
             if (state.settings.provider !== 'ollama' && !state.settings.apiKey) { toast('No API key set. Open Settings.', 'error'); return; }
             if (!state.settings.model) { toast('No model selected. Open Settings.', 'error'); return; }
 
             addUserMessage(userText);
             state.conversationHistory.push({ role: 'user', content: userText });
+
+            /* Clear truncated flag and remove button when user sends a new message */
+            state.responseTruncated = false;
+            removeContinueButton();
 
             state.activeTask.isRunning = CONTINUATION_MODES.indexOf(state.currentMode) !== -1;
             state.activeTask.loopCount = 0;
@@ -729,6 +742,41 @@ export async function sendMessage(userText, isAutoContinue) {
         updateSendButton();
         setConnectionStatus('connected', 'Connected — ' + (state.settings.model || 'unknown'));
         toast('Unexpected error: ' + (fatalError.message || 'unknown').substring(0, 100), 'error');
+    }
+}
+
+/* ═══════════════════════════════════════════════════
+   CONTINUE RESPONSE — Resumes a truncated response
+   Called by: Continue button, /continue command, or typing "continue"
+   ═══════════════════════════════════════════════════ */
+export async function continueResponse() {
+    if (state.isStreaming) {
+        toast('Wait for the current response to finish first.', 'info');
+        return;
+    }
+    if (!state.responseTruncated) {
+        toast('No truncated response to continue.', 'info');
+        return;
+    }
+
+    /* Clear the truncated flag and remove the continue button */
+    state.responseTruncated = false;
+    removeContinueButton();
+
+    /* Push a continuation prompt without showing it as a user bubble */
+    state.conversationHistory.push({ role: 'user', content: 'Continue exactly where you left off. Do not repeat anything already said.' });
+
+    toast('Continuing response...', 'info');
+
+    try {
+        var systemPrompt = await buildSafeSystemPrompt('');
+        var messages = buildSafeMessages('', systemPrompt);
+        return executeStream(messages, null, true);
+    } catch (err) {
+        console.error('[Connection] FATAL in continueResponse:', err);
+        state.isStreaming = false;
+        updateSendButton();
+        toast('Failed to continue: ' + (err.message || 'unknown').substring(0, 100), 'error');
     }
 }
 

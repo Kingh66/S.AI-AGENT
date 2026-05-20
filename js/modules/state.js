@@ -29,6 +29,9 @@ export const state = {
 
     modelContextLimits: {},
 
+    /* Set to true when the last response was truncated (finishReason=length) */
+    responseTruncated: false,
+
     activeTask: {
         isRunning: false,
         loopCount: 0,

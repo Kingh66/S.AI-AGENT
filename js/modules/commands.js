@@ -46,6 +46,8 @@ export function handleSlashCommand(cmd) {
         clearChat();
     } else if (cmd === '/export') {
         exportChat();
+    } else if (cmd === '/continue') {
+        import('./connection.js').then(function(m) { m.continueResponse(); });
     } else {
         toast('Unknown command: ' + cmd, 'error');
     }
@@ -53,6 +55,7 @@ export function handleSlashCommand(cmd) {
 
 export function clearChat() {
     state.conversationHistory = [];
+    state.responseTruncated = false;
     document.getElementById('messages').innerHTML =
         '<div class="welcome-state" id="welcome-state">' +
         '<div class="welcome-icon">S</div>' +

@@ -297,6 +297,30 @@ window.toggleThinkingBlock = function (el) {
     }
 };
 
+/* ═══════════════════════════════════════════════════
+   CONTINUE BUTTON — Shown when response is truncated
+   ═══════════════════════════════════════════════════ */
+export function showContinueButton() {
+    removeContinueButton();
+    var lastBotMsg = document.querySelector('.message.bot:last-child .msg-content');
+    if (!lastBotMsg) return;
+
+    var wrapper = document.createElement('div');
+    wrapper.className = 'continue-response-wrapper';
+    wrapper.id = 'continue-response-btn';
+    wrapper.innerHTML =
+        '<button class="continue-response-btn" onclick="window.saiContinueResponse()" title="Continue the truncated response">' +
+        '<i class="fas fa-forward"></i> Continue' +
+        '</button>';
+    lastBotMsg.appendChild(wrapper);
+    fastScroll();
+}
+
+export function removeContinueButton() {
+    var el = document.getElementById('continue-response-btn');
+    if (el) el.remove();
+}
+
 export function updateSendButton() {
     var btn = document.getElementById('send-btn');
     if (state.isStreaming) {

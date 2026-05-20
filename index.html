@@ -8,6 +8,43 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <link rel="stylesheet" href="css/styles.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+    <style>
+        /* ── Continue Response Button ── */
+        .continue-response-wrapper {
+            display: flex;
+            justify-content: center;
+            margin-top: 12px;
+            padding-top: 10px;
+            border-top: 1px solid rgba(255,255,255,0.08);
+        }
+        .continue-response-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 20px;
+            border: 1px solid var(--accent, #00d4aa);
+            border-radius: 20px;
+            background: rgba(0,212,170,0.1);
+            color: var(--accent, #00d4aa);
+            font-size: 0.82rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-family: 'Poppins', sans-serif;
+        }
+        .continue-response-btn:hover {
+            background: var(--accent, #00d4aa);
+            color: #1a1a2e;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 15px rgba(0,212,170,0.3);
+        }
+        .continue-response-btn:active {
+            transform: translateY(0);
+        }
+        .continue-response-btn i {
+            font-size: 0.75rem;
+        }
+    </style>
 </head>
 <body>
 
@@ -171,7 +208,7 @@
             </div>
             <div class="input-hint">
                 <div class="slash-cmds">
-                    <code>/doc</code> <code>/review</code> <code>/improve</code> <code>/debug</code> <code>/explain</code> <code>/clear</code> <code>/export</code>
+                    <code>/doc</code> <code>/review</code> <code>/improve</code> <code>/debug</code> <code>/explain</code> <code>/continue</code> <code>/clear</code> <code>/export</code>
                 </div>
                 <span>Shift+Enter for new line &middot; Mic for voice</span>
             </div>
