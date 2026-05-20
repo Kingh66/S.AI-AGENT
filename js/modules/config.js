@@ -75,26 +75,30 @@ export const TOP_TIER_MODELS = {
     'models/gemini-2.0-flash': { chars: 500000, tier: 'Free (Google AI Studio)' },
     'models/gemini-2.5-flash-preview-05-20': { chars: 500000, tier: 'Free (Google AI Studio)' },
     'models/gemini-2.5-pro-preview-05-06': { chars: 500000, tier: 'Free (Google AI Studio)' },
-    'stepfun/step-3.5-flash': { chars: 3500000, tier: 'Free Unlimited' },
-    'z-ai/glm-5-turbo': { chars: 450000, tier: 'Free Unlimited' },
-    'xiaomi/mimo-v2-pro': { chars: 3500000, tier: 'Free Unlimited' },
-    'minimax/minimax-m2.7': { chars: 3500000, tier: 'Free Unlimited' },
-    'minimax/minimax-m2.5': { chars: 3500000, tier: 'Free Unlimited' },
-    'nvidia/nemotron-3-super': { chars: 450000, tier: 'Free Unlimited' },
-    'anthropic/claude-sonnet-4.6': { chars: 700000, tier: 'Paid (Needs Credits)' },
-    'anthropic/claude-opus-4.6': { chars: 700000, tier: 'Paid (Needs Credits)' }
+    'xiaomi/mimo-v2-pro:free': { chars: 3500000, tier: 'Free Unlimited' },
+    'minimax/minimax-m2.7:free': { chars: 3500000, tier: 'Free Unlimited' },
+    'minimax/minimax-m2.5:free': { chars: 3500000, tier: 'Free Unlimited' },
+    'nvidia/nemotron-3-super:free': { chars: 450000, tier: 'Free Unlimited' },
+    'google/gemma-3-27b-it:free': { chars: 131072, tier: 'Free Unlimited' },
+    'meta-llama/llama-4-scout:free': { chars: 10485760, tier: 'Free Unlimited' }
 };
 
 /* ── Auto fallback models for rate-limit recovery ──
    When the primary model hits 429, the system tries these in order.
-   All models here are free on OpenRouter with good rate limits. */
+   IMPORTANT: These are dynamically validated against OpenRouter's pricing API
+   (pricing.prompt === '0' && pricing.completion === '0').
+   Models that return 404 or have non-zero pricing are automatically skipped.
+   The list below is the DEFAULT seed — actual runtime list is built from
+   the live API response via fetchOpenRouterModels(). */
 export const FREE_MODEL_FALLBACKS = [
-    'stepfun/step-3.5-flash',
-    'z-ai/glm-5-turbo',
-    'xiaomi/mimo-v2-pro',
-    'minimax/minimax-m2.7',
-    'minimax/minimax-m2.5',
-    'nvidia/nemotron-3-super'
+    'xiaomi/mimo-v2-pro:free',
+    'minimax/minimax-m2.7:free',
+    'minimax/minimax-m2.5:free',
+    'nvidia/nemotron-3-super:free',
+    'google/gemma-3-27b-it:free',
+    'meta-llama/llama-4-scout:free',
+    'deepseek/deepseek-chat-v3-0324:free',
+    'qwen/qwen3-235b-a22b:free'
 ];
 
 export const bootLines = [
@@ -135,12 +139,12 @@ RULES:
 
 export const MULTI_AGENT_CONFIG = {
     agentModels: {
-        planner: 'stepfun/step-3.5-flash',
-        coder: 'xiaomi/mimo-v2-pro',
-        coderFallback: 'stepfun/step-3.5-flash',
-        critic: 'minimax/minimax-m2.7',
-        criticFallback: 'stepfun/step-3.5-flash',
-        tester: 'stepfun/step-3.5-flash'
+        planner: 'xiaomi/mimo-v2-pro:free',
+        coder: 'minimax/minimax-m2.7:free',
+        coderFallback: 'xiaomi/mimo-v2-pro:free',
+        critic: 'nvidia/nemotron-3-super:free',
+        criticFallback: 'minimax/minimax-m2.5:free',
+        tester: 'google/gemma-3-27b-it:free'
     },
     maxCoderAttempts: 3,
     maxCriticRejections: 2,

@@ -42,6 +42,11 @@ export const state = {
     /* Track which models have been tried in current fallback cycle */
     fallbackModelsTried: [],
 
+    /* Dynamically verified list of completely free model IDs (pricing.prompt=0, pricing.completion=0)
+       Populated by fetchOpenRouterModels() and used by getNextFallbackModel() for rate-limit recovery.
+       Persisted to localStorage so it survives page reloads. */
+    verifiedFreeModelIds: [],
+
     activeTask: {
         isRunning: false,
         loopCount: 0,

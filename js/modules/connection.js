@@ -14,7 +14,7 @@ import { setConnectionStatus, toast } from './ui.js';
    ═══════════════════════════════════════════════════ */
 var RATE_LIMIT_CONFIG = {
     'google-ai':   { baseDelay: 15000, maxRetries: 5, backoffFactor: 2.0, minInterval: 5000, continueDelay: 8000, cooldownMs: 60000 },
-    'openrouter':  { baseDelay: 8000,  maxRetries: 4, backoffFactor: 2.0, minInterval: 3500, continueDelay: 4000, cooldownMs: 45000 },
+    'openrouter':  { baseDelay: 8000,  maxRetries: 2, backoffFactor: 2.0, minInterval: 3500, continueDelay: 4000, cooldownMs: 45000 },
     'ollama':      { baseDelay: 2000,  maxRetries: 2, backoffFactor: 1.5, minInterval: 500,  continueDelay: 1000, cooldownMs: 10000 },
     'lmstudio':    { baseDelay: 2000,  maxRetries: 2, backoffFactor: 1.5, minInterval: 500,  continueDelay: 1000, cooldownMs: 10000 },
     'openai':      { baseDelay: 5000,  maxRetries: 3, backoffFactor: 2.0, minInterval: 2000, continueDelay: 3000, cooldownMs: 30000 },
@@ -43,16 +43,32 @@ var _lastRequestTime = 0;
    AUTO MODEL FALLBACK — Picks next free model to try
    ═══════════════════════════════════════════════════ */
 function getNextFallbackModel(currentModel) {
-    if (!FREE_MODEL_FALLBACKS || FREE_MODEL_FALLBACKS.length === 0) return null;
     if (state.settings.provider !== 'openrouter') return null;
 
-    /* Reset fallback tracking if this is a fresh request (not already in fallback chain) */
+    var fallbackPool = [];
+
+    if (state.verifiedFreeModelIds && state.verifiedFreeModelIds.length > 0) {
+        fallbackPool = state.verifiedFreeModelIds.slice();
+    } else {
+        try {
+            var cached = localStorage.getItem('sai_verified_free_models');
+            if (cached) fallbackPool = JSON.parse(cached);
+        } catch (e) { /* parse error — ignore */ }
+    }
+
+    if (fallbackPool.length === 0 && FREE_MODEL_FALLBACKS && FREE_MODEL_FALLBACKS.length > 0) {
+        fallbackPool = FREE_MODEL_FALLBACKS.slice();
+        console.log('[Connection] No verified model list available — using hardcoded fallback seed');
+    }
+
+    if (fallbackPool.length === 0) return null;
+
     if (state.fallbackModelsTried.indexOf(currentModel) === -1) {
         state.fallbackModelsTried = [currentModel];
     }
 
-    for (var i = 0; i < FREE_MODEL_FALLBACKS.length; i++) {
-        var candidate = FREE_MODEL_FALLBACKS[i];
+    for (var i = 0; i < fallbackPool.length; i++) {
+        var candidate = fallbackPool[i];
         if (state.fallbackModelsTried.indexOf(candidate) === -1) {
             state.fallbackModelsTried.push(candidate);
             console.log('[Connection] Fallback chain: [' + state.fallbackModelsTried.join(', ') + ']');
@@ -60,15 +76,20 @@ function getNextFallbackModel(currentModel) {
         }
     }
 
-    /* All fallbacks exhausted — return null to trigger cooldown */
-    console.warn('[Connection] All ' + FREE_MODEL_FALLBACKS.length + ' fallback models exhausted');
+    console.warn('[Connection] All ' + fallbackPool.length + ' fallback models exhausted');
     return null;
 }
 
 /* Reset fallback tracking when a request succeeds */
 function resetFallbackTracking() {
+    /* If we're using a fallback model (not the original), persist it */
     if (state.fallbackModelsTried.length > 1) {
         console.log('[Connection] Request succeeded with fallback model: ' + state.settings.model);
+        toast('Switched to ' + state.settings.model + ' (original model was rate limited)', 'success');
+        /* Persist the new model so it sticks for future requests */
+        import('./storage.js').then(function (s) { s.saveSettings(); });
+        var modelInput = document.getElementById('s-model');
+        if (modelInput) modelInput.value = state.settings.model;
     }
     state.fallbackModelsTried = [];
 }
@@ -631,7 +652,29 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                     try {
                         return executeStream(messages, overrideMaxTokens, isAutoContinue);
                     } catch (fallbackErr) {
-                        /* Fallback also failed — restore original model and go to cooldown */
+                        var fbErrMsg = (fallbackErr.message || '').toLowerCase();
+                        /* If fallback returned 404 (model discontinued), try the NEXT fallback instead of giving up */
+                        if (fbErrMsg.indexOf('404') > -1 || fbErrMsg.indexOf('not found') > -1 || fbErrMsg.indexOf('does not exist') > -1) {
+                            console.warn('[Connection] Fallback ' + fallbackModel + ' returned 404 — trying next fallback');
+                            /* Don't restore original — keep trying more fallbacks */
+                            state.settings.model = originalModel;
+                            /* Re-enter the 429 handler with the next fallback model */
+                            var nextFallback = getNextFallbackModel(fallbackModel);
+                            if (nextFallback) {
+                                console.log('[Connection] Trying next fallback: ' + nextFallback);
+                                toast(fallbackModel + ' unavailable (404). Trying ' + nextFallback + '...', 'info');
+                                state.settings.model = nextFallback;
+                                setConnectionStatus('connecting', 'Retrying with ' + nextFallback + '...');
+                                await new Promise(function (r) { setTimeout(r, 2000); });
+                                try {
+                                    return executeStream(messages, overrideMaxTokens, isAutoContinue);
+                                } catch (e2) {
+                                    state.settings.model = originalModel;
+                                    throw new Error('RATE_LIMIT: All fallbacks failed. ' + err429Text.substring(0, 150));
+                                }
+                            }
+                        }
+                        /* Any other error — restore original model and go to cooldown */
                         state.settings.model = originalModel;
                         throw new Error('RATE_LIMIT: Fallback ' + fallbackModel + ' also failed. ' + err429Text.substring(0, 150));
                     }
@@ -650,7 +693,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             toast('Rate limited. Cooling down for 45s — your message will auto-send.', 'error');
             /* Queue the current request so it auto-sends after cooldown */
             if (!isAutoContinue) {
-                state.pendingRequest = { type: 'message', text: userText || '' };
+                state.pendingRequest = { type: 'message', text: messages && messages.length > 0 ? (messages[messages.length - 1].content || '') : '' };
             }
             return;
         }
@@ -1099,6 +1142,15 @@ async function fetchGoogleAIModels() {
     toast('Loaded ' + geminiModels.length + ' Gemini models', 'success');
 }
 
+/* ── Check if a model from OpenRouter API is completely free (zero cost) ── */
+function isModelFree(m) {
+    if (!m || !m.pricing) return false;
+    var p = m.pricing;
+    var promptFree = (p.prompt === '0' || p.prompt === '0.0' || p.prompt === '0.00' || parseFloat(p.prompt) === 0);
+    var completionFree = (p.completion === '0' || p.completion === '0.0' || p.completion === '0.00' || parseFloat(p.completion) === 0);
+    return promptFree && completionFree;
+}
+
 async function fetchOpenRouterModels() {
     var listEl = document.getElementById('s-models-list');
     var apiKey = state.settings.apiKey;
@@ -1111,33 +1163,94 @@ async function fetchOpenRouterModels() {
         var d = await r.json();
         var allModels = d.data || [];
 
+        /* Store context limits for all models */
         for (var x = 0; x < allModels.length; x++) { var ctx = allModels[x].context_length; if (ctx) state.modelContextLimits[allModels[x].id] = Math.floor(ctx * 3.5); }
 
-        var topTierIds = ['stepfun/step-3.5-flash', 'z-ai/glm-5-turbo', 'xiaomi/mimo-v2-pro', 'minimax/minimax-m2.7', 'minimax/minimax-m2.5', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-opus-4.6', 'nvidia/nemotron-3-super'];
-        var topTierModels = [];
-        for (var t = 0; t < topTierIds.length; t++) { var found = allModels.find(function (m) { return m.id === topTierIds[t] || m.id === topTierIds[t] + ':free'; }); if (found) topTierModels.push(found); }
-        var freeModels = allModels.filter(function (m) { return m.id.indexOf(':free') > -1 && !topTierIds.some(function (id) { return m.id.startsWith(id); }); }).sort(function (a, b) { return a.id.localeCompare(b.id); });
-        var reasoningModels = allModels.filter(function (m) { var id = m.id.toLowerCase(); return (id.indexOf('deepseek-r1') > -1 || id.indexOf('qwq') > -1 || id.indexOf('o1') > -1 || id.indexOf('reasoner') > -1) && !topTierIds.some(function (id) { return m.id.startsWith(id); }); }).sort(function (a, b) { return a.id.localeCompare(b.id); });
+        /* ═══════════════════════════════════════════════════
+           FILTER: Only models with pricing.prompt=0 AND pricing.completion=0
+           This is the authoritative way to determine free models on OpenRouter.
+           The :free suffix is NOT reliable — some :free models have been
+           discontinued (404) and some free models lack the :free suffix.
+           ═══════════════════════════════════════════════════ */
+        var trulyFree = allModels.filter(isModelFree);
+        console.log('[Connection] OpenRouter: ' + allModels.length + ' total models, ' + trulyFree.length + ' completely free (pricing=0)');
 
+        /* ── Build dynamic fallback list from verified free models ── */
+        state.verifiedFreeModelIds = trulyFree.map(function (m) { return m.id; });
+        /* Persist for fallback use even before next fetch */
+        try {
+            localStorage.setItem('sai_verified_free_models', JSON.stringify(state.verifiedFreeModelIds));
+        } catch (e) { /* localStorage might be full — non-fatal */ }
+
+        /* ── Top tier: preferred free models for coding/chat ── */
+        var topTierIds = [
+            'xiaomi/mimo-v2-pro:free',
+            'minimax/minimax-m2.7:free',
+            'minimax/minimax-m2.5:free',
+            'nvidia/nemotron-3-super:free',
+            'google/gemma-3-27b-it:free',
+            'meta-llama/llama-4-scout:free',
+            'deepseek/deepseek-chat-v3-0324:free',
+            'qwen/qwen3-235b-a22b:free',
+            'qwen/qwen3-coder:free'
+        ];
+        var topTierModels = [];
+        for (var t = 0; t < topTierIds.length; t++) {
+            var found = trulyFree.find(function (m) { return m.id === topTierIds[t]; });
+            /* Also try base model name in case :free variant has a different ID */
+            if (!found) {
+                var baseId = topTierIds[t].replace(/:free$/, '');
+                found = trulyFree.find(function (m) { return m.id === baseId; });
+            }
+            if (found) topTierModels.push(found);
+        }
+
+        /* ── All other free models (excluding top tier and reasoning) ── */
+        var topTierIdSet = {};
+        for (var ti = 0; ti < topTierModels.length; ti++) topTierIdSet[topTierModels[ti].id] = true;
+        var freeModels = trulyFree.filter(function (m) {
+            return !topTierIdSet[m.id];
+        }).sort(function (a, b) { return a.id.localeCompare(b.id); });
+
+        /* ── Free reasoning models ── */
+        var reasoningModels = trulyFree.filter(function (m) {
+            var id = m.id.toLowerCase();
+            return (id.indexOf('deepseek-r1') > -1 || id.indexOf('qwq') > -1 || id.indexOf('reasoner') > -1);
+        }).sort(function (a, b) { return a.id.localeCompare(b.id); });
+
+        /* ── Remove reasoning models from the general free list to avoid duplicates ── */
+        var reasoningIdSet = {};
+        for (var ri = 0; ri < reasoningModels.length; ri++) reasoningIdSet[reasoningModels[ri].id] = true;
+        freeModels = freeModels.filter(function (m) { return !reasoningIdSet[m.id]; });
+
+        /* ── Build the dropdown HTML ── */
         var html = '';
         if (topTierModels.length > 0) {
-            html += '<option disabled style="color:var(--accent);font-weight:700">── 🔥 Top Tier ──</option>';
-            for (var i = 0; i < topTierModels.length; i++) { var isFree = topTierModels[i].id.indexOf(':free') > -1; html += '<option value="' + topTierModels[i].id + '">' + topTierModels[i].id + (isFree ? ' [FREE]' : ' [PAID]') + formatCtx(topTierModels[i].context_length) + '</option>'; }
+            html += '<option disabled style="color:var(--accent);font-weight:700">── 🔥 Free Top Tier (pricing = $0) ──</option>';
+            for (var i = 0; i < topTierModels.length; i++) {
+                html += '<option value="' + topTierModels[i].id + '">' + topTierModels[i].id + ' [FREE]' + formatCtx(topTierModels[i].context_length) + '</option>';
+            }
         }
         if (freeModels.length > 0) {
-            html += '<option disabled style="color:var(--green);font-weight:700">── Other Free ──</option>';
+            html += '<option disabled style="color:var(--green);font-weight:700">── All Other Free (pricing = $0) ──</option>';
             for (var j = 0; j < freeModels.length; j++) html += '<option value="' + freeModels[j].id + '">' + freeModels[j].id + formatCtx(freeModels[j].context_length) + '</option>';
         }
         if (reasoningModels.length > 0) {
-            html += '<option disabled style="color:var(--cyan);font-weight:700">── Reasoning ──</option>';
+            html += '<option disabled style="color:var(--cyan);font-weight:700">── Free Reasoning (pricing = $0) ──</option>';
             for (var k = 0; k < reasoningModels.length; k++) html += '<option value="' + reasoningModels[k].id + '">' + reasoningModels[k].id + formatCtx(reasoningModels[k].context_length) + '</option>';
         }
 
         listEl.innerHTML = html;
         listEl.style.display = 'block';
         var curModel = document.getElementById('s-model').value;
-        if (!curModel && topTierModels.length > 0) { var defaultModel = topTierModels[0].id; document.getElementById('s-model').value = defaultModel; listEl.value = defaultModel; toast('Auto-selected: ' + defaultModel, 'success'); }
-        else toast(topTierModels.length + ' top tier, ' + freeModels.length + ' free loaded', 'success');
+        if (!curModel && topTierModels.length > 0) {
+            var defaultModel = topTierModels[0].id;
+            document.getElementById('s-model').value = defaultModel;
+            listEl.value = defaultModel;
+            toast('Auto-selected: ' + defaultModel + ' (verified free)', 'success');
+        } else {
+            toast(topTierModels.length + ' top tier, ' + freeModels.length + ' other free models loaded (all verified $0)', 'success');
+        }
     } catch (e) { toast('Failed: ' + e.message, 'error'); listEl.style.display = 'none'; }
 }
 
