@@ -1,7 +1,8 @@
-/* ═══════════════════════════════════════
+/* ══════════════════════════════════════
    S.ai — Main Entry Point
    ═══════════════════════════════════════ */
 import { loadSettings } from './modules/storage.js';
+import { loadRuntimeState } from './modules/state.js';
 import { initEventListeners } from './modules/events.js';
 import { runBoot } from './modules/boot.js';
 import { speakLastResponse } from './modules/voice.js';
@@ -19,6 +20,7 @@ window.saiContinueResponse = continueResponse;
 
 document.addEventListener('DOMContentLoaded', () => {
     loadSettings();
+    loadRuntimeState();
     initEventListeners();
     runBoot();
 });

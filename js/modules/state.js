@@ -64,3 +64,46 @@ export const voiceState = {
     synthesis: null,
     currentUtterance: null,
 };
+
+/* ═══════════════════════════════════════
+   RUNTIME STATE PERSISTENCE
+   ═══════════════════════════════════════ */
+
+const RUNTIME_STATE_KEY = 'sai_runtime_state';
+
+/* Keys in `state` that should survive page reloads */
+const PERSISTED_RUNTIME_KEYS = [
+    'responseTruncated',
+    'cooldownUntil',
+    'fallbackModelsTried',
+    'verifiedFreeModelIds',
+    'activeTask'
+];
+
+export function loadRuntimeState() {
+    try {
+        var saved = localStorage.getItem(RUNTIME_STATE_KEY);
+        if (!saved) return;
+        var parsed = JSON.parse(saved);
+        PERSISTED_RUNTIME_KEYS.forEach(function(key) {
+            if (parsed[key] !== undefined) {
+                state[key] = parsed[key];
+            }
+        });
+        console.log('[State] Runtime state restored from localStorage');
+    } catch (e) {
+        console.warn('[State] Failed to restore runtime state:', e.message);
+    }
+}
+
+export function saveRuntimeState() {
+    try {
+        var toSave = {};
+        PERSISTED_RUNTIME_KEYS.forEach(function(key) {
+            toSave[key] = state[key];
+        });
+        localStorage.setItem(RUNTIME_STATE_KEY, JSON.stringify(toSave));
+    } catch (e) {
+        console.warn('[State] Failed to persist runtime state:', e.message);
+    }
+}

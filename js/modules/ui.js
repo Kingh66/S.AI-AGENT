@@ -91,8 +91,7 @@ export function bindQuickActions() {
 }
 
 /* ═══════════════════════════════════════
-   FORMAT HELPERS
-   ═══════════════════════════════════════ */
+   FORMAT HELPERS   ═══════════════════════════════════════ */
 function fmtBudgetChars(n) {
     if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
     if (n >= 1000) return Math.round(n / 1000) + 'K';
@@ -105,8 +104,7 @@ function fmtBudgetTokens(chars) {
     return tokens + ' tokens';
 }
 
-/* ═══════════════════════════════════════
-   INJECT CONTEXT BUDGET UI
+/* ═══════════════════════════════════════   INJECT CONTEXT BUDGET UI
    ═══════════════════════════════════════ */
 function injectContextBudgetUI() {
     if (document.getElementById('context-budget-row')) return;
@@ -214,7 +212,6 @@ function injectMaxTokensPresets() {
         btn.addEventListener('click', function() {
             var v = parseInt(this.dataset.val);
             tokensRow.value = v;
-            safeText('q-tokens-val', v);
             highlightMtkPreset(v);
         });
     });
@@ -255,7 +252,6 @@ export function populateSettingsUI() {
     safeVal('q-temp', state.settings.temperature);
     safeText('q-temp-val', state.settings.temperature);
     safeVal('q-tokens', state.settings.maxTokens);
-    safeText('q-tokens-val', state.settings.maxTokens);
     safeVal('s-prompt', state.settings.systemPrompt);
     safeVal('q-voice-lang', voiceState.lang);
     safeVal('q-voice-rate', voiceState.rate);
@@ -300,16 +296,40 @@ export function updateProviderHint() {
    MULTI-AGENT UI — Settings panel + visibility
    ═══════════════════════════════════════ */
 
+/* ── Helper: ensure multiAgent sub-object exists ── */
+function ensureMultiAgent() {
+    if (!state.settings.multiAgent) {
+        state.settings.multiAgent = {
+            enabled: false,
+            agentModels: {
+                planner: 'xiaomi/mimo-v2-pro:free',
+                coder: 'minimax/minimax-m2.7:free',
+                coderFallback: 'xiaomi/mimo-v2-pro:free',
+                critic: 'nvidia/nemotron-3-super:free',
+                criticFallback: 'minimax/minimax-m2.5:free',
+                tester: 'google/gemma-3-27b-it:free'
+            },
+            maxCoderAttempts: 3,
+            maxCriticRejections: 2
+        };
+    }
+    if (!state.settings.multiAgent.agentModels) {
+        state.settings.multiAgent.agentModels = {};
+    }
+    return state.settings.multiAgent;
+}
+
 export function renderMultiAgentSettings() {
     var container = document.getElementById('multiagent-settings');
     if (!container) return;
 
-    var models = state.settings.agentModels || {};
+    var ma = ensureMultiAgent();
+    var models = ma.agentModels;
 
     container.innerHTML =
         '<div class="setting-row">' +
         '<label class="setting-label" style="display:flex;align-items:center;gap:8px;cursor:pointer">' +
-        '<input type="checkbox" id="ma-enabled" ' + (state.settings.multiAgentEnabled ? 'checked' : '') + '>' +
+        '<input type="checkbox" id="ma-enabled" ' + (ma.enabled ? 'checked' : '') + '>' +
         'Enable Multi-Agent Mode' +
         '</label>' +
         '</div>' +
@@ -317,120 +337,121 @@ export function renderMultiAgentSettings() {
         '<div class="setting-row" style="margin-top:10px">' +
         '<label class="setting-label">Planner Model</label>' +
         '<select class="setting-select" id="ma-planner-model">' +
-        '<option value="stepfun/step-3.5-flash"' + (models.planner === 'stepfun/step-3.5-flash' ? ' selected' : '') + '>Step 3.5 Flash (Recommended)</option>' +
-        '<option value="xiaomi/mimo-v2-pro"' + (models.planner === 'xiaomi/mimo-v2-pro' ? ' selected' : '') + '>MiMo V2 Pro</option>' +
-        '<option value="minimax/minimax-m2.7"' + (models.planner === 'minimax/minimax-m2.7' ? ' selected' : '') + '>Minimax M2.7</option>' +
-        '<option value="z-ai/glm-5-turbo"' + (models.planner === 'z-ai/glm-5-turbo' ? ' selected' : '') + '>GLM 5 Turbo</option>' +
+        '<option value="stepfun/step-3.5-flash:free"' + (models.planner === 'stepfun/step-3.5-flash:free' ? ' selected' : '') + '>Step 3.5 Flash (Recommended)</option>' +
+        '<option value="xiaomi/mimo-v2-pro:free"' + (models.planner === 'xiaomi/mimo-v2-pro:free' ? ' selected' : '') + '>MiMo V2 Pro</option>' +
+        '<option value="minimax/minimax-m2.7:free"' + (models.planner === 'minimax/minimax-m2.7:free' ? ' selected' : '') + '>Minimax M2.7</option>' +
+        '<option value="z-ai/glm-5-turbo:free"' + (models.planner === 'z-ai/glm-5-turbo:free' ? ' selected' : '') + '>GLM 5 Turbo</option>' +
         '</select>' +
-        '</div>' +
-
-        '<div class="setting-row">' +
+        '</div>' +        '<div class="setting-row">' +
         '<label class="setting-label">Coder Primary</label>' +
         '<select class="setting-select" id="ma-coder-model">' +
-        '<option value="xiaomi/mimo-v2-pro"' + (models.coder === 'xiaomi/mimo-v2-pro' ? ' selected' : '') + '>MiMo V2 Pro (Recommended)</option>' +
-        '<option value="stepfun/step-3.5-flash"' + (models.coder === 'stepfun/step-3.5-flash' ? ' selected' : '') + '>Step 3.5 Flash</option>' +
-        '<option value="minimax/minimax-m2.7"' + (models.coder === 'minimax/minimax-m2.7' ? ' selected' : '') + '>Minimax M2.7</option>' +
-        '<option value="z-ai/glm-5-turbo"' + (models.coder === 'z-ai/glm-5-turbo' ? ' selected' : '') + '>GLM 5 Turbo</option>' +
+        '<option value="xiaomi/mimo-v2-pro:free"' + (models.coder === 'xiaomi/mimo-v2-pro:free' ? ' selected' : '') + '>MiMo V2 Pro (Recommended)</option>' +
+        '<option value="stepfun/step-3.5-flash:free"' + (models.coder === 'stepfun/step-3.5-flash:free' ? ' selected' : '') + '>Step 3.5 Flash</option>' +
+        '<option value="minimax/minimax-m2.7:free"' + (models.coder === 'minimax/minimax-m2.7:free' ? ' selected' : '') + '>Minimax M2.7</option>' +
+        '<option value="z-ai/glm-5-turbo:free"' + (models.coder === 'z-ai/glm-5-turbo:free' ? ' selected' : '') + '>GLM 5 Turbo</option>' +
         '</select>' +
         '</div>' +
 
         '<div class="setting-row">' +
         '<label class="setting-label">Coder Fallback</label>' +
         '<select class="setting-select" id="ma-coder-fallback-model">' +
-        '<option value="stepfun/step-3.5-flash"' + (models.coderFallback === 'stepfun/step-3.5-flash' ? ' selected' : '') + '>Step 3.5 Flash</option>' +
-        '<option value="minimax/minimax-m2.7"' + (models.coderFallback === 'minimax/minimax-m2.7' ? ' selected' : '') + '>Minimax M2.7</option>' +
-        '<option value="z-ai/glm-5-turbo"' + (models.coderFallback === 'z-ai/glm-5-turbo' ? ' selected' : '') + '>GLM 5 Turbo</option>' +
-        '<option value="xiaomi/mimo-v2-pro"' + (models.coderFallback === 'xiaomi/mimo-v2-pro' ? ' selected' : '') + '>MiMo V2 Pro</option>' +
+        '<option value="stepfun/step-3.5-flash:free"' + (models.coderFallback === 'stepfun/step-3.5-flash:free' ? ' selected' : '') + '>Step 3.5 Flash</option>' +
+        '<option value="minimax/minimax-m2.7:free"' + (models.coderFallback === 'minimax/minimax-m2.7:free' ? ' selected' : '') + '>Minimax M2.7</option>' +
+        '<option value="z-ai/glm-5-turbo:free"' + (models.coderFallback === 'z-ai/glm-5-turbo:free' ? ' selected' : '') + '>GLM 5 Turbo</option>' +
+        '<option value="xiaomi/mimo-v2-pro:free"' + (models.coderFallback === 'xiaomi/mimo-v2-pro:free' ? ' selected' : '') + '>MiMo V2 Pro</option>' +
         '</select>' +
         '</div>' +
 
         '<div class="setting-row">' +
         '<label class="setting-label">Critic Model</label>' +
         '<select class="setting-select" id="ma-critic-model">' +
-        '<option value="minimax/minimax-m2.7"' + (models.critic === 'minimax/minimax-m2.7' ? ' selected' : '') + '>Minimax M2.7 (Recommended)</option>' +
-        '<option value="stepfun/step-3.5-flash"' + (models.critic === 'stepfun/step-3.5-flash' ? ' selected' : '') + '>Step 3.5 Flash</option>' +
-        '<option value="xiaomi/mimo-v2-pro"' + (models.critic === 'xiaomi/mimo-v2-pro' ? ' selected' : '') + '>MiMo V2 Pro</option>' +
-        '<option value="z-ai/glm-5-turbo"' + (models.critic === 'z-ai/glm-5-turbo' ? ' selected' : '') + '>GLM 5 Turbo</option>' +
+        '<option value="minimax/minimax-m2.7:free"' + (models.critic === 'minimax/minimax-m2.7:free' ? ' selected' : '') + '>Minimax M2.7 (Recommended)</option>' +
+        '<option value="stepfun/step-3.5-flash:free"' + (models.critic === 'stepfun/step-3.5-flash:free' ? ' selected' : '') + '>Step 3.5 Flash</option>' +
+        '<option value="xiaomi/mimo-v2-pro:free"' + (models.critic === 'xiaomi/mimo-v2-pro:free' ? ' selected' : '') + '>MiMo V2 Pro</option>' +
+        '<option value="z-ai/glm-5-turbo:free"' + (models.critic === 'z-ai/glm-5-turbo:free' ? ' selected' : '') + '>GLM 5 Turbo</option>' +
         '</select>' +
         '</div>' +
 
         '<div class="setting-row">' +
         '<label class="setting-label">Critic Fallback</label>' +
         '<select class="setting-select" id="ma-critic-fallback-model">' +
-        '<option value="stepfun/step-3.5-flash"' + (models.criticFallback === 'stepfun/step-3.5-flash' ? ' selected' : '') + '>Step 3.5 Flash</option>' +
-        '<option value="xiaomi/mimo-v2-pro"' + (models.criticFallback === 'xiaomi/mimo-v2-pro' ? ' selected' : '') + '>MiMo V2 Pro</option>' +
-        '<option value="minimax/minimax-m2.7"' + (models.criticFallback === 'minimax/minimax-m2.7' ? ' selected' : '') + '>Minimax M2.7</option>' +
+        '<option value="stepfun/step-3.5-flash:free"' + (models.criticFallback === 'stepfun/step-3.5-flash:free' ? ' selected' : '') + '>Step 3.5 Flash</option>' +
+        '<option value="xiaomi/mimo-v2-pro:free"' + (models.criticFallback === 'xiaomi/mimo-v2-pro:free' ? ' selected' : '') + '>MiMo V2 Pro</option>' +
+        '<option value="minimax/minimax-m2.7:free"' + (models.criticFallback === 'minimax/minimax-m2.7:free' ? ' selected' : '') + '>Minimax M2.7</option>' +
         '</select>' +
         '</div>' +
 
         '<div class="setting-row">' +
         '<label class="setting-label">Tester Model</label>' +
         '<select class="setting-select" id="ma-tester-model">' +
-        '<option value="stepfun/step-3.5-flash"' + ((models.tester || 'stepfun/step-3.5-flash') === 'stepfun/step-3.5-flash' ? ' selected' : '') + '>Step 3.5 Flash (Recommended)</option>' +
-        '<option value="xiaomi/mimo-v2-pro"' + (models.tester === 'xiaomi/mimo-v2-pro' ? ' selected' : '') + '>MiMo V2 Pro</option>' +
-        '<option value="minimax/minimax-m2.7"' + (models.tester === 'minimax/minimax-m2.7' ? ' selected' : '') + '>Minimax M2.7</option>' +
+        '<option value="stepfun/step-3.5-flash:free"' + ((models.tester || 'stepfun/step-3.5-flash:free') === 'stepfun/step-3.5-flash:free' ? ' selected' : '') + '>Step 3.5 Flash (Recommended)</option>' +
+        '<option value="xiaomi/mimo-v2-pro:free"' + (models.tester === 'xiaomi/mimo-v2-pro:free' ? ' selected' : '') + '>MiMo V2 Pro</option>' +
+        '<option value="minimax/minimax-m2.7:free"' + (models.tester === 'minimax/minimax-m2.7:free' ? ' selected' : '') + '>Minimax M2.7</option>' +
         '</select>' +
         '</div>' +
 
         '<div class="setting-row">' +
         '<label class="setting-label">Max Coder Attempts</label>' +
-        '<input type="number" class="setting-input" id="ma-max-attempts" value="' + (state.settings.maxCoderAttempts || 3) + '" min="1" max="5">' +
+        '<input type="number" class="setting-input" id="ma-max-attempts" value="' + (ma.maxCoderAttempts || 3) + '" min="1" max="5">' +
         '</div>' +
 
         '<div class="setting-row">' +
         '<label class="setting-label">Max Critic Rejections</label>' +
-        '<input type="number" class="setting-input" id="ma-max-rejections" value="' + (state.settings.maxCriticRejections || 2) + '" min="1" max="3">' +
+        '<input type="number" class="setting-input" id="ma-max-rejections" value="' + (ma.maxCriticRejections || 2) + '" min="1" max="3">' +
         '</div>';
 
     var maEnabled = document.getElementById('ma-enabled');
     if (maEnabled) maEnabled.addEventListener('change', function(e) {
-        state.settings.multiAgentEnabled = e.target.checked;
+        var ma2 = ensureMultiAgent();
+        ma2.enabled = e.target.checked;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
     var maPlanner = document.getElementById('ma-planner-model');
     if (maPlanner) maPlanner.addEventListener('change', function(e) {
-        if (!state.settings.agentModels) state.settings.agentModels = {};
-        state.settings.agentModels.planner = e.target.value;
+        var ma2 = ensureMultiAgent();
+        ma2.agentModels.planner = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
     var maCoder = document.getElementById('ma-coder-model');
     if (maCoder) maCoder.addEventListener('change', function(e) {
-        if (!state.settings.agentModels) state.settings.agentModels = {};
-        state.settings.agentModels.coder = e.target.value;
+        var ma2 = ensureMultiAgent();
+        ma2.agentModels.coder = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
     var maCoderFb = document.getElementById('ma-coder-fallback-model');
     if (maCoderFb) maCoderFb.addEventListener('change', function(e) {
-        if (!state.settings.agentModels) state.settings.agentModels = {};
-        state.settings.agentModels.coderFallback = e.target.value;
+        var ma2 = ensureMultiAgent();
+        ma2.agentModels.coderFallback = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
     var maCritic = document.getElementById('ma-critic-model');
     if (maCritic) maCritic.addEventListener('change', function(e) {
-        if (!state.settings.agentModels) state.settings.agentModels = {};
-        state.settings.agentModels.critic = e.target.value;
+        var ma2 = ensureMultiAgent();
+        ma2.agentModels.critic = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
     var maCriticFb = document.getElementById('ma-critic-fallback-model');
     if (maCriticFb) maCriticFb.addEventListener('change', function(e) {
-        if (!state.settings.agentModels) state.settings.agentModels = {};
-        state.settings.agentModels.criticFallback = e.target.value;
+        var ma2 = ensureMultiAgent();
+        ma2.agentModels.criticFallback = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
     var maTester = document.getElementById('ma-tester-model');
     if (maTester) maTester.addEventListener('change', function(e) {
-        if (!state.settings.agentModels) state.settings.agentModels = {};
-        state.settings.agentModels.tester = e.target.value;
+        var ma2 = ensureMultiAgent();
+        ma2.agentModels.tester = e.target.value;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
     var maAttempts = document.getElementById('ma-max-attempts');
     if (maAttempts) maAttempts.addEventListener('change', function(e) {
-        state.settings.maxCoderAttempts = parseInt(e.target.value) || 3;
+        var ma2 = ensureMultiAgent();
+        ma2.maxCoderAttempts = parseInt(e.target.value) || 3;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
     var maRejections = document.getElementById('ma-max-rejections');
     if (maRejections) maRejections.addEventListener('change', function(e) {
-        state.settings.maxCriticRejections = parseInt(e.target.value) || 2;
+        var ma2 = ensureMultiAgent();
+        ma2.maxCriticRejections = parseInt(e.target.value) || 2;
         import('./storage.js').then(function(s) { s.saveSettings(); });
     });
 }
