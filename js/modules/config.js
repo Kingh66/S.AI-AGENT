@@ -145,7 +145,7 @@ export const stateDefaults = {
     apiKey: '',
     model: '',
     temperature: 0.7,
-    maxTokens: 4096,
+    maxTokens: 2048,
     systemPrompt: '',
     multiAgent: {
         enabled: false,

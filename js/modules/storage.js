@@ -104,9 +104,9 @@ export function resetAllSettings() {
 }
 
 export function saveSettings() {
-    /* Clamp before saving */
+    /* Clamp before saving — allow values down to 32 (for 402 auto-retry) */
     var mt = state.settings.maxTokens;
-    if (typeof mt !== 'number' || mt < 256) mt = 2048;
+    if (typeof mt !== 'number' || mt < 32) mt = 2048;
     else if (mt > 32768) mt = 32768;
 
     var cb = state.settings.contextBudget;
@@ -186,12 +186,19 @@ export function loadSettings() {
     }
 
     /* ── SANITY CLAMP: maxTokens ── */
-    if (typeof state.settings.maxTokens !== 'number' || state.settings.maxTokens < 256) {
+    /* Lower threshold from 256 to 32 so 402 auto-retry values (128, 64, 32) survive reload */
+    if (typeof state.settings.maxTokens !== 'number' || state.settings.maxTokens < 32) {
         state.settings.maxTokens = 2048;
         repaired = true;
     } else if (state.settings.maxTokens > 32768) {
         console.warn('[Storage] Clamped maxTokens from ' + state.settings.maxTokens + ' to 32768');
         state.settings.maxTokens = 32768;
+        repaired = true;
+    }
+    /* Bump very low values (402 auto-retry leftovers) to a usable free-tier floor */
+    if (state.settings.maxTokens >= 32 && state.settings.maxTokens < 512) {
+        console.warn('[Storage] maxTokens very low (' + state.settings.maxTokens + '), bumping to 1024 for usability');
+        state.settings.maxTokens = 1024;
         repaired = true;
     }
 

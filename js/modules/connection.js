@@ -24,9 +24,9 @@ var RATE_LIMIT_CONFIG = {
 
 var FETCH_TIMEOUT = 120000;
 var STREAM_STALL_TIMEOUT = 60000;
-var MIN_MAX_TOKENS = 256;
+var MIN_MAX_TOKENS = 32;
 var MAX_MAX_TOKENS = 32768;
-var DEFAULT_MAX_TOKENS = 4096;
+var DEFAULT_MAX_TOKENS = 2048;
 var TOKEN_402_SAFETY_MARGIN = 150;
 var MIN_RETRY_TOKENS = 32;
 
@@ -175,7 +175,11 @@ function parse402Affordable(errText) {
         /can only afford\s+([\d,]+)/i,
         /afford\s+up to\s+([\d,]+)/i,
         /maximum\s+([\d,]+)\s*tokens.*allowed/i,
-        /limit.*?([\d,]+)\s*tokens/i
+        /limit.*?([\d,]+)\s*tokens/i,
+        /quota.*?(\d+)\s*tokens?/i,
+        /exceeded.*?(\d+)\s*tokens?/i,
+        /allow.*?(\d+)\s*tokens?/i,
+        /max.*?(\d{2,})\s*tokens/i
     ];
     for (var i = 0; i < patterns.length; i++) {
         var match = errText.match(patterns[i]);
@@ -198,15 +202,33 @@ function resolveRetryTokens(errText, actualMaxTokens, isRetry) {
         ? Math.max(extracted - TOKEN_402_SAFETY_MARGIN, MIN_RETRY_TOKENS)
         : FALLBACK_RETRY_TOKENS;
 
+    /* First attempt: retry with reduced tokens if possible */
     if (!isRetry && retryAmount < actualMaxTokens) {
         return retryAmount;
     }
 
+    /* Retry attempt: try one more time with a safe free-tier value instead of giving up */
+    if (isRetry) {
+        var safeRetry = Math.max(retryAmount, MIN_RETRY_TOKENS);
+        /* Persist the reduced value so future requests don't hit the same wall */
+        state.settings.maxTokens = safeRetry;
+        import('./storage.js').then(function (s) { s.saveSettings(); });
+        var tokensInput = document.getElementById('q-tokens');
+        if (tokensInput) tokensInput.value = safeRetry;
+        console.warn('[Connection] 402 retry: persisted maxTokens=' + safeRetry);
+        /* Only give up if we're already at the absolute minimum */
+        if (safeRetry <= MIN_RETRY_TOKENS && retryAmount <= MIN_RETRY_TOKENS && extracted == null) {
+            return null;
+        }
+        return safeRetry;
+    }
+
+    /* Non-retry fallback: persist if reasonable */
     if (retryAmount >= MIN_MAX_TOKENS) {
         state.settings.maxTokens = retryAmount;
         import('./storage.js').then(function (s) { s.saveSettings(); });
-        var tokensInput = document.getElementById('q-tokens');
-        if (tokensInput) tokensInput.value = retryAmount;
+        var tokensInput2 = document.getElementById('q-tokens');
+        if (tokensInput2) tokensInput2.value = retryAmount;
     }
     return null;
 }
@@ -453,7 +475,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                 state.streamBuffer = '';
                 state.thinkingContent = '';
 
-                toast('Free tier limit hit. Auto-adjusting to ' + retryTokens + ' tokens...', 'info');
+                toast('Tier limit hit. Auto-adjusting to ' + retryTokens + ' tokens...', 'info');
                 setConnectionStatus('connecting', 'Retrying with ' + retryTokens + ' tokens...');
                 await new Promise(function (r) { setTimeout(r, 800); });
                 return executeStream(messages, retryTokens, isAutoContinue);
