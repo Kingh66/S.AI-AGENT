@@ -45,17 +45,23 @@ var _lastRequestTime = 0;
 function getNextFallbackModel(currentModel) {
     if (state.settings.provider !== 'openrouter') return null;
 
+    /* Build the effective fallback list: prefer dynamically verified free models,
+       fall back to the hardcoded FREE_MODEL_FALLBACKS seed list, and filter out
+       any model that we've already tried in this cycle. */
     var fallbackPool = [];
 
+    /* First: use dynamically verified list from last fetchOpenRouterModels() call */
     if (state.verifiedFreeModelIds && state.verifiedFreeModelIds.length > 0) {
         fallbackPool = state.verifiedFreeModelIds.slice();
     } else {
+        /* Fallback: try to load from localStorage (persisted by fetchOpenRouterModels) */
         try {
             var cached = localStorage.getItem('sai_verified_free_models');
             if (cached) fallbackPool = JSON.parse(cached);
         } catch (e) { /* parse error — ignore */ }
     }
 
+    /* If still empty, use the hardcoded seed list as last resort */
     if (fallbackPool.length === 0 && FREE_MODEL_FALLBACKS && FREE_MODEL_FALLBACKS.length > 0) {
         fallbackPool = FREE_MODEL_FALLBACKS.slice();
         console.log('[Connection] No verified model list available — using hardcoded fallback seed');
@@ -63,6 +69,7 @@ function getNextFallbackModel(currentModel) {
 
     if (fallbackPool.length === 0) return null;
 
+    /* Reset fallback tracking if this is a fresh request (not already in fallback chain) */
     if (state.fallbackModelsTried.indexOf(currentModel) === -1) {
         state.fallbackModelsTried = [currentModel];
     }
@@ -76,6 +83,7 @@ function getNextFallbackModel(currentModel) {
         }
     }
 
+    /* All fallbacks exhausted — return null to trigger cooldown */
     console.warn('[Connection] All ' + fallbackPool.length + ' fallback models exhausted');
     return null;
 }
@@ -1146,6 +1154,7 @@ async function fetchGoogleAIModels() {
 function isModelFree(m) {
     if (!m || !m.pricing) return false;
     var p = m.pricing;
+    /* pricing.prompt and pricing.completion are strings like "0", "0.00001", etc. */
     var promptFree = (p.prompt === '0' || p.prompt === '0.0' || p.prompt === '0.00' || parseFloat(p.prompt) === 0);
     var completionFree = (p.completion === '0' || p.completion === '0.0' || p.completion === '0.00' || parseFloat(p.completion) === 0);
     return promptFree && completionFree;
