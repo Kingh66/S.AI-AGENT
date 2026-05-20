@@ -85,6 +85,18 @@ export const TOP_TIER_MODELS = {
     'anthropic/claude-opus-4.6': { chars: 700000, tier: 'Paid (Needs Credits)' }
 };
 
+/* ── Auto fallback models for rate-limit recovery ──
+   When the primary model hits 429, the system tries these in order.
+   All models here are free on OpenRouter with good rate limits. */
+export const FREE_MODEL_FALLBACKS = [
+    'stepfun/step-3.5-flash',
+    'z-ai/glm-5-turbo',
+    'xiaomi/mimo-v2-pro',
+    'minimax/minimax-m2.7',
+    'minimax/minimax-m2.5',
+    'nvidia/nemotron-3-super'
+];
+
 export const bootLines = [
     { text: '<span class="prompt">sizwe@local</span>:$ s.ai --init --turbo', delay: 300 },
     { text: '<span class="info">Loading neural pathways...</span> <span class="ok">[OK]</span>', delay: 600 },

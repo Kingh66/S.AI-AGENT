@@ -2,7 +2,7 @@
    CONNECTION — LLM API calls, streaming
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
-import { FILE_SYSTEM_INSTRUCTIONS } from './config.js';
+import { FILE_SYSTEM_INSTRUCTIONS, FREE_MODEL_FALLBACKS } from './config.js';
 import {
     removeWelcome, addUserMessage, addBotMessageStart,
     appendStreamChunk, finalizeStream, updateSendButton, showContinueButton, removeContinueButton
@@ -13,13 +13,13 @@ import { setConnectionStatus, toast } from './ui.js';
    RATE LIMIT CONFIG — per-provider retry behavior
    ═══════════════════════════════════════════════════ */
 var RATE_LIMIT_CONFIG = {
-    'google-ai':   { baseDelay: 12000, maxRetries: 4, backoffFactor: 2.0, minInterval: 4000, continueDelay: 6000 },
-    'openrouter':  { baseDelay: 5000,  maxRetries: 2, backoffFactor: 1.5, minInterval: 1500, continueDelay: 2000 },
-    'ollama':      { baseDelay: 2000,  maxRetries: 2, backoffFactor: 1.5, minInterval: 500,  continueDelay: 1000 },
-    'lmstudio':    { baseDelay: 2000,  maxRetries: 2, backoffFactor: 1.5, minInterval: 500,  continueDelay: 1000 },
-    'openai':      { baseDelay: 5000,  maxRetries: 2, backoffFactor: 2.0, minInterval: 1500, continueDelay: 2000 },
-    'openai-compat': { baseDelay: 5000, maxRetries: 2, backoffFactor: 2.0, minInterval: 1500, continueDelay: 2000 },
-    'default':     { baseDelay: 5000,  maxRetries: 2, backoffFactor: 2.0, minInterval: 2000, continueDelay: 2000 }
+    'google-ai':   { baseDelay: 15000, maxRetries: 5, backoffFactor: 2.0, minInterval: 5000, continueDelay: 8000, cooldownMs: 60000 },
+    'openrouter':  { baseDelay: 8000,  maxRetries: 4, backoffFactor: 2.0, minInterval: 3500, continueDelay: 4000, cooldownMs: 45000 },
+    'ollama':      { baseDelay: 2000,  maxRetries: 2, backoffFactor: 1.5, minInterval: 500,  continueDelay: 1000, cooldownMs: 10000 },
+    'lmstudio':    { baseDelay: 2000,  maxRetries: 2, backoffFactor: 1.5, minInterval: 500,  continueDelay: 1000, cooldownMs: 10000 },
+    'openai':      { baseDelay: 5000,  maxRetries: 3, backoffFactor: 2.0, minInterval: 2000, continueDelay: 3000, cooldownMs: 30000 },
+    'openai-compat': { baseDelay: 5000, maxRetries: 3, backoffFactor: 2.0, minInterval: 2000, continueDelay: 3000, cooldownMs: 30000 },
+    'default':     { baseDelay: 8000,  maxRetries: 3, backoffFactor: 2.0, minInterval: 3000, continueDelay: 3000, cooldownMs: 30000 }
 };
 
 var FETCH_TIMEOUT = 120000;
@@ -38,6 +38,118 @@ var CONTINUE_MSG_STALL = 'OUTPUT NEXT FILE: Previous output cut off. One file bl
 
 /* ── Track last request time for client-side throttling ── */
 var _lastRequestTime = 0;
+
+/* ═══════════════════════════════════════════════════
+   AUTO MODEL FALLBACK — Picks next free model to try
+   ═══════════════════════════════════════════════════ */
+function getNextFallbackModel(currentModel) {
+    if (!FREE_MODEL_FALLBACKS || FREE_MODEL_FALLBACKS.length === 0) return null;
+    if (state.settings.provider !== 'openrouter') return null;
+
+    /* Reset fallback tracking if this is a fresh request (not already in fallback chain) */
+    if (state.fallbackModelsTried.indexOf(currentModel) === -1) {
+        state.fallbackModelsTried = [currentModel];
+    }
+
+    for (var i = 0; i < FREE_MODEL_FALLBACKS.length; i++) {
+        var candidate = FREE_MODEL_FALLBACKS[i];
+        if (state.fallbackModelsTried.indexOf(candidate) === -1) {
+            state.fallbackModelsTried.push(candidate);
+            console.log('[Connection] Fallback chain: [' + state.fallbackModelsTried.join(', ') + ']');
+            return candidate;
+        }
+    }
+
+    /* All fallbacks exhausted — return null to trigger cooldown */
+    console.warn('[Connection] All ' + FREE_MODEL_FALLBACKS.length + ' fallback models exhausted');
+    return null;
+}
+
+/* Reset fallback tracking when a request succeeds */
+function resetFallbackTracking() {
+    if (state.fallbackModelsTried.length > 1) {
+        console.log('[Connection] Request succeeded with fallback model: ' + state.settings.model);
+    }
+    state.fallbackModelsTried = [];
+}
+
+/* ═══════════════════════════════════════════════════
+   COOLDOWN — Locks input after 429 exhaustion
+   ═══════════════════════════════════════════════════ */
+function startCooldown(reason) {
+    var cfg = getRLConfig();
+    var duration = cfg.cooldownMs || 30000;
+    state.cooldownUntil = Date.now() + duration;
+    var secs = Math.ceil(duration / 1000);
+
+    console.log('[Connection] Starting ' + secs + 's cooldown: ' + reason);
+
+    /* Clear any existing timer */
+    if (state.cooldownTimer) { clearInterval(state.cooldownTimer); state.cooldownTimer = null; }
+
+    /* Update UI immediately */
+    setConnectionStatus('disconnected', 'Cooldown ' + secs + 's');
+    setSendButtonCooldown(secs);
+
+    /* Countdown timer — updates every second */
+    var remaining = secs;
+    state.cooldownTimer = setInterval(function() {
+        remaining--;
+        if (remaining <= 0) {
+            clearInterval(state.cooldownTimer);
+            state.cooldownTimer = null;
+            state.cooldownUntil = 0;
+            console.log('[Connection] Cooldown ended');
+            setConnectionStatus('connected', 'Connected — ' + state.settings.model);
+            clearSendButtonCooldown();
+            /* If there's a queued request, send it now */
+            if (state.pendingRequest) {
+                var pending = state.pendingRequest;
+                state.pendingRequest = null;
+                console.log('[Connection] Sending queued request after cooldown');
+                if (pending.type === 'continue') {
+                    continueResponse();
+                } else {
+                    sendMessage(pending.text, false);
+                }
+            }
+        } else {
+            setConnectionStatus('disconnected', 'Cooldown ' + remaining + 's');
+            setSendButtonCooldown(remaining);
+        }
+    }, 1000);
+}
+
+function isInCooldown() {
+    return state.cooldownUntil > Date.now();
+}
+
+function setSendButtonCooldown(secs) {
+    var btn = document.getElementById('send-btn');
+    if (btn) {
+        btn.classList.add('cooldown');
+        btn.innerHTML = '<i class="fas fa-hourglass-half"></i> ' + secs + 's';
+        btn.title = 'Rate limited — wait ' + secs + 's';
+        btn.style.pointerEvents = 'none';
+        btn.style.opacity = '0.5';
+    }
+    /* Also disable the input */
+    var input = document.getElementById('msg-input');
+    if (input) input.setAttribute('readonly', true);
+}
+
+function clearSendButtonCooldown() {
+    var btn = document.getElementById('send-btn');
+    if (btn) {
+        btn.classList.remove('cooldown');
+        btn.style.pointerEvents = '';
+        btn.style.opacity = '';
+    }
+    var input = document.getElementById('msg-input');
+    if (input) input.removeAttribute('readonly');
+    /* Let updateSendButton reset the icon */
+    updateSendButton();
+}
 
 function getRLConfig() {
     return RATE_LIMIT_CONFIG[state.settings.provider] || RATE_LIMIT_CONFIG['default'];
@@ -490,7 +602,57 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         /* ── Handle 429 (rate limit) after all retries exhausted ── */
         if (res.status === 429) {
             var err429Text = await res.text().catch(function () { return ''; });
-            throw new Error('RATE_LIMIT: All retries exhausted. ' + err429Text.substring(0, 200));
+
+            /* ── AUTO MODEL FALLBACK for OpenRouter ── */
+            if (state.settings.provider === 'openrouter') {
+                var fallbackModel = getNextFallbackModel(state.settings.model);
+                if (fallbackModel) {
+                    console.log('[Connection] 429 exhausted on ' + state.settings.model + ', switching to fallback: ' + fallbackModel);
+                    toast('Rate limited on ' + state.settings.model + '. Switching to ' + fallbackModel + '...', 'info');
+
+                    /* Clean up current stream state */
+                    clearInterval(stallWatchdog);
+                    if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
+                    if (fetchTimeoutId) { clearTimeout(fetchTimeoutId); fetchTimeoutId = null; }
+                    var streamMsg429 = document.getElementById('streaming-msg');
+                    if (streamMsg429 && !isAutoContinue) streamMsg429.remove();
+                    state.isStreaming = false;
+                    state.streamElement = null;
+                    state.streamBuffer = '';
+                    state.thinkingContent = '';
+
+                    /* Temporarily switch model and retry */
+                    var originalModel = state.settings.model;
+                    state.settings.model = fallbackModel;
+                    setConnectionStatus('connecting', 'Retrying with ' + fallbackModel + '...');
+
+                    await new Promise(function (r) { setTimeout(r, 1500); });
+
+                    try {
+                        return executeStream(messages, overrideMaxTokens, isAutoContinue);
+                    } catch (fallbackErr) {
+                        /* Fallback also failed — restore original model and go to cooldown */
+                        state.settings.model = originalModel;
+                        throw new Error('RATE_LIMIT: Fallback ' + fallbackModel + ' also failed. ' + err429Text.substring(0, 150));
+                    }
+                }
+            }
+
+            /* No fallback available — go to cooldown instead of just erroring */
+            console.warn('[Connection] 429 rate limit: all retries exhausted, no fallback available');
+            state.activeTask.isRunning = false;
+            state.activeTask.loopCount = 0;
+            state.isStreaming = false;
+            state.streamElement = null;
+            state.streamBuffer = '';
+            updateSendButton();
+            startCooldown('429 exhausted on ' + state.settings.model);
+            toast('Rate limited. Cooling down for 45s — your message will auto-send.', 'error');
+            /* Queue the current request so it auto-sends after cooldown */
+            if (!isAutoContinue) {
+                state.pendingRequest = { type: 'message', text: userText || '' };
+            }
+            return;
         }
 
         /* ── Handle other HTTP errors ── */
@@ -507,6 +669,8 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         /* ═══════════════════════════════════════
            STREAM READING
            ═══════════════════════════════════════ */
+        /* Reset fallback tracking — this model works! */
+        resetFallbackTracking();
         var reader = res.body.getReader();
         var decoder = new TextDecoder();
 
@@ -643,18 +807,13 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         } else if (errMsg.indexOf('RATE_LIMIT:') === 0) {
             state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
             state.isStreaming = false; updateSendButton();
-            /* ── Better rate limit message with actionable advice ── */
+            /* Go to cooldown instead of just showing an error */
+            startCooldown('rate limit from fallback');
             var provider = state.settings.provider;
-            var advice = '';
-            if (provider === 'google-ai') {
-                advice = 'Gemini free tier: ~15 requests/min. Wait 60s, reduce conversation history, or switch to a lighter model (gemini-2.0-flash-lite).';
-            } else if (provider === 'openrouter') {
-                advice = 'Wait a few minutes or switch to a different free model.';
-            } else {
-                advice = 'Wait a minute and try again.';
-            }
-            toast('Rate limited after all retries. ' + advice, 'error');
-            setConnectionStatus('disconnected', 'Rate Limited — Wait ' + (provider === 'google-ai' ? '60s' : '30s'));
+            var advice = provider === 'google-ai'
+                ? 'Gemini free tier. All models + fallbacks rate limited.'
+                : 'All models + fallbacks rate limited on OpenRouter.';
+            toast(advice + ' Cooling down — your message will auto-send.', 'error');
         } else if (errMsg.indexOf('AUTH_ERROR:') === 0) {
             state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
             state.isStreaming = false; updateSendButton();
@@ -705,6 +864,14 @@ export async function sendMessage(userText, isAutoContinue) {
             state.abortController = null;
             state.activeTask.isRunning = false;
             state.activeTask.loopCount = 0;
+            return;
+        }
+
+        /* ── Cooldown guard: queue the request instead of failing ── */
+        if (!isAutoContinue && isInCooldown()) {
+            var remainingSecs = Math.ceil((state.cooldownUntil - Date.now()) / 1000);
+            toast('Rate limited. Your message will auto-send in ' + remainingSecs + 's...', 'info');
+            state.pendingRequest = { type: 'message', text: userText };
             return;
         }
 

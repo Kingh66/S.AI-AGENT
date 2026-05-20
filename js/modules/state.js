@@ -32,6 +32,16 @@ export const state = {
     /* Set to true when the last response was truncated (finishReason=length) */
     responseTruncated: false,
 
+    /* Rate limit cooldown — prevents sending during cooldown period */
+    cooldownUntil: 0,
+    cooldownTimer: null,
+
+    /* Pending request to send after cooldown ends */
+    pendingRequest: null,
+
+    /* Track which models have been tried in current fallback cycle */
+    fallbackModelsTried: [],
+
     activeTask: {
         isRunning: false,
         loopCount: 0,
