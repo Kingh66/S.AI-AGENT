@@ -16,9 +16,9 @@ export var AGENTS = {
     planner: {
         name: 'Planner',
         description: 'Task decomposition and architecture design',
-        defaultModel: 'stepfun/step-3.5-flash',
+        defaultModel: 'deepseek/deepseek-chat-v3-0324:free',
         fallbackModels: ['xiaomi/mimo-v2-pro', 'minimax/minimax-m2.7'],
-        maxTokens: 4096,
+        maxTokens: 8192,
         prompt: 'You are S.ai\'s Planner agent. Your ONLY responsibility is to understand the task and create a detailed, step-by-step implementation plan.\n\nCRITICAL RULES:\n1. If a workspace file tree is provided, use it to understand the project structure\n2. Reference specific file paths in your plan\n3. Break complex tasks into 3-7 actionable steps\n4. Each step must be specific, testable, and independent\n5. Consider file structure, dependencies, and integration points\n6. Output format: EXACTLY this structure:\n\n## PLAN\n**Objective:** [Clear one-sentence goal]\n\n**Steps:**\n1. [Step 1 description - specific action, referencing actual files]\n2. [Step 2 description]\n3. ...\n\n**Files to create/modify:**\n- path/to/file.ext (purpose)\n- path/to/file.ext (purpose)\n\n**Dependencies:**\n- [List any external requirements]\n\n**Risks:**\n- [Potential issues and mitigation]\n\nNEVER write code. NEVER review code. ONLY plan.',
 
         parsePlan: function(text) {
@@ -147,7 +147,7 @@ export var AGENTS = {
     tester: {
         name: 'Tester',
         description: 'Validation and testing',
-        defaultModel: 'stepfun/step-3.5-flash',
+        defaultModel: 'deepseek/deepseek-chat-v3-0324:free',
         fallbackModels: ['xiaomi/mimo-v2-pro', 'minimax/minimax-m2.7'],
         maxTokens: 4096,
         prompt: 'You are S.ai\'s Tester agent.\n\nOutput format:\n\n## VALIDATION RESULT\nPASS | FAIL | NEEDS_REVIEW\n\n[Reasoning]',
