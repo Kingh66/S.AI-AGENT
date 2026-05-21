@@ -7,7 +7,7 @@ import { SYSTEM_PROMPTS, PROVIDER_DEFAULTS, MULTI_AGENT_CONFIG } from './config.
 import { toast } from './ui.js';
 
 /* ── Settings version — bump to force-clear all saved settings ── */
-var SETTINGS_VERSION = 5;
+var SETTINGS_VERSION = 6;
 
 var BAD_ENDPOINTS = [
     'http://localhost:8000/v1',
@@ -89,7 +89,7 @@ export function resetAllSettings() {
     state.settings.apiKey = '';
     state.settings.model = '';
     state.settings.temperature = 0.7;
-    state.settings.maxTokens = 2048;
+    state.settings.maxTokens = 8192;
     state.settings.contextBudget = 25000;
     state.settings.systemPrompt = SYSTEM_PROMPTS[state.currentMode];
     state.settings._version = SETTINGS_VERSION;
@@ -158,12 +158,12 @@ export function loadSettings() {
                 state.settings.apiKey = keepKey;
                 state.settings.model = keepModel;
                 state.settings.temperature = 0.7;
-                state.settings.maxTokens = 2048;
+                state.settings.maxTokens = 8192;
                 state.settings.contextBudget = 25000;
                 state.settings.systemPrompt = SYSTEM_PROMPTS[state.currentMode];
                 state.settings._version = SETTINGS_VERSION;
                 repaired = true;
-                toast('Settings updated to v' + SETTINGS_VERSION + ' (maxTokens lowered to 2048 for free tier safety)', 'info');
+                toast('Settings updated to v' + SETTINGS_VERSION + ' (maxTokens set to 8192 for coding mode support)', 'info');
                 /* Skip normal load — we just reset everything */
                 savedRaw = null;
             }
@@ -188,17 +188,17 @@ export function loadSettings() {
     /* ── SANITY CLAMP: maxTokens ── */
     /* Lower threshold from 256 to 32 so 402 auto-retry values (128, 64, 32) survive reload */
     if (typeof state.settings.maxTokens !== 'number' || state.settings.maxTokens < 32) {
-        state.settings.maxTokens = 2048;
+        state.settings.maxTokens = 8192;
         repaired = true;
     } else if (state.settings.maxTokens > 32768) {
         console.warn('[Storage] Clamped maxTokens from ' + state.settings.maxTokens + ' to 32768');
         state.settings.maxTokens = 32768;
         repaired = true;
     }
-    /* Bump very low values (402 auto-retry leftovers) to a usable free-tier floor */
+    /* Bump very low values (402 auto-retry leftovers) to a usable coding floor */
     if (state.settings.maxTokens >= 32 && state.settings.maxTokens < 512) {
-        console.warn('[Storage] maxTokens very low (' + state.settings.maxTokens + '), bumping to 1024 for usability');
-        state.settings.maxTokens = 1024;
+        console.warn('[Storage] maxTokens very low (' + state.settings.maxTokens + '), bumping to 8192 for coding support');
+        state.settings.maxTokens = 8192;
         repaired = true;
     }
 
@@ -325,7 +325,7 @@ export function saveFromSettingsUI() {
     state.settings.apiKey = document.getElementById('s-apikey').value.trim();
     state.settings.model = document.getElementById('s-model').value.trim();
     state.settings.temperature = parseFloat(document.getElementById('q-temp').value);
-    state.settings.maxTokens = parseInt(document.getElementById('q-tokens').value) || 2048;
+    state.settings.maxTokens = parseInt(document.getElementById('q-tokens').value) || 8192;
     state.settings.contextBudget = parseInt(document.getElementById('q-context-budget') ? document.getElementById('q-context-budget').value : 60000) || 60000;
     voiceState.lang = document.getElementById('q-voice-lang').value;
     voiceState.rate = parseFloat(document.getElementById('q-voice-rate').value);

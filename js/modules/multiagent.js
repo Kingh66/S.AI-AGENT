@@ -18,7 +18,7 @@ export var AGENTS = {
         description: 'Task decomposition and architecture design',
         defaultModel: 'xiaomi/mimo-v2-pro:free',
         fallbackModels: ['minimax/minimax-m2.7:free', 'stepfun/step-3.5-flash:free'],
-        maxTokens: 8192,
+        maxTokens: 16384,
         prompt: 'You are S.ai\'s Planner agent. Your ONLY responsibility is to understand the task and create a detailed, step-by-step implementation plan.\n\nCRITICAL RULES:\n1. If a workspace file tree is provided, use it to understand the project structure\n2. Reference specific file paths in your plan\n3. Break complex tasks into 3-7 actionable steps\n4. Each step must be specific, testable, and independent\n5. Consider file structure, dependencies, and integration points\n6. Output format: EXACTLY this structure:\n\n## PLAN\n**Objective:** [Clear one-sentence goal]\n\n**Steps:**\n1. [Step 1 description - specific action, referencing actual files]\n2. [Step 2 description]\n3. ...\n\n**Files to create/modify:**\n- path/to/file.ext (purpose)\n- path/to/file.ext (purpose)\n\n**Dependencies:**\n- [List any external requirements]\n\n**Risks:**\n- [Potential issues and mitigation]\n\nNEVER write code. NEVER review code. ONLY plan.',
 
         parsePlan: function(text) {
@@ -104,7 +104,7 @@ export var AGENTS = {
         description: 'Implementation based on plan',
         defaultModel: 'minimax/minimax-m2.7:free',
         fallbackModels: ['xiaomi/mimo-v2-pro:free', 'stepfun/step-3.5-flash:free', 'z-ai/glm-5-turbo:free'],
-        maxTokens: 4096,
+        maxTokens: 16384,
         currentModel: null,
         prompt: 'You are S.ai\'s Coder agent. Your ONLY responsibility is to write complete, production-ready code based on the Planner\'s plan.\n\nCRITICAL RULES:\n1. Follow the plan EXACTLY - do not deviate\n2. If workspace files are provided, READ THEM to understand existing code\n3. When modifying existing files, output the COMPLETE file — never "...", "// rest unchanged"\n4. Every file must be self-contained and runnable\n5. Include all necessary imports, error handling, and edge cases\n6. For each file, output:\n\nfile:path/to/filename.ext\n// FULL FILE CONTENT - NO OMISSIONS\n[complete code]\n\n7. NEVER hallucinate imports\n8. After writing ALL files, add: <|INTEGRATION_CHECK|>',
 
@@ -131,7 +131,7 @@ export var AGENTS = {
         description: 'Code review and quality gate',
         defaultModel: 'nvidia/nemotron-3-super:free',
         fallbackModels: ['minimax/minimax-m2.5:free', 'stepfun/step-3.5-flash:free', 'xiaomi/mimo-v2-pro:free'],
-        maxTokens: 2048,
+        maxTokens: 8192,
         prompt: 'You are S.ai\'s Critic agent - the FINAL quality gate.\n\nOutput format: EXACTLY one of these:\n\nAPPROVED\n[Brief validation]\n\nREJECTED\n[Detailed reasons, numbered]\n\nIf in doubt, REJECT.',
 
         parseDecision: function(text) {
@@ -149,7 +149,7 @@ export var AGENTS = {
         description: 'Validation and testing',
         defaultModel: 'google/gemma-3-27b-it:free',
         fallbackModels: ['xiaomi/mimo-v2-pro:free', 'minimax/minimax-m2.7:free'],
-        maxTokens: 4096,
+        maxTokens: 8192,
         prompt: 'You are S.ai\'s Tester agent.\n\nOutput format:\n\n## VALIDATION RESULT\nPASS | FAIL | NEEDS_REVIEW\n\n[Reasoning]',
 
         parseResult: function(text) {
@@ -244,17 +244,47 @@ function getSmartFileContext(agentName) {
     }
 
     /* ── Coder: file tree + truncated file contents ──
-       Cap at 15KB to keep input tokens manageable */
+       Cap at 30KB to give the coder enough context to write accurate code.
+       IMPORTANT: Always cut at a file boundary — never mid-file.
+       If truncation would cut a file in half, drop that entire file instead. */
     if (agentName === 'coder') {
-        var MAX_CODER_CTX = 15000;
+        var MAX_CODER_CTX = 30000;
         if (fullCtx.length <= MAX_CODER_CTX) return fullCtx;
-        /* Find a good truncation point — don't cut mid-file */
-        var truncated = fullCtx.substring(0, MAX_CODER_CTX);
-        var lastFileEnd = truncated.lastIndexOf('--- END FILE ---');
-        if (lastFileEnd > 5000) {
-            truncated = truncated.substring(0, lastFileEnd + '--- END FILE ---'.length);
+
+        /* Strategy: build context file-by-file, stopping when budget runs out.
+           Never include a partial file — if a file doesn't fit, skip it entirely. */
+        var fileSections = fullCtx.split(/(?=--- FILE: )/);
+        var treeSection = '';
+        var fileContents = [];
+
+        /* First element is the tree (before any "--- FILE:" markers) */
+        if (fileSections.length > 0 && fileSections[0].indexOf('--- FILE:') === -1) {
+            treeSection = fileSections[0];
+            fileSections = fileSections.slice(1);
         }
-        return truncated + '\n\n[... ' + (fullCtx.length - truncated.length) + ' more characters truncated to fit token budget. Ask the user to paste specific files if you need them.]';
+
+        var budgetRemaining = MAX_CODER_CTX - treeSection.length - 200;
+        var includedFiles = [];
+        var omittedFiles = [];
+
+        for (var fi = 0; fi < fileSections.length; fi++) {
+            var section = fileSections[fi];
+            if (section.length <= budgetRemaining) {
+                includedFiles.push(section);
+                budgetRemaining -= section.length;
+            } else {
+                /* Extract filename for the omission notice */
+                var nameMatch = section.match(/--- FILE: (.+?) ---/);
+                omittedFiles.push(nameMatch ? nameMatch[1] : 'file ' + (fi + 1));
+            }
+        }
+
+        var result = treeSection + includedFiles.join('');
+        if (omittedFiles.length > 0) {
+            result += '\n\n--- TRUNCATED: ' + omittedFiles.length + ' files omitted to fit context budget ---\n';
+            result += 'Omitted files (ask the user to paste if needed):\n' + omittedFiles.join('\n');
+        }
+        return result;
     }
 
     /* ── Critic and Tester: NO raw file context ──
@@ -571,9 +601,13 @@ MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, mo
         systemContent += '\n\n' + fileCtx;
     }
 
+    /* ── Agent token budget: use the HIGHER of user setting or agent requirement ──
+       IMPORTANT: Math.min() was capping agent output at the user's maxTokens (default 2048),
+       which is WAY too low for code generation. The agent knows what it needs — let it decide.
+       The user's setting is a CEILING for chat, not a FLOOR for agents. */
     var userMax = state.settings.maxTokens || 4096;
-    var agentBudget = agent.maxTokens || 4096;
-    var startTokens = Math.min(userMax, agentBudget);
+    var agentBudget = agent.maxTokens || 8192;
+    var startTokens = Math.max(agentBudget, Math.min(userMax, 32768));
 
     var fileCount = fileCtx ? (fileCtx.match(/--- FILE:/g) || []).length : 0;
     console.log('[MultiAgent] ' + agentName + ' model=' + model + ' startTokens=' + startTokens + ' fileCtx=' + fileCtx.length + ' chars ' + fileCount + ' files');

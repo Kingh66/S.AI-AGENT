@@ -130,6 +130,20 @@ export const MODE_INFO = {
     multiagent: { title: 'Multi-Agent', desc: 'Planner → Coder → Critic → Tester pipeline' }
 };
 
+/* ── Mode-specific maxTokens recommendations ──
+   Coding modes need much more output than chat modes.
+   These are the FLOOR values — the user's setting is respected if higher. */
+export const MODE_MAX_TOKENS_FLOOR = {
+    doc: 4096,
+    review: 4096,
+    improve: 8192,
+    debug: 4096,
+    explain: 4096,
+    selfimprove: 8192,
+    custom: 8192,
+    multiagent: 8192
+};
+
 export const PROVIDER_DEFAULTS = {
     'google-ai': { endpoint: 'https://generativelanguage.googleapis.com/v1beta/openai', hint: 'Google AI Studio — free Gemini models, generous rate limits, no credit card needed', keyPlaceholder: 'AIza...', keyHint: 'Get your key at aistudio.google.com/apikey' },
     openrouter: { endpoint: 'https://openrouter.ai/api/v1', hint: 'OpenRouter — access hundreds of models through one API', keyPlaceholder: 'sk-or-v1-...', keyHint: 'Get your key at openrouter.ai/keys' },
@@ -226,7 +240,7 @@ export const stateDefaults = {
     apiKey: '',
     model: '',
     temperature: 0.7,
-    maxTokens: 2048,
+    maxTokens: 8192,
     systemPrompt: '',
     multiAgent: {
         enabled: false,

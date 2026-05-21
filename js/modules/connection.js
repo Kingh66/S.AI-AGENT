@@ -2,7 +2,7 @@
    CONNECTION — LLM API calls, streaming
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
-import { FILE_SYSTEM_INSTRUCTIONS, FREE_MODEL_FALLBACKS } from './config.js';
+import { FILE_SYSTEM_INSTRUCTIONS, FREE_MODEL_FALLBACKS, MODE_MAX_TOKENS_FLOOR } from './config.js';
 import {
     removeWelcome, addUserMessage, addBotMessageStart,
     appendStreamChunk, finalizeStream, updateSendButton, showContinueButton, removeContinueButton
@@ -26,15 +26,15 @@ var FETCH_TIMEOUT = 120000;
 var STREAM_STALL_TIMEOUT = 60000;
 var MIN_MAX_TOKENS = 32;
 var MAX_MAX_TOKENS = 32768;
-var DEFAULT_MAX_TOKENS = 2048;
+var DEFAULT_MAX_TOKENS = 8192;
 var TOKEN_402_SAFETY_MARGIN = 150;
 var MIN_RETRY_TOKENS = 32;
 
 var CONTINUATION_MODES = ['custom', 'selfimprove', 'multiagent'];
 
-var CONTINUE_MSG_FILE = 'OUTPUT NEXT FILE: One file block only. <|CONTINUE_TASK|> if more files remain, end normally if last. No commentary.';
+var CONTINUE_MSG_FILE = 'CONTINUE your previous response EXACTLY where you left off. If you were in the middle of a code file, continue that SAME file from the exact cutoff point. Do NOT start a new file unless the previous one was complete. <|CONTINUE_TASK|> if more files remain, end normally if last. No commentary.';
 
-var CONTINUE_MSG_STALL = 'OUTPUT NEXT FILE: Previous output cut off. One file block only. <|CONTINUE_TASK|> if more remain, end normally if last. No commentary.';
+var CONTINUE_MSG_STALL = 'Your output was cut off. CONTINUE from the exact point where you stopped. If mid-code, continue the SAME code block. Do NOT restart or summarize. <|CONTINUE_TASK|> if more remain, end normally if last. No commentary.';
 
 /* ── Track last request time for client-side throttling ── */
 var _lastRequestTime = 0;
@@ -302,6 +302,26 @@ function clampMaxTokens(val) {
     return val;
 }
 
+/* ── Mode-aware maxTokens floor ──
+   Coding modes (custom, selfimprove, multiagent) need MUCH more output tokens
+   than chat modes. A user with maxTokens=2048 gets truncated after ~1.5KB of
+   code — way too short for any real file. This function ensures coding modes
+   never use less than the mode's floor, regardless of the user's setting. */
+function getEffectiveMaxTokens(requestedTokens) {
+    var clamped = clampMaxTokens(requestedTokens);
+
+    /* Use mode-specific floor from config */
+    var mode = state.currentMode || '';
+    var modeFloor = (MODE_MAX_TOKENS_FLOOR && MODE_MAX_TOKENS_FLOOR[mode]) || 2048;
+
+    if (clamped < modeFloor) {
+        console.log('[Connection] Boosting maxTokens from ' + clamped + ' to ' + modeFloor + ' for ' + mode + ' mode');
+        return modeFloor;
+    }
+
+    return clamped;
+}
+
 /* ═══════════════════════════════════════
    402 PARSER — Always extracts a number, floors at minimum
    ═══════════════════════════════════════ */
@@ -392,7 +412,7 @@ export function isOllamaProvider() {
 export function buildPayload(messages, overrideModel, overrideMaxTokens) {
     var model = overrideModel || state.settings.model || 'gpt-3.5-turbo';
     var temperature = state.settings.temperature;
-    var maxTokens = clampMaxTokens(overrideMaxTokens != null ? overrideMaxTokens : state.settings.maxTokens);
+    var maxTokens = getEffectiveMaxTokens(overrideMaxTokens != null ? overrideMaxTokens : state.settings.maxTokens);
 
     if (isOllamaProvider()) {
         return { model: model, messages: messages, stream: true, options: { temperature: temperature, num_predict: maxTokens } };
@@ -523,7 +543,7 @@ function buildSafeMessages(userText, systemPrompt) {
 
 async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     var model = state.settings.model || 'gpt-3.5-turbo';
-    var actualMaxTokens = clampMaxTokens(overrideMaxTokens != null ? overrideMaxTokens : state.settings.maxTokens);
+    var actualMaxTokens = getEffectiveMaxTokens(overrideMaxTokens != null ? overrideMaxTokens : state.settings.maxTokens);
 
     var totalEstTokens = 0;
     for (var m = 0; m < messages.length; m++) totalEstTokens += estimateTokens(messages[m].content);
