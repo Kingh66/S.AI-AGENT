@@ -1,12 +1,9 @@
+
 /* ═══════════════════════════════════════
    SMART CONTEXT — Relevance-scored file injection
-   Solves "whole folder too big for free tier"
-   All scoring is client-side, zero API calls
-   Uses only exported functions from filesystem.js
    ═══════════════════════════════════════ */
 import { getTree, readFile, isConnected } from './filesystem.js';
 
-/* ── Stop words to ignore when extracting keywords ── */
 var STOP = new Set([
     'the','a','an','is','are','was','were','be','been','being','have','has','had',
     'do','does','did','will','would','could','should','may','might','shall','can',
@@ -24,7 +21,6 @@ var STOP = new Set([
     'getting','got','been','being','having','doing','does','done','doing'
 ]);
 
-/* ── Config/manifest files — always include these ── */
 var CONFIG_FILES = new Set([
     'package.json','package-lock.json','tsconfig.json','.eslintrc','.eslintrc.json',
     '.eslintrc.js','webpack.config.js','vite.config.js','vite.config.ts',
@@ -37,7 +33,6 @@ var CONFIG_FILES = new Set([
     'babel.config.js','rollup.config.js','index.html'
 ]);
 
-/* ── Extension → topic aliases (for matching "python" → .py files) ── */
 var EXT_TOPICS = {
     js:   ['javascript','js','node','script','npm','express','react','vue'],
     mjs:  ['javascript','js','node','esm','module'],
@@ -73,7 +68,6 @@ var EXT_TOPICS = {
     gql:  ['graphql','gql','query','mutation']
 };
 
-/* ── Entry point filenames ── */
 var ENTRY_POINTS = new Set([
     'index.js','index.ts','index.mjs','index.jsx','index.tsx',
     'main.js','main.ts','main.py','main.go','main.rs','main.java',
@@ -81,6 +75,40 @@ var ENTRY_POINTS = new Set([
     'server.js','server.ts','server.py','server.go',
     'cli.js','cli.ts','script.js'
 ]);
+
+/* ═══════════════════════════════════════
+   FIX: INTENT DETECTION
+   When the user says "debug", "find bugs", "review",
+   "analyze", "read folder", they want ALL source files.
+   The old keyword scoring missed this because "debug"
+   doesn't contain "javascript" or "js" or "react".
+   ═══════════════════════════════════════ */
+var SOURCE_CODE_EXTS = new Set([
+    'js','mjs','cjs','ts','tsx','jsx','py','java','css','html','htm',
+    'json','sql','go','rs','rb','php','vue','svelte','dart','kt',
+    'swift','c','cpp','h','sh','bash','yml','yaml','toml','graphql','gql'
+]);
+
+function isDebugOrReviewIntent(userMessage) {
+    var t = userMessage.toLowerCase();
+    var intentWords = [
+        'debug', 'bug', 'bugs', 'fix', 'error', 'errors', 'issue', 'issues',
+        'problem', 'problems', 'review', 'analyze', 'analyse', 'analysis',
+        'check', 'inspect', 'audit', 'find', 'read', 'look', 'examine',
+        'improve', 'refactor', 'optimize', 'optimise', 'cleanup', 'clean up',
+        'scan', 'detect', 'identify', 'diagnose', 'troubleshoot',
+        'what wrong', 'what broken', 'what error', 'what bug',
+        'any issue', 'any bug', 'any problem', 'any error',
+        'tell me', 'show me', 'list all', 'find all'
+    ];
+    for (var i = 0; i < intentWords.length; i++) {
+        if (t.indexOf(intentWords[i]) > -1) return true;
+    }
+    /* Also detect "read this/that/the folder" or "read folder" */
+    if (/\bread\s+(this|that|the|my|our|whole|entire|all)\s*(folder|project|code|files|workspace|repo|directory)/i.test(t)) return true;
+    if (/\bread\s+(folder|project|code|files|workspace|repo|directory)/i.test(t)) return true;
+    return false;
+}
 
 /* ═══════════════════════════════════════
    KEYWORD EXTRACTION
@@ -109,8 +137,7 @@ function extractKeywords(text) {
 }
 
 /* ═══════════════════════════════════════
-   METADATA SCORING (sync — no content needed)
-   Covers: filename, path, extension, config, entry points
+   METADATA SCORING
    ═══════════════════════════════════════ */
 function scoreFileMetadata(filePath, keywords, userMessage) {
     var score = 0;
@@ -144,16 +171,13 @@ function scoreFileMetadata(filePath, keywords, userMessage) {
 }
 
 /* ═══════════════════════════════════════
-   CONTENT SCORING (sync — needs content string)
-   Covers: error messages, keyword density, function/class names
+   CONTENT SCORING
    ═══════════════════════════════════════ */
 function scoreFileContent(filePath, content, keywords, userMessage) {
     if (!content) return 0;
     var score = 0;
-    var fileName = filePath.split('/').pop().toLowerCase();
     var lowerContent = content.toLowerCase();
 
-    /* Quoted string (error message) match — HIGHEST signal */
     for (var q = 0; q < keywords.quoted.length; q++) {
         var qs = keywords.quoted[q];
         if (qs.length > 3 && lowerContent.includes(qs)) {
@@ -161,7 +185,6 @@ function scoreFileContent(filePath, content, keywords, userMessage) {
         }
     }
 
-    /* Content keyword density */
     for (var k = 0; k < keywords.words.length; k++) {
         var word = keywords.words[k];
         if (word.length < 3) continue;
@@ -175,7 +198,6 @@ function scoreFileContent(filePath, content, keywords, userMessage) {
         score += Math.min(count * 0.4, 6);
     }
 
-    /* Function/class name detection */
     var nameCandidates = userMessage.match(/\b([a-zA-Z_][a-zA-Z0-9_]{2,})\b/g) || [];
     var nameSeen = new Set();
     for (var n = 0; n < nameCandidates.length; n++) {
@@ -202,8 +224,7 @@ function scoreFileContent(filePath, content, keywords, userMessage) {
 }
 
 /* ═══════════════════════════════════════
-   IMPORT GRAPH — boost files imported by
-   already-relevant files
+   IMPORT GRAPH
    ═══════════════════════════════════════ */
 function buildImportMap(contentMap) {
     var imports = {};
@@ -216,7 +237,6 @@ function buildImportMap(contentMap) {
 
         var deps = [];
 
-        /* JS/TS: import ... from '...' and require('...') */
         var jsImp = content.match(/(?:import\s+.*?from\s+['"]([^'"]+)['"]|require\s*\(\s*['"]([^'"]+)['"]\s*\))/g);
         if (jsImp) {
             for (var j = 0; j < jsImp.length; j++) {
@@ -232,7 +252,6 @@ function buildImportMap(contentMap) {
             }
         }
 
-        /* Python: from X import Y / import X */
         var pyImp = content.match(/^(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))/gm);
         if (pyImp) {
             for (var p = 0; p < pyImp.length; p++) {
@@ -241,7 +260,6 @@ function buildImportMap(contentMap) {
             }
         }
 
-        /* Go: import */
         var goImp = content.match(/import\s+\(?[^)]*"([^"]+)"/g);
         if (goImp) {
             for (var g = 0; g < goImp.length; g++) {
@@ -281,8 +299,6 @@ function applyImportBoost(scores, importMap) {
 
 /* ═══════════════════════════════════════
    MAIN EXPORT — async
-   Reads file content only for top candidates
-   to keep readFile calls minimal
    ═══════════════════════════════════════ */
 export async function getSmartFileContext(userMessage, maxChars) {
     if (!isConnected()) return '';
@@ -293,32 +309,80 @@ export async function getSmartFileContext(userMessage, maxChars) {
 
     if (readableFiles.length === 0) return '';
 
-    /* Extract folder name from first file path */
     var projectName = 'project';
     if (readableFiles.length > 0) {
         var firstSegment = readableFiles[0].path.split('/')[0];
         if (firstSegment) projectName = firstSegment;
     }
 
-    /* ≤3 files: send all, no scoring needed */
+    /* ≤3 files: send all */
     if (readableFiles.length <= 3) {
         return await buildRawContext(readableFiles, maxChars, projectName);
     }
 
-    /* Phase 1: Score by metadata only (sync, fast) */
+    /* ═══════════════════════════════════════════════════
+       FIX: DEBUG/REVIEW INTENT → INCLUDE ALL SOURCE FILES
+       
+       OLD BUG: "debug two bugs in this folder" didn't match
+       any EXT_TOPICS for .js files because the message
+       doesn't contain "javascript", "js", "react", etc.
+       Only CSS/HTML files got included because "folder"
+       and "find" happened to score them slightly higher.
+       
+       NEW: When intent is debug/review/analyze, ALL source
+       code files get a massive score boost (+50), ensuring
+       they're included before CSS/assets. We also expand
+       the budget to fit more files since the user clearly
+       wants comprehensive analysis.
+       ═══════════════════════════════════════════════════ */
+    var isDebugIntent = isDebugOrReviewIntent(userMessage);
+
+    /* Phase 1: Score by metadata */
     var keywords = extractKeywords(userMessage);
     var scores = {};
 
     for (var i = 0; i < readableFiles.length; i++) {
-        scores[readableFiles[i].path] = scoreFileMetadata(readableFiles[i].path, keywords, userMessage);
+        var filePath = readableFiles[i].path;
+        var fileName = filePath.split('/').pop().toLowerCase();
+        var fileExt = fileName.split('.').pop();
+
+        scores[filePath] = scoreFileMetadata(filePath, keywords, userMessage);
+
+        /* ── FIX: Massive boost for source code files when intent is debug/review ── */
+        if (isDebugIntent && SOURCE_CODE_EXTS.has(fileExt)) {
+            scores[filePath] += 50;
+
+            /* Extra boost for JS/TS modules — they contain the actual logic */
+            if (['js','mjs','cjs','ts','tsx','jsx','py','java','go','rs','rb','php'].indexOf(fileExt) > -1) {
+                scores[filePath] += 20;
+            }
+
+            /* Extra boost for entry points */
+            if (ENTRY_POINTS.has(fileName)) {
+                scores[filePath] += 15;
+            }
+
+            /* Extra boost for config files */
+            if (CONFIG_FILES.has(fileName)) {
+                scores[filePath] += 10;
+            }
+        }
+
+        /* ── FIX: Penalize binary/asset files for debug intent ── */
+        if (isDebugIntent && !SOURCE_CODE_EXTS.has(fileExt)) {
+            scores[filePath] -= 10;
+        }
     }
 
-    /* Phase 2: Read content for top 20 candidates, re-score with content */
+    /* Phase 2: Read content for top candidates, re-score with content */
     var sorted = readableFiles.slice().sort(function(a, b) {
         return (scores[b.path] || 0) - (scores[a.path] || 0);
     });
 
-    var candidateCount = Math.min(sorted.length, 20);
+    /* ── FIX: Read more candidates for debug intent (top 40 instead of 20) ── */
+    var candidateCount = isDebugIntent
+        ? Math.min(sorted.length, 40)
+        : Math.min(sorted.length, 20);
     var contentMap = {};
 
     for (var c = 0; c < candidateCount; c++) {
@@ -329,11 +393,11 @@ export async function getSmartFileContext(userMessage, maxChars) {
         }
     }
 
-    /* Phase 3: Import graph boost using the content we already read */
+    /* Phase 3: Import graph boost */
     var importMap = buildImportMap(contentMap);
     applyImportBoost(scores, importMap);
 
-    /* Phase 4: Final sort by combined score */
+    /* Phase 4: Final sort */
     sorted.sort(function(a, b) {
         return (scores[b.path] || 0) - (scores[a.path] || 0);
     });
@@ -347,6 +411,21 @@ export async function getSmartFileContext(userMessage, maxChars) {
     }
     header += '---\n';
 
+    /* ═══════════════════════════════════════════════════
+       FIX: EXPAND BUDGET FOR DEBUG INTENT
+       
+       When the user says "debug bugs" or "read folder",
+       they want ALL the source files. The default 25K char
+       budget is way too small for a project with 20+ JS files.
+       We expand it to 80K for debug intent, which is still
+       within most free model limits.
+       ═══════════════════════════════════════════════════ */
+    var effectiveMaxChars = maxChars;
+    if (isDebugIntent) {
+        effectiveMaxChars = Math.max(maxChars, 80000);
+        console.log('[SmartContext] Debug/review intent detected — expanded budget to ' + effectiveMaxChars + ' chars');
+    }
+
     /* Fill budget with top-scoring files */
     var context = header;
     var used = context.length;
@@ -355,8 +434,6 @@ export async function getSmartFileContext(userMessage, maxChars) {
 
     for (var s = 0; s < sorted.length; s++) {
         var file = sorted[s];
-
-        /* Use cached content if available, otherwise read it */
         var fileContent = contentMap[file.path];
         if (!fileContent) {
             fileContent = await readFile(file.path);
@@ -364,7 +441,17 @@ export async function getSmartFileContext(userMessage, maxChars) {
         if (!fileContent) continue;
 
         var overhead = file.path.length + 50;
-        if (used + fileContent.length + overhead > maxChars) {
+        if (used + fileContent.length + overhead > effectiveMaxChars) {
+            /* ── FIX: For debug intent, truncate large files instead of omitting them ── */
+            if (isDebugIntent && fileContent.length > 5000) {
+                var truncatedContent = fileContent.substring(0, Math.min(fileContent.length, effectiveMaxChars - used - overhead - 200));
+                if (truncatedContent.length > 500) {
+                    context += '\n--- FILE: ' + file.path + ' [TRUNCATED to ' + truncatedContent.length + ' of ' + fileContent.length + ' chars] ---\n' + truncatedContent + '\n\n// ... [file truncated, ' + Math.round((1 - truncatedContent.length / fileContent.length) * 100) + '% omitted] ...\n--- END FILE ---\n';
+                    used += truncatedContent.length + overhead + 200;
+                    included++;
+                    continue;
+                }
+            }
             omitted.push(file.path);
             continue;
         }
@@ -375,17 +462,18 @@ export async function getSmartFileContext(userMessage, maxChars) {
     }
 
     if (omitted.length > 0) {
-        context += '\n[OMITTED ' + omitted.length + ' low-relevance files. ';
+        context += '\n[OMITTED ' + omitted.length + ' files. ';
         context += 'Included: ' + included + '/' + readableFiles.length + '. ';
         context += 'Omitted: ' + omitted.slice(0, 8).join(', ');
         if (omitted.length > 8) context += ' +' + (omitted.length - 8) + ' more';
         context += ']';
     }
 
+    console.log('[SmartContext] Final context: ' + context.length + ' chars, ' + included + '/' + readableFiles.length + ' files included, intent=' + (isDebugIntent ? 'debug/review' : 'general'));
+
     return context;
 }
 
-/* ── Fallback: raw context for small projects ── */
 async function buildRawContext(files, maxChars, projectName) {
     var ctx = '--- WORKSPACE: ' + (projectName || 'project') + ' ---\n';
     var used = ctx.length;
