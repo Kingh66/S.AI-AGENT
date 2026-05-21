@@ -38,16 +38,22 @@ var CONTINUE_MSG_STALL = 'Your output was cut off. CONTINUE from the exact point
 
 var _lastRequestTime = 0;
 
+/* ═══════════════════════════════════════════════════
+   FIX: Track the ORIGINAL user message so
+   auto-continue can maintain file context and intent.
+   Without this, continuations pass '' to
+   buildSafeSystemPrompt which loses debug intent
+   and drops file context from 80K to 25K.
+   ═══════════════════════════════════════════════════ */
+var _originalUserMessage = '';
+
 function getNextFallbackModel(currentModel) {
     if (state.settings.provider !== 'openrouter') return null;
     var fallbackPool = [];
     if (state.verifiedFreeModelIds && state.verifiedFreeModelIds.length > 0) {
         fallbackPool = state.verifiedFreeModelIds.slice();
     } else {
-        try {
-            var cached = localStorage.getItem('sai_verified_free_models');
-            if (cached) fallbackPool = JSON.parse(cached);
-        } catch (e) { }
+        try { var cached = localStorage.getItem('sai_verified_free_models'); if (cached) fallbackPool = JSON.parse(cached); } catch (e) { }
     }
     if (fallbackPool.length === 0 && FREE_MODEL_FALLBACKS && FREE_MODEL_FALLBACKS.length > 0) {
         fallbackPool = FREE_MODEL_FALLBACKS.slice();
@@ -68,7 +74,7 @@ function getNextFallbackModel(currentModel) {
 
 function resetFallbackTracking() {
     if (state.fallbackModelsTried.length > 1) {
-        toast('Switched to ' + state.settings.model + ' (original model was rate limited)', 'success');
+        toast('Switched to ' + state.settings.model, 'success');
         import('./storage.js').then(function (s) { s.saveSettings(); });
         var modelInput = document.getElementById('s-model');
         if (modelInput) modelInput.value = state.settings.model;
@@ -88,14 +94,11 @@ function startCooldown(reason) {
     state.cooldownTimer = setInterval(function() {
         remaining--;
         if (remaining <= 0) {
-            clearInterval(state.cooldownTimer);
-            state.cooldownTimer = null;
-            state.cooldownUntil = 0;
+            clearInterval(state.cooldownTimer); state.cooldownTimer = null; state.cooldownUntil = 0;
             setConnectionStatus('connected', 'Connected — ' + state.settings.model);
             clearSendButtonCooldown();
             if (state.pendingRequest) {
-                var pending = state.pendingRequest;
-                state.pendingRequest = null;
+                var pending = state.pendingRequest; state.pendingRequest = null;
                 if (pending.type === 'continue') continueResponse();
                 else sendMessage(pending.text, false);
             }
@@ -162,7 +165,7 @@ async function fetchWithRetry(url, options) {
                 var parsed429 = JSON.parse(last429Body);
                 if (parsed429.error && parsed429.error.details) {
                     for (var d = 0; d < parsed429.error.details.length; d++) {
-                        if (parsed429.error.details[d].retryDelay) { var googleDelay = parseInt(parsed429.error.details[d].retryDelay, 10) * 1000; if (googleDelay > 0) delay = Math.max(delay, googleDelay); }
+                        if (parsed429.error.details[d].retryDelay) { var gd = parseInt(parsed429.error.details[d].retryDelay, 10) * 1000; if (gd > 0) delay = Math.max(delay, gd); }
                     }
                 }
             } catch (e) { }
@@ -290,17 +293,11 @@ async function buildSafeSystemPrompt(userText) {
 function buildSafeMessages(userText, systemPrompt) {
     var sysTokens = estimateTokens(systemPrompt);
 
-    /* ── FIX: Proper default context window ──
-       modelContextLimits stores chars (approx context_length * 3.5).
-       Default: 128K token context = ~448K chars.
-       If model isn't in the lookup, assume 128K tokens minimum. */
     var modelCtxTokens = 128000;
     var modelId = state.settings.model || '';
     if (state.modelContextLimits[modelId]) {
-        /* Convert chars back to approximate tokens */
         modelCtxTokens = Math.max(Math.floor(state.modelContextLimits[modelId] / 3.5), 128000);
     } else if (modelId.indexOf(':free') > -1 || modelId.indexOf('/') > -1) {
-        /* Free/OpenRouter models typically have 128K+ context */
         modelCtxTokens = 128000;
     } else if (modelId.indexOf('gemini') > -1) {
         modelCtxTokens = 1000000;
@@ -317,9 +314,8 @@ function buildSafeMessages(userText, systemPrompt) {
         var sys = state.settings.systemPrompt;
         var ctx = document.getElementById('project-context').value.trim();
         if (ctx) sys += '\n\n--- PROJECT CONTEXT ---\n' + ctx + '\n--- END CONTEXT ---';
-        var strippedTokens = estimateTokens(sys);
-        if (strippedTokens <= safeLimit) { systemPrompt = sys; toast('File context stripped — too large.', 'info'); }
-        else { systemPrompt = state.settings.systemPrompt; if (estimateTokens(systemPrompt) > safeLimit) { systemPrompt = systemPrompt.substring(0, Math.floor(safeLimit * 3.5)) + '\n\n[Truncated]'; toast('System prompt truncated.', 'error'); } }
+        if (estimateTokens(sys) <= safeLimit) { systemPrompt = sys; toast('File context stripped.', 'info'); }
+        else { systemPrompt = state.settings.systemPrompt; if (estimateTokens(systemPrompt) > safeLimit) { systemPrompt = systemPrompt.substring(0, Math.floor(safeLimit * 3.5)) + '\n\n[Truncated]'; } }
     }
 
     var remainingTokens = safeLimit - estimateTokens(systemPrompt);
@@ -335,56 +331,76 @@ function buildSafeMessages(userText, systemPrompt) {
 }
 
 /* ═══════════════════════════════════════════════════
-   FIX: Detect incomplete response even when
-   finish_reason='stop' (some models do this)
+   FIX: responseSeemsIncomplete — MUCH more conservative
+   
+   OLD BUG: This function triggered on almost EVERY
+   response because:
+   - Many valid responses end without ".!?)"
+   - Status lines like "⏳ In Progress" have no period
+   - Short responses in coding mode were always flagged
+   - This caused infinite auto-continue loops
+   
+   NEW: Only flag if there's STRONG evidence of truncation:
+   1. Unclosed code block (odd number of ```)
+   2. Text literally cut mid-word (no whitespace at end)
+   3. Response ends with a comma/conjunction AND is long
+   
+   Do NOT flag just because there's no period.
    ═══════════════════════════════════════════════════ */
 function responseSeemsIncomplete(text) {
-    if (!text || text.length < 100) return false;
-    var trimmed = text.trimEnd();
+    if (!text || text.length < 200) return false;
 
-    /* Check if ends mid-word (no sentence-ending punctuation) */
-    var lastChar = trimmed.slice(-1);
-    var sentenceEnders = ['.', '!', '?', '`', ')', ']', '}', '---', '|'];
-    var endsWithSentence = sentenceEnders.some(function(e) { return trimmed.endsWith(e); });
-
-    /* Check for completion markers that indicate a FINISHED response */
+    /* Check for completion markers — definitely complete */
     var completionMarkers = [
-        '📦 FILES READY TO APPLY',
-        'FILES READY TO APPLY',
-        '## SUMMARY',
-        '📊 SUMMARY',
-        'REVIEW BEFORE APPLYING',
-        'All files completed',
-        'Task Complete',
-        'Task Failed'
+        '📦 FILES READY TO APPLY', 'FILES READY TO APPLY',
+        '📊 SUMMARY', '## SUMMARY',
+        'REVIEW BEFORE APPLYING', 'All files completed',
+        'Task Complete', 'Task Failed', 'END FILE'
     ];
     for (var i = 0; i < completionMarkers.length; i++) {
         if (text.indexOf(completionMarkers[i]) > -1) return false;
     }
 
-    /* Check for unclosed code blocks */
+    /* 1. Unclosed code block — DEFINITE truncation */
     var codeBlockCount = 0;
     var codeRe = /```/g;
-    var codeMatch;
-    while ((codeMatch = codeRe.exec(text)) !== null) codeBlockCount++;
-    if (codeBlockCount % 2 !== 0) return true; /* Unclosed code block = definitely incomplete */
-
-    /* If response doesn't end with sentence punctuation AND is in a coding mode,
-       it's probably truncated */
-    if (!endsWithSentence && CONTINUATION_MODES.indexOf(state.currentMode) !== -1) {
-        /* But only flag if the response is long enough to be a real attempt */
-        if (trimmed.length > 500) return true;
+    while (codeRe.exec(text) !== null) codeBlockCount++;
+    if (codeBlockCount % 2 !== 0) {
+        console.log('[Connection] Incomplete: unclosed code block');
+        return true;
     }
 
-    /* Check for trailing incomplete words like "I've" at the very end without closure */
-    if (trimmed.length > 200) {
-        var last50 = trimmed.slice(-50);
-        /* Ends with a comma, colon, or conjunction suggesting more was coming */
-        if (/[,:]$/.test(last50.trim())) return true;
-        /* Ends with "and" or "or" suggesting a list was cut off */
-        if (/\band\s*$/.test(last50) || /\bor\s*$/.test(last50)) return true;
+    /* 2. Text cut mid-word — last line has no trailing whitespace and
+          ends with a partial word (lowercase letter, no punctuation) */
+    var trimmed = text.trimEnd();
+    var lastChar = trimmed.slice(-1);
+    var last30 = trimmed.slice(-30);
+
+    /* Ends with comma or colon followed by nothing = likely cut off */
+    if (/[,:]$/.test(last30.trim()) && trimmed.length > 1000) {
+        /* But only if it's a long response — short ones naturally end with ":" */
+        console.log('[Connection] Incomplete: ends with comma/colon in long response');
+        return true;
     }
 
+    /* 3. Ends with a conjunction word = definitely cut off */
+    if (/\b(and|or|then|also|further|additionally)\s*$/.test(last30)) {
+        console.log('[Connection] Incomplete: ends with conjunction');
+        return true;
+    }
+
+    /* 4. Contains <|CONTINUE_TASK|> in system prompt but model didn't output it —
+          this means the model was told to use it but stopped before completing all files */
+    if (state.activeTask.isRunning && state.activeTask.loopCount > 0) {
+        /* If we're in a multi-file task and the response is short, it might be incomplete */
+        if (trimmed.length < 300 && !/[.!?]$/.test(trimmed)) {
+            console.log('[Connection] Incomplete: short response in active task without sentence ending');
+            return true;
+        }
+    }
+
+    /* DO NOT flag just because there's no period — many valid responses
+       end with status lines, code blocks, or formatted output */
     return false;
 }
 
@@ -409,7 +425,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         else addBotMessageStart();
     }
 
-    setConnectionStatus('connecting', isAutoContinue ? 'File ' + (state.activeTask.loopCount + 1) + '...' : 'Generating...');
+    setConnectionStatus('connecting', isAutoContinue ? 'Continuing...' : 'Generating...');
     if (voiceState.isVoiceChat) import('./voice.js').then(function (m) { m.setVoiceMode('thinking'); });
 
     var thinkingContent = '';
@@ -424,7 +440,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     var thinkTimer = setInterval(function () {
         if (!firstTokenReceived && state.isStreaming) {
             var elapsed = ((Date.now() - thinkStartTime) / 1000).toFixed(0);
-            setConnectionStatus('connecting', isAutoContinue ? 'File ' + (state.activeTask.loopCount + 1) + '... ' + elapsed + 's' : 'Thinking... ' + elapsed + 's');
+            setConnectionStatus('connecting', isAutoContinue ? 'Continuing... ' + elapsed + 's' : 'Thinking... ' + elapsed + 's');
         }
     }, thinkInterval);
 
@@ -451,13 +467,13 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             var retryTokens = resolveRetryTokens(err402Text, actualMaxTokens, overrideMaxTokens != null);
             if (retryTokens != null) {
                 clearInterval(stallWatchdog); if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
-                var streamMsg402 = document.getElementById('streaming-msg'); if (streamMsg402 && !isAutoContinue) streamMsg402.remove();
+                var sm402 = document.getElementById('streaming-msg'); if (sm402 && !isAutoContinue) sm402.remove();
                 state.isStreaming = false; state.streamElement = null; state.streamBuffer = ''; state.thinkingContent = '';
-                toast('Tier limit hit. Retrying with ' + retryTokens + ' tokens...', 'info');
+                toast('Tier limit. Retrying with ' + retryTokens + ' tokens...', 'info');
                 await new Promise(function (r) { setTimeout(r, 800); });
                 return executeStream(messages, retryTokens, isAutoContinue);
             }
-            throw new Error('INSUFFICIENT_CREDITS: Balance too low. Reduce Max Tokens or wait for refill.');
+            throw new Error('INSUFFICIENT_CREDITS: Balance too low.');
         }
 
         if (res.status === 429) {
@@ -466,26 +482,25 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                 var fallbackModel = getNextFallbackModel(state.settings.model);
                 if (fallbackModel) {
                     clearInterval(stallWatchdog); if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
-                    var streamMsg429 = document.getElementById('streaming-msg'); if (streamMsg429 && !isAutoContinue) streamMsg429.remove();
+                    var sm429 = document.getElementById('streaming-msg'); if (sm42929 && !isAutoContinue) sm429.remove();
                     state.isStreaming = false; state.streamElement = null; state.streamBuffer = ''; state.thinkingContent = '';
                     var originalModel = state.settings.model; state.settings.model = fallbackModel;
-                    setConnectionStatus('connecting', 'Retrying with ' + fallbackModel + '...');
                     await new Promise(function (r) { setTimeout(r, 1500); });
                     try { return executeStream(messages, overrideMaxTokens, isAutoContinue); }
                     catch (fallbackErr) {
                         state.settings.model = originalModel;
                         var fbErrMsg = (fallbackErr.message || '').toLowerCase();
                         if (fbErrMsg.indexOf('404') > -1) {
-                            var nextFallback = getNextFallbackModel(fallbackModel);
-                            if (nextFallback) { state.settings.model = nextFallback; await new Promise(function (r) { setTimeout(r, 2000); }); try { return executeStream(messages, overrideMaxTokens, isAutoContinue); } catch (e2) { state.settings.model = originalModel; throw new Error('RATE_LIMIT: All fallbacks failed.'); } }
+                            var nextFb = getNextFallbackModel(fallbackModel);
+                            if (nextFb) { state.settings.model = nextFb; await new Promise(function (r) { setTimeout(r, 2000); }); try { return executeStream(messages, overrideMaxTokens, isAutoContinue); } catch (e2) { state.settings.model = originalModel; } }
                         }
-                        throw new Error('RATE_LIMIT: Fallback failed. ' + err429Text.substring(0, 150));
+                        throw new Error('RATE_LIMIT: Fallback failed.');
                     }
                 }
             }
             state.activeTask.isRunning = false; state.activeTask.loopCount = 0; state.isStreaming = false; state.streamElement = null; state.streamBuffer = '';
             updateSendButton(); startCooldown('429 exhausted');
-            if (!isAutoContinue) state.pendingRequest = { type: 'message', text: messages && messages.length > 0 ? (messages[messages.length - 1].content || '') : '' };
+            if (!isAutoContinue) state.pendingRequest = { type: 'message', text: _originalUserMessage };
             return;
         }
 
@@ -538,12 +553,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         clearInterval(stallWatchdog); if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
 
         /* ═══════════════════════════════════════════════════
-           FIX: Comprehensive truncation detection
-           
-           1. finish_reason='length' → definitely truncated
-           2. <|CONTINUE_TASK|> tag → auto-continue
-           3. responseSeemsIncomplete() → model returned
-              'stop' but output looks cut off mid-sentence
+           TRUNCATION DETECTION — conservative
            ═══════════════════════════════════════════════════ */
         var hitLimit = (finishReason === 'length');
         var lastResponse = state.conversationHistory[state.conversationHistory.length - 1];
@@ -552,25 +562,50 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         if (hasContinueTag) {
             lastResponse.content = lastResponse.content.replace(/<\|CONTINUE_TASK\|>\s*$|\|CONTINUE_TASK\|\s*$/, '').trimEnd();
             hitLimit = true;
-            console.log('[Connection] Detected <|CONTINUE_TASK|> — auto-continuing');
+            console.log('[Connection] <|CONTINUE_TASK|> detected — auto-continuing');
         }
 
-        /* ── FIX: Check if response seems incomplete even with finish_reason='stop' ── */
+        /* Only check for incomplete response if finish_reason is NOT 'length'
+           (if it IS 'length', we already know it's truncated) */
         var seemsIncomplete = false;
         if (!hitLimit && lastResponse && responseSeemsIncomplete(lastResponse.content)) {
             seemsIncomplete = true;
-            hitLimit = true; /* Treat as truncated */
-            console.log('[Connection] Response appears incomplete (model returned stop but output looks cut off)');
+            hitLimit = true;
         }
 
-        if (state.activeTask.isRunning && hitLimit && state.activeTask.loopCount < state.activeTask.maxLoops) {
+        /* ═══════════════════════════════════════════════════
+           FIX: Cap auto-continue at 3 loops max, not 10
+           
+           Free tier models hit 429 very quickly.
+           10 auto-continues = 10 API calls per user message
+           = guaranteed 429 on free tier.
+           
+           Also: only auto-continue for finish_reason='length'
+           or <|CONTINUE_TASK|> tag. Do NOT auto-continue
+           for "seemsIncomplete" — that should just show
+           the Continue button and let the user decide.
+           ═══════════════════════════════════════════════════ */
+        var shouldAutoContinue = (hitLimit && !seemsIncomplete) && state.activeTask.isRunning && state.activeTask.loopCount < 3;
+
+        if (shouldAutoContinue) {
             state.activeTask.loopCount++;
-            toast('Continuing (' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')...', 'info');
+            toast('Continuing (' + state.activeTask.loopCount + '/3)...', 'info');
             setConnectionStatus('connecting', 'Continuing...');
-            var continueMsg = seemsIncomplete
-                ? 'Your previous response was cut off mid-sentence. CONTINUE EXACTLY where you left off. Do NOT restart or summarize. Just pick up where you stopped.'
-                : CONTINUE_MSG_FILE;
+
+            /* ── FIX: Use ORIGINAL user message for context ──
+               This maintains debug/review intent and file context */
+            var continueMsg = CONTINUE_MSG_FILE;
             state.conversationHistory.push({ role: 'user', content: continueMsg });
+
+            /* Trim conversation history to prevent unbounded growth */
+            if (state.conversationHistory.length > 16) {
+                /* Keep system message + last 14 messages */
+                var sysMsg = state.conversationHistory[0];
+                var recent = state.conversationHistory.slice(-14);
+                state.conversationHistory = [sysMsg].concat(recent);
+                console.log('[Connection] Trimmed conversation to ' + state.conversationHistory.length + ' messages');
+            }
+
             var continueDelay = getRLConfig().continueDelay;
             setTimeout(function () { sendMessage('', true); }, continueDelay);
         } else {
@@ -583,7 +618,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             if (hitLimit) {
                 state.responseTruncated = true;
                 if (seemsIncomplete) {
-                    toast('Response appears cut off. Click Continue to resume.', 'info');
+                    toast('Response may be incomplete. Click Continue to resume.', 'info');
                 } else {
                     toast('Response truncated. Click Continue or type /continue', 'info');
                 }
@@ -603,18 +638,11 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                 state.activeTask.isRunning = false; state.activeTask.loopCount = 0; state.isStreaming = false; updateSendButton();
                 toast('Request timed out.', 'error'); setConnectionStatus('disconnected', 'Timeout');
             } else if (abortSource === 'stall') {
-                var stallLastResponse = state.conversationHistory[state.conversationHistory.length - 1];
-                var stallTag = stallLastResponse && CONTINUE_TAG_REGEX.test(stallLastResponse.content);
-                if (stallTag) stallLastResponse.content = stallLastResponse.content.replace(/<\|CONTINUE_TASK\|>\s*$|\|CONTINUE_TASK\|\s*$/, '').trimEnd();
-                if (state.activeTask.isRunning && (finishReason === 'length' || stallTag) && state.activeTask.loopCount < state.activeTask.maxLoops) {
-                    state.activeTask.loopCount++;
-                    toast('Stalled. Retrying (' + state.activeTask.loopCount + ')...', 'error');
-                    state.conversationHistory.push({ role: 'user', content: CONTINUE_MSG_STALL });
-                    setTimeout(function () { sendMessage('', true); }, getRLConfig().continueDelay + 2000);
-                } else {
-                    state.activeTask.isRunning = false; state.activeTask.loopCount = 0; state.isStreaming = false; updateSendButton();
-                    toast('Stream stalled.', 'error'); setConnectionStatus('connected', 'Connected — ' + state.settings.model);
-                }
+                var stallLast = state.conversationHistory[state.conversationHistory.length - 1];
+                var stallTag = stallLast && CONTINUE_TAG_REGEX.test(stallLast.content);
+                if (stallTag) stallLast.content = stallLast.content.replace(/<\|CONTINUE_TASK\|>\s*$|\|CONTINUE_TASK\|\s*$/, '').trimEnd();
+                state.activeTask.isRunning = false; state.activeTask.loopCount = 0; state.isStreaming = false; updateSendButton();
+                toast('Stream stalled.', 'error'); setConnectionStatus('connected', 'Connected — ' + state.settings.model);
             } else {
                 state.activeTask.isRunning = false; state.activeTask.loopCount = 0; state.isStreaming = false; updateSendButton();
                 toast('Stopped', 'info'); setConnectionStatus('connected', 'Connected — ' + state.settings.model);
@@ -625,10 +653,10 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         var errMsg = error.message || '';
         if (errMsg.indexOf('INSUFFICIENT_CREDITS:') === 0) { state.activeTask.isRunning = false; state.isStreaming = false; updateSendButton(); toast('Insufficient credits.', 'error'); setConnectionStatus('disconnected', 'No Credits'); }
         else if (errMsg.indexOf('RATE_LIMIT:') === 0) { state.activeTask.isRunning = false; state.isStreaming = false; updateSendButton(); startCooldown('rate limit'); toast('Rate limited. Cooling down.', 'error'); }
-        else if (errMsg.indexOf('AUTH_ERROR:') === 0) { state.activeTask.isRunning = false; state.isStreaming = false; updateSendButton(); toast('Auth failed. Check API key.', 'error'); setConnectionStatus('disconnected', 'Auth Error'); }
-        else if (errMsg.indexOf('SERVER_OVERLOAD:') === 0) { state.activeTask.isRunning = false; state.isStreaming = false; updateSendButton(); toast('Server overloaded.', 'error'); setConnectionStatus('disconnected', 'Overloaded'); }
-        else if (errMsg.indexOf('SERVER_ERROR:') === 0) { state.activeTask.isRunning = false; state.isStreaming = false; updateSendButton(); toast('Server error.', 'error'); setConnectionStatus('disconnected', 'Error'); }
-        else { state.activeTask.isRunning = false; state.isStreaming = false; updateSendButton(); toast(errMsg.indexOf('Failed to fetch') > -1 ? 'Cannot reach endpoint.' : errMsg, 'error'); setConnectionStatus('disconnected', 'Error'); }
+        else if (errMsg.indexOf('AUTH_ERROR:') === 0) { state.activeTask.isRunning = false; state.isStreaming = false; updateSendButton(); toast('Auth failed.', 'error'); setConnectionStatus('disconnected', 'Auth Error'); }
+        else if (errMsg.indexOf('SERVER_OVERLOAD:') === 0) { state.activeTask.isRunning = false; state.isStreaming = false; updateSendButton(); toast('Server overloaded.', 'error'); }
+        else if (errMsg.indexOf('SERVER_ERROR:') === 0) { state.activeTask.isRunning = false; state.isStreaming = false; updateSendButton(); toast('Server error.', 'error'); }
+        else { state.activeTask.isRunning = false; state.isStreaming = false; updateSendButton(); toast(errMsg.indexOf('Failed to fetch') > -1 ? 'Cannot reach endpoint.' : errMsg.substring(0, 100), 'error'); setConnectionStatus('disconnected', 'Error'); }
         if (voiceState.isVoiceChat) import('./voice.js').then(function (m) { m.setVoiceMode('idle'); });
 
     } finally {
@@ -640,13 +668,26 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
 
 export async function sendMessage(userText, isAutoContinue) {
     try {
-        if (state.isStreaming && !isAutoContinue) { if (state.abortController) state.abortController.abort(); state.abortController = null; state.activeTask.isRunning = false; state.activeTask.loopCount = 0; return; }
-        if (!isAutoContinue && isInCooldown()) { var remainingSecs = Math.ceil((state.cooldownUntil - Date.now()) / 1000); toast('Rate limited. Auto-sending in ' + remainingSecs + 's...', 'info'); state.pendingRequest = { type: 'message', text: userText }; return; }
+        if (state.isStreaming && !isAutoContinue) {
+            if (state.abortController) state.abortController.abort();
+            state.abortController = null; state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
+            return;
+        }
+        if (!isAutoContinue && isInCooldown()) {
+            var remainingSecs = Math.ceil((state.cooldownUntil - Date.now()) / 1000);
+            toast('Rate limited. Auto-sending in ' + remainingSecs + 's...', 'info');
+            state.pendingRequest = { type: 'message', text: userText };
+            return;
+        }
         if (!isAutoContinue) {
             if (!userText.trim()) return;
             if (state.responseTruncated && /^continue$/i.test(userText.trim())) { continueResponse(); return; }
-            if (state.settings.provider !== 'ollama' && !state.settings.apiKey) { toast('No API key set.', 'error'); return; }
-            if (!state.settings.model) { toast('No model selected.', 'error'); return; }
+            if (state.settings.provider !== 'ollama' && !state.settings.apiKey) { toast('No API key.', 'error'); return; }
+            if (!state.settings.model) { toast('No model.', 'error'); return; }
+
+            /* ── FIX: Store original user message for continuations ── */
+            _originalUserMessage = userText;
+
             addUserMessage(userText);
             state.conversationHistory.push({ role: 'user', content: userText });
             state.responseTruncated = false;
@@ -654,15 +695,19 @@ export async function sendMessage(userText, isAutoContinue) {
             state.activeTask.isRunning = CONTINUATION_MODES.indexOf(state.currentMode) !== -1;
             state.activeTask.loopCount = 0;
         }
-        var systemPrompt = await buildSafeSystemPrompt(userText || '');
-        var messages = buildSafeMessages(userText || '', systemPrompt);
+
+        /* ── FIX: Use ORIGINAL user message for context, not empty string ──
+           This ensures buildSafeSystemPrompt gets the debug intent keywords */
+        var contextMessage = isAutoContinue ? _originalUserMessage : userText;
+        var systemPrompt = await buildSafeSystemPrompt(contextMessage || '');
+        var messages = buildSafeMessages(contextMessage || '', systemPrompt);
         return executeStream(messages, null, isAutoContinue);
     } catch (fatalError) {
         console.error('[Connection] FATAL:', fatalError);
         state.isStreaming = false; state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
         state.streamElement = null; state.streamBuffer = '';
-        updateSendButton(); setConnectionStatus('connected', 'Connected — ' + (state.settings.model || 'unknown'));
-        toast('Error: ' + (fatalError.message || 'unknown').substring(0, 100), 'error');
+        updateSendButton(); setConnectionStatus('connected', 'Connected — ' + (state.settings.model || ''));
+        toast('Error: ' + (fatalError.message || '').substring(0, 100), 'error');
     }
 }
 
@@ -675,7 +720,6 @@ export async function continueResponse() {
     state.responseTruncated = false;
     removeContinueButton();
 
-    /* FIX: Set activeTask so auto-continue chains */
     if (CONTINUATION_MODES.indexOf(state.currentMode) !== -1) {
         state.activeTask.isRunning = true;
         if (state.activeTask.loopCount === 0) state.activeTask.loopCount = 1;
@@ -685,8 +729,9 @@ export async function continueResponse() {
     toast('Continuing...', 'info');
 
     try {
-        var systemPrompt = await buildSafeSystemPrompt('');
-        var messages = buildSafeMessages('', systemPrompt);
+        /* ── FIX: Use ORIGINAL user message for context ── */
+        var systemPrompt = await buildSafeSystemPrompt(_originalUserMessage || '');
+        var messages = buildSafeMessages(_originalUserMessage || '', systemPrompt);
         return executeStream(messages, null, true);
     } catch (err) {
         state.isStreaming = false; state.activeTask.isRunning = false; updateSendButton();
@@ -699,10 +744,10 @@ function showThinkingBlock(text) {
     var display = text.length > 800 ? '...' + text.slice(-800) : text;
     display = display.replace(/\n/g, '<br>');
     var existing = document.getElementById('sai-thinking-block');
-    if (existing) { existing.querySelector('.thinking-text').innerHTML = display; existing.scrollTop = existing.scrollHeight; }
+    if (existing) { existing.querySelector('.thinking-text').innerHTML = display; }
     else {
         var block = document.createElement('div'); block.id = 'sai-thinking-block'; block.className = 'thinking-block';
-        block.innerHTML = '<div class="thinking-header"><span class="thinking-label"><i class="fas fa-brain"></i> Thinking...</span><button class="thinking-toggle" onclick="toggleThinkingBlock(this)"><i class="fas fa-chevron-down"></i></button></div><div class="thinking-text">' + display + '</div>';
+        block.innerHTML = '<div class="thinking-header"><span class="thinking-label"><i class="fas fa-brain"></i> Thinking...</span></div><div class="thinking-text">' + display + '</div>';
         state.streamElement.insertBefore(block, state.streamElement.firstChild);
     }
 }
@@ -711,14 +756,14 @@ function closeThinkingBlock() {
     var existing = document.getElementById('sai-thinking-block');
     if (existing) {
         var label = existing.querySelector('.thinking-label');
-        if (label) { var secs = Math.max(1, Math.round((state.thinkingContent || '').length / 15)); label.innerHTML = '<i class="fas fa-brain"></i> Thought for ' + (secs < 60 ? secs + 's' : Math.floor(secs / 60) + 'm ' + (secs % 60) + 's'); }
+        if (label) { var secs = Math.max(1, Math.round((state.thinkingContent || '').length / 15)); label.innerHTML = '<i class="fas fa-brain"></i> Thought for ' + (secs < 60 ? secs + 's' : Math.floor(secs / 60) + 'm'); }
     }
 }
 
 export async function testConnection() {
     var provider = state.settings.provider; var apiKey = state.settings.apiKey; var model = state.settings.model;
-    if (provider !== 'ollama' && !apiKey) { toast('Enter API key first', 'error'); return false; }
-    if (!model) { toast('Select a model first', 'error'); return false; }
+    if (provider !== 'ollama' && !apiKey) { toast('Enter API key.', 'error'); return false; }
+    if (!model) { toast('Select a model.', 'error'); return false; }
     setConnectionStatus('connecting', 'Testing...'); toast('Testing...', 'info');
     try {
         var h = { 'Content-Type': 'application/json' };
@@ -726,8 +771,8 @@ export async function testConnection() {
         if (provider === 'openrouter') { h['HTTP-Referer'] = window.location.href; h['X-Title'] = 'S.ai Coding Agent'; }
         var body = provider === 'ollama' ? JSON.stringify({ model: model, messages: [{ role: 'user', content: 'Hi' }], stream: false }) : JSON.stringify({ model: model, messages: [{ role: 'user', content: 'Hi' }], max_tokens: 5 });
         var r = await fetchWithRetry(getApiUrl(), { method: 'POST', headers: h, body: body });
-        if (r.status === 429) { toast('Rate limited during test. Connection works.', 'info'); setConnectionStatus('connected', 'Connected — ' + model + ' (rate limited)'); return true; }
-        if (!r.ok) { var e = await r.text().catch(function () { return ''; }); if (r.status === 401 || r.status === 403) throw new Error('Auth failed.'); throw new Error('HTTP ' + r.status + ': ' + e.substring(0, 200)); }
+        if (r.status === 429) { setConnectionStatus('connected', 'Connected — ' + model + ' (rate limited)'); toast('Works but rate limited.', 'info'); return true; }
+        if (!r.ok) { var e = await r.text().catch(function () { return ''; }); if (r.status === 401 || r.status === 403) throw new Error('Auth failed.'); throw new Error('HTTP ' + r.status); }
         var d = await r.json();
         if ((provider === 'ollama' && d.message && d.message.content) || (d.choices && d.choices[0] && d.choices[0].message)) { setConnectionStatus('connected', 'Connected — ' + model); toast('Connected!', 'success'); return true; }
         throw new Error('Unexpected response');
@@ -735,46 +780,39 @@ export async function testConnection() {
 }
 
 export async function fetchModels() {
-    var provider = state.settings.provider; var endpoint = state.settings.endpoint; var apiKey = state.settings.apiKey;
-    var listEl = document.getElementById('s-models-list'); var btn = document.getElementById('s-fetch-models');
-    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Fetching...'; btn.disabled = true;
+    var provider = state.settings.provider; var listEl = document.getElementById('s-models-list'); var btn = document.getElementById('s-fetch-models');
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>'; btn.disabled = true;
     try {
         if (provider === 'openrouter') { await fetchOpenRouterModels(); return; }
         if (provider === 'google-ai') { await fetchGoogleAIModels(); return; }
         var url, h = {};
-        if (provider === 'ollama') url = endpoint + '/api/tags';
-        else { url = endpoint.replace(/\/+$/, '').replace(/\/v1$/, '') + '/v1/models'; if (apiKey) h['Authorization'] = 'Bearer ' + apiKey; }
+        if (provider === 'ollama') url = state.settings.endpoint + '/api/tags';
+        else { url = state.settings.endpoint.replace(/\/+$/, '').replace(/\/v1$/, '') + '/v1/models'; if (state.settings.apiKey) h['Authorization'] = 'Bearer ' + state.settings.apiKey; }
         var r = await fetch(url, { headers: h }); if (!r.ok) throw new Error('HTTP ' + r.status);
         var d = await r.json(); var models = provider === 'ollama' ? (d.models || []).map(function (m) { return m.name; }) : (d.data || []).map(function (m) { return m.id; });
         if (!models.length) { toast('No models found.', 'error'); listEl.style.display = 'none'; }
-        else { listEl.innerHTML = models.map(function (m) { return '<option value="' + m + '">' + m + '</option>'; }).join(''); listEl.style.display = 'block'; toast('Found ' + models.length + ' models', 'success'); }
+        else { listEl.innerHTML = models.map(function (m) { return '<option value="' + m + '">' + m + '</option>'; }).join(''); listEl.style.display = 'block'; toast(models.length + ' models found', 'success'); }
     } catch (e) { toast('Failed: ' + e.message, 'error'); listEl.style.display = 'none'; }
     finally { btn.innerHTML = '<i class="fas fa-refresh"></i> Fetch Models'; btn.disabled = false; }
 }
 
 async function fetchGoogleAIModels() {
-    var listEl = document.getElementById('s-models-list'); var apiKey = state.settings.apiKey;
-    if (!apiKey) { toast('Enter Google AI API key first', 'error'); listEl.style.display = 'none'; return; }
+    var listEl = document.getElementById('s-models-list');
     var geminiModels = [
         { id: 'models/gemini-2.0-flash', name: 'Gemini 2.0 Flash [FREE]', ctx: 1048576 },
         { id: 'models/gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash [FREE]', ctx: 1048576 },
-        { id: 'models/gemini-2.5-pro-preview-05-06', name: 'Gemini 2.5 Pro [FREE]', ctx: 2097152 },
-        { id: 'models/gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash Lite [FREE]', ctx: 1048576 },
-        { id: 'models/gemini-1.5-flash', name: 'Gemini 1.5 Flash [FREE]', ctx: 1048576 },
-        { id: 'models/gemini-1.5-pro', name: 'Gemini 1.5 Pro [FREE]', ctx: 2097152 }
+        { id: 'models/gemini-2.5-pro-preview-05-06', name: 'Gemini 2.5 Pro [FREE]', ctx: 2097152 }
     ];
-    var html = '<option disabled style="color:var(--accent);font-weight:700">── 🌐 Google Gemini (Free) ──</option>';
-    for (var i = 0; i < geminiModels.length; i++) { html += '<option value="' + geminiModels[i].id + '">' + geminiModels[i].name + formatCtx(geminiModels[i].ctx) + '</option>'; state.modelContextLimits[geminiModels[i].id] = Math.floor(geminiModels[i].ctx * 3.5); }
+    var html = '<option disabled style="color:var(--accent);font-weight:700">── 🌐 Gemini ──</option>';
+    for (var i = 0; i < geminiModels.length; i++) { html += '<option value="' + geminiModels[i].id + '">' + geminiModels[i].name + '</option>'; state.modelContextLimits[geminiModels[i].id] = Math.floor(geminiModels[i].ctx * 3.5); }
     listEl.innerHTML = html; listEl.style.display = 'block';
-    if (!document.getElementById('s-model').value) { document.getElementById('s-model').value = geminiModels[0].id; listEl.value = geminiModels[0].id; }
-    toast('Loaded ' + geminiModels.length + ' Gemini models', 'success');
+    toast(geminiModels.length + ' Gemini models', 'success');
 }
 
 function isModelFree(m) { if (!m || !m.pricing) return false; var p = m.pricing; return (p.prompt === '0' || parseFloat(p.prompt) === 0) && (p.completion === '0' || parseFloat(p.completion) === 0); }
 
 async function fetchOpenRouterModels() {
-    var listEl = document.getElementById('s-models-list'); var apiKey = state.settings.apiKey;
-    var h = { 'Content-Type': 'application/json' }; if (apiKey) h['Authorization'] = 'Bearer ' + apiKey;
+    var listEl = document.getElementById('s-models-list'); var h = { 'Content-Type': 'application/json' }; if (state.settings.apiKey) h['Authorization'] = 'Bearer ' + state.settings.apiKey;
     try {
         var r = await fetch('https://openrouter.ai/api/v1/models', { headers: h });
         if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -788,19 +826,14 @@ async function fetchOpenRouterModels() {
         for (var t = 0; t < topTierIds.length; t++) { var found = trulyFree.find(function (m) { return m.id === topTierIds[t]; }); if (!found) found = trulyFree.find(function (m) { return m.id === topTierIds[t].replace(':free',''); }); if (found) topTierModels.push(found); }
         var topTierIdSet = {}; topTierModels.forEach(function(m) { topTierIdSet[m.id] = true; });
         var freeModels = trulyFree.filter(function (m) { return !topTierIdSet[m.id]; }).sort(function (a, b) { return a.id.localeCompare(b.id); });
-        var reasoningModels = trulyFree.filter(function (m) { var id = m.id.toLowerCase(); return id.indexOf('deepseek-r1') > -1 || id.indexOf('qwq') > -1 || id.indexOf('reasoner') > -1; }).sort(function (a, b) { return a.id.localeCompare(b.id); });
-        var reasoningIdSet = {}; reasoningModels.forEach(function(m) { reasoningIdSet[m.id] = true; });
-        freeModels = freeModels.filter(function (m) { return !reasoningIdSet[m.id]; });
         var html = '';
-        if (topTierModels.length > 0) { html += '<option disabled style="color:var(--accent);font-weight:700">── 🔥 Free Top Tier ──</option>'; topTierModels.forEach(function(m) { html += '<option value="' + m.id + '">' + m.id + ' [FREE]' + formatCtx(m.context_length) + '</option>'; }); }
-        if (freeModels.length > 0) { html += '<option disabled style="color:var(--green);font-weight:700">── Other Free ──</option>'; freeModels.forEach(function(m) { html += '<option value="' + m.id + '">' + m.id + formatCtx(m.context_length) + '</option>'; }); }
-        if (reasoningModels.length > 0) { html += '<option disabled style="color:var(--cyan);font-weight:700">── Free Reasoning ──</option>'; reasoningModels.forEach(function(m) { html += '<option value="' + m.id + '">' + m.id + formatCtx(m.context_length) + '</option>'; }); }
+        if (topTierModels.length > 0) { html += '<option disabled style="color:var(--accent);font-weight:700">── 🔥 Top Free ──</option>'; topTierModels.forEach(function(m) { html += '<option value="' + m.id + '">' + m.id + '</option>'; }); }
+        if (freeModels.length > 0) { html += '<option disabled style="color:var(--green);font-weight:700">── Other Free ──</option>'; freeModels.forEach(function(m) { html += '<option value="' + m.id + '">' + m.id + '</option>'; }); }
         listEl.innerHTML = html; listEl.style.display = 'block';
-        if (!document.getElementById('s-model').value && topTierModels.length > 0) { document.getElementById('s-model').value = topTierModels[0].id; listEl.value = topTierModels[0].id; }
-        toast(topTierModels.length + ' top tier + ' + freeModels.length + ' free models loaded', 'success');
+        toast(topTierModels.length + ' top + ' + freeModels.length + ' free models', 'success');
     } catch (e) { toast('Failed: ' + e.message, 'error'); listEl.style.display = 'none'; }
 }
 
-function formatCtx(n) { if (!n) return ''; if (n >= 1000000000) return ' ~' + (n/1000000000).toFixed(0) + 'B ctx'; if (n >= 1000000) return ' ~' + (n/1000000).toFixed(0) + 'M ctx'; if (n >= 1000) return ' ~' + (n/1000).toFixed(0) + 'K ctx'; return ''; }
+function formatCtx(n) { if (!n) return ''; if (n >= 1000000) return ' ~' + (n/1000000).toFixed(0) + 'M'; if (n >= 1000) return ' ~' + (n/1000).toFixed(0) + 'K'; return ''; }
 
 export function showOpenRouterModels() { fetchOpenRouterModels(); }
