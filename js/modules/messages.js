@@ -1,6 +1,7 @@
 
 /* ═══════════════════════════════════════════════════
    MESSAGES — Rendering, streaming, actions
+   Advanced rendering with collapsible phases
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { parseMarkdown } from './markdown.js';
@@ -92,7 +93,6 @@ export function addBotMessageStart() {
     streamTextNode = null;
     lastRenderTime = 0;
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
-
     receivedAnyRealText = false;
 
     fastScroll();
@@ -104,13 +104,9 @@ export function appendStreamChunk(chunk) {
     if (chunk.length === 0) return;
 
     receivedAnyRealText = true;
-
     state.streamBuffer += chunk;
 
-    /* ── FIX: Count triple backticks correctly, including when split across chunks ──
-       OLD BUG: Only checked characters within a single chunk. If "``" was at the end
-       of one chunk and "`" at the start of the next, the transition was missed.
-       NEW: Count in the full buffer instead. */
+    /* Count backticks in full buffer for code block detection */
     backtickCount = 0;
     var buf = state.streamBuffer;
     for (var bi = 0; bi < buf.length - 2; bi++) {
@@ -135,6 +131,7 @@ export function appendStreamChunk(chunk) {
 
             if (!state.streamElement) return;
 
+            /* Remove thinking block during streaming (non-Ollama) */
             if (!isOllamaSession()) {
                 var thinkBlock = state.streamElement.querySelector('.thinking-block');
                 if (thinkBlock) thinkBlock.remove();
@@ -168,7 +165,7 @@ export function appendStreamChunk(chunk) {
 function clearNonThinkingChildren(container) {
     var children = Array.from(container.children);
     for (var i = 0; i < children.length; i++) {
-        if (!children[i].classList.contains('thinking-block')) {
+        if (!children[i].classList.contains('thinking-block') && !children[i].classList.contains('thinking-phase')) {
             children[i].remove();
         }
     }
@@ -188,35 +185,13 @@ function removeCursor(container) {
     if (cursor) cursor.remove();
 }
 
-function buildFinalThinkingBlock(text) {
-    if (!text || text.length < 10) return '';
-    if (isOllamaSession()) return '';
-    var display = text.length > 1200 ? '...' + text.slice(-1200) : text;
-    display = escapeHtml(display).replace(/\n/g, '<br>');
-    var timeStr = formatThinkTimeChars(text.length);
-    var uid = 'think-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6);
-
-    return '<div class="thinking-block" id="' + uid + '">' +
-        '<div class="thinking-header">' +
-        '<span class="thinking-label"><i class="fas fa-brain"></i> Thought for ' + timeStr + '</span>' +
-        '<button class="thinking-toggle" onclick="toggleThinkingBlock(this)" title="Toggle thinking"><i class="fas fa-chevron-right"></i></button>' +
-        '</div>' +
-        '<div class="thinking-text" style="display:none;max-height:300px;overflow-y:auto">' + display + '</div>' +
-        '</div>';
-}
-
-function formatThinkTimeChars(charCount) {
-    var secs = Math.max(1, Math.round(charCount / 15));
-    if (secs < 60) return secs + 's';
-    var mins = Math.floor(secs / 60);
-    var remSecs = secs % 60;
-    return mins + 'm ' + remSecs + 's';
-}
-
+/* ═══════════════════════════════════════════════════
+   FINALIZE — Render the complete message
+   with collapsible thinking/reading phase
+   ═══════════════════════════════════════════════════ */
 export function finalizeStream() {
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
     state.isRenderScheduled = false;
-
     backtickCount = 0;
     streamPre = null;
     streamTextNode = null;
@@ -228,34 +203,36 @@ export function finalizeStream() {
         var clean = state.streamBuffer.replace(/^[\u0000-\u001F\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\uFFFD]+/, '');
 
         if (clean.length === 0 && receivedAnyRealText) {
-            console.warn('[Messages] Buffer empty but data was received. Recovery...');
-            if (state.thinkingContent && state.thinkingContent.length > 10) {
-                clean = '⚠️ The model returned only internal reasoning with no response. Try again or switch models.';
-            } else {
-                clean = '⚠️ The model returned an empty response. Try again or switch models.';
-            }
+            clean = state.thinkingContent && state.thinkingContent.length > 10
+                ? '⚠️ The model returned only reasoning with no visible response. Try again or switch models.'
+                : '⚠️ Empty response received. Try again.';
         }
-
-        /* ── FIX: Also check for empty buffer with NO real text (connection died) ── */
         if (clean.length === 0 && !receivedAnyRealText) {
-            clean = '⚠️ No response received. The connection may have been interrupted. Try again.';
+            clean = '⚠️ No response received. Connection may have been interrupted.';
         }
 
+        /* ── Build thinking block if we have reasoning content ── */
         var thinkHtml = '';
-        if (state.thinkingContent && state.thinkingContent.length > 10) {
+        if (state.thinkingContent && state.thinkingContent.length > 10 && !isOllamaSession()) {
             thinkHtml = buildFinalThinkingBlock(state.thinkingContent);
         }
         state.thinkingContent = '';
 
-        state.streamElement.innerHTML = thinkHtml + parseMarkdown(clean);
+        /* ── Parse the full response with advanced markdown ── */
+        var renderedContent = parseMarkdown(clean);
 
+        /* ── Wrap reading/plan sections in collapsible phase blocks ── */
+        renderedContent = wrapThinkingPhases(renderedContent, clean);
+
+        state.streamElement.innerHTML = thinkHtml + renderedContent;
+
+        /* Defer code highlighting */
         var el = state.streamElement;
-        requestAnimationFrame(function () {
-            highlightCodeBlocks(el);
-        });
+        requestAnimationFrame(function () { highlightCodeBlocks(el); });
 
         state.conversationHistory.push({ role: 'assistant', content: clean });
 
+        /* Voice chat TTS */
         if (voiceState.isVoiceChat) {
             import('./voice.js').then(function (m) {
                 m.stopListening();
@@ -280,23 +257,138 @@ export function finalizeStream() {
     }
 }
 
+/* ═══════════════════════════════════════════════════
+   WRAP THINKING PHASES
+   Detects the "plan + reading files" section at the
+   top of a response and wraps it in a collapsible
+   block so the user sees a compact summary instead
+   of a wall of text.
+   ═══════════════════════════════════════════════════ */
+function wrapThinkingPhases(html, rawText) {
+    /* Only wrap if the response starts with a plan or reading phase */
+    var hasPlan = rawText.indexOf('📋') > -1 || /\bPLAN\b/i.test(rawText.substring(0, 500));
+    var hasReading = rawText.indexOf('📁') > -1 || /\bWORKING ON\b/i.test(rawText.substring(0, 500));
+    var hasChecklist = rawText.indexOf('☐') > -1;
+
+    if (!hasPlan && !hasReading && !hasChecklist) return html;
+
+    /* Find where the "real output" starts — typically after the last
+       status line or before the first file:block code section */
+    var phaseEndMarker = null;
+    var markers = [
+        '📊 SUMMARY',
+        '📦 FILES READY',
+        'REVIEW BEFORE APPLYING',
+        'FILES READY TO APPLY',
+        '## Findings',
+        '## Bugs Found',
+        '## Issues',
+        '## Results',
+        '🐛',
+        '🔴',
+        'Bug #',
+        'Issue #',
+        '```file:'
+    ];
+
+    for (var m = 0; m < markers.length; m++) {
+        var idx = rawText.indexOf(markers[m]);
+        if (idx > -1 && (phaseEndMarker === null || idx < phaseEndMarker)) {
+            phaseEndMarker = idx;
+        }
+    }
+
+    /* If no end marker found, don't wrap — it's all one section */
+    if (phaseEndMarker === null || phaseEndMarker < 100) return html;
+
+    var phaseText = rawText.substring(0, phaseEndMarker);
+    var outputText = rawText.substring(phaseEndMarker);
+
+    /* Count items in the phase */
+    var stepCount = (phaseText.match(/☐/g) || []).length;
+    var fileCount = (phaseText.match(/📁/g) || []).length;
+    var doneCount = (phaseText.match(/✅/g) || []).length;
+
+    var phaseLabel = 'Reading & Planning';
+    if (stepCount > 0) phaseLabel = stepCount + ' steps planned';
+    if (fileCount > 0) phaseLabel += ' · ' + fileCount + ' files read';
+    if (doneCount > 0) phaseLabel += ' · ' + doneCount + ' complete';
+
+    var uid = 'phase-' + Date.now();
+
+    /* Render the phase section as collapsed by default */
+    var phaseHtml = '<div class="thinking-phase" id="' + uid + '">' +
+        '<div class="thinking-phase-header" onclick="toggleThinkingPhase(\'' + uid + '\')">' +
+        '<span class="phase-icon"><i class="fas fa-route"></i></span>' +
+        '<span class="phase-label">' + phaseLabel + '</span>' +
+        '<span class="phase-toggle collapsed"><i class="fas fa-chevron-down"></i></span>' +
+        '</div>' +
+        '<div class="thinking-phase-body collapsed">' +
+        parseMarkdown(phaseText) +
+        '</div></div>';
+
+    /* Render the output section normally */
+    var outputHtml = parseMarkdown(outputText);
+
+    return phaseHtml + outputHtml;
+}
+
+/* ── Thinking block for reasoning models ── */
+function buildFinalThinkingBlock(text) {
+    if (!text || text.length < 10) return '';
+    if (isOllamaSession()) return '';
+    var display = text.length > 1200 ? '...' + text.slice(-1200) : text;
+    display = escapeHtml(display).replace(/\n/g, '<br>');
+    var secs = Math.max(1, Math.round(text.length / 15));
+    var timeStr = secs < 60 ? secs + 's' : Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
+    var uid = 'think-' + Date.now();
+
+    return '<div class="thinking-phase" id="' + uid + '">' +
+        '<div class="thinking-phase-header" onclick="toggleThinkingPhase(\'' + uid + '\')">' +
+        '<span class="phase-icon"><i class="fas fa-brain"></i></span>' +
+        '<span class="phase-label">Thought for ' + timeStr + '</span>' +
+        '<span class="phase-toggle collapsed"><i class="fas fa-chevron-down"></i></span>' +
+        '</div>' +
+        '<div class="thinking-phase-body collapsed">' + display + '</div>' +
+        '</div>';
+}
+
+/* ── Global toggle for thinking/phase blocks ── */
+window.toggleThinkingPhase = function (uid) {
+    var block = document.getElementById(uid);
+    if (!block) return;
+    var body = block.querySelector('.thinking-phase-body');
+    var toggle = block.querySelector('.phase-toggle');
+    if (!body || !toggle) return;
+
+    if (body.classList.contains('collapsed')) {
+        body.classList.remove('collapsed');
+        toggle.classList.remove('collapsed');
+    } else {
+        body.classList.add('collapsed');
+        toggle.classList.add('collapsed');
+    }
+};
+
+/* Keep the old toggle for backward compat */
 window.toggleThinkingBlock = function (el) {
     var block;
-    if (el && el.closest) {
-        block = el.closest('.thinking-block');
-    } else {
-        block = document.getElementById('sai-thinking-block');
-    }
+    if (el && el.closest) block = el.closest('.thinking-phase') || el.closest('.thinking-block');
+    else block = document.getElementById('sai-thinking-block');
     if (!block) return;
-    var textEl = block.querySelector('.thinking-text');
-    var icon = block.querySelector('.thinking-toggle i');
-    if (!textEl || !icon) return;
-    if (textEl.style.display === 'none') {
-        textEl.style.display = 'block';
-        icon.className = 'fas fa-chevron-down';
+
+    var body = block.querySelector('.thinking-phase-body') || block.querySelector('.thinking-text');
+    var toggle = block.querySelector('.phase-toggle') || block.querySelector('.thinking-toggle i');
+    if (!body) return;
+
+    if (body.style.display === 'none' || body.classList.contains('collapsed')) {
+        body.style.display = '';
+        body.classList.remove('collapsed');
+        if (toggle) { toggle.classList.remove('collapsed'); toggle.className = 'fas fa-chevron-down'; }
     } else {
-        textEl.style.display = 'none';
-        icon.className = 'fas fa-chevron-right';
+        body.style.display = 'none';
+        body.classList.add('collapsed');
+        if (toggle) { toggle.classList.add('collapsed'); toggle.className = 'fas fa-chevron-right'; }
     }
 };
 
@@ -329,11 +421,9 @@ export function updateSendButton() {
     if (state.isStreaming) {
         btn.classList.add('stop');
         btn.innerHTML = '<i class="fas fa-stop"></i>';
-        if (state.activeTask.loopCount > 0) {
-            btn.title = 'Stop task (loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')';
-        } else {
-            btn.title = 'Stop generating';
-        }
+        btn.title = state.activeTask.loopCount > 0
+            ? 'Stop task (loop ' + state.activeTask.loopCount + '/' + state.activeTask.maxLoops + ')'
+            : 'Stop generating';
     } else {
         btn.classList.remove('stop');
         btn.innerHTML = '<i class="fas fa-arrow-up"></i>';
@@ -358,7 +448,6 @@ export function useAsInput(btn) {
     import('./ui.js').then(function (m) { m.toast('Code loaded into input', 'success'); });
 }
 
-/* ── Edit file code inline before applying ── */
 export function editFileCode(btn) {
     var block = btn.closest('.file-block');
     if (!block) return;
@@ -391,15 +480,12 @@ export function editFileCode(btn) {
     textarea.className = 'edit-textarea';
     textarea.value = currentCode;
     textarea.spellcheck = false;
-    textarea.style.cssText = 'width:100%;min-height:200px;background:var(--bg-secondary,#1a1a2e);color:var(--text,#e0e0e0);border:1px solid var(--accent,#00d4aa);border-radius:6px;padding:12px;font-family:"JetBrains Mono",monospace;font-size:0.85rem;resize:vertical;tab-size:4;box-sizing:border-box;outline:none;';
 
     if (pre) pre.style.display = 'none';
-    if (pre && pre.parentNode) {
-        pre.parentNode.insertBefore(textarea, pre);
-    }
+    if (pre && pre.parentNode) pre.parentNode.insertBefore(textarea, pre);
 
     btn.innerHTML = '<i class="fas fa-eye"></i> Preview';
-    btn.style.color = 'var(--accent,#00d4aa)';
+    btn.style.color = 'var(--accent)';
 
     textarea.addEventListener('keydown', function (e) {
         if (e.key === 'Tab') {
