@@ -313,6 +313,17 @@ function ensureMultiAgent() {
             maxCriticRejections: 2
         };
     }
+    /* ── BACKWARD COMPAT: auto-fix models missing `:free` suffix ──
+       Old saved settings may have models without `:free`, which causes 402 errors. */
+    if (state.settings.multiAgent.agentModels) {
+        var models = state.settings.multiAgent.agentModels;
+        for (var key in models) {
+            if (models[key] && models[key].indexOf('/') > -1 && models[key].indexOf(':free') === -1) {
+                console.warn('[UI] Auto-fixing multi-agent model: "' + models[key] + '" → "' + models[key] + ':free"');
+                models[key] = models[key] + ':free';
+            }
+        }
+    }
     if (!state.settings.multiAgent.agentModels) {
         state.settings.multiAgent.agentModels = {};
     }

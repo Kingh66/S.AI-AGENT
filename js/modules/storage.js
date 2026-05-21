@@ -16,8 +16,8 @@ var BAD_ENDPOINTS = [
 ];
 
 var DEAD_MODELS = {
-    'qwen/qwen-3.6-plus': 'xiaomi/mimo-v2-pro',
-    'openrouter/hunter-alpha': 'xiaomi/mimo-v2-pro'
+    'qwen/qwen-3.6-plus': 'xiaomi/mimo-v2-pro:free',
+    'openrouter/hunter-alpha': 'xiaomi/mimo-v2-pro:free'
 };
 
 /* ═══════════════════════════════════════
@@ -222,6 +222,24 @@ export function loadSettings() {
             state.settings.agentModels = Object.assign({}, MULTI_AGENT_CONFIG.agentModels, maParsed.agentModels || {});
             state.settings.maxCoderAttempts = maParsed.maxCoderAttempts || MULTI_AGENT_CONFIG.maxCoderAttempts;
             state.settings.maxCriticRejections = maParsed.maxCriticRejections || MULTI_AGENT_CONFIG.maxCriticRejections;
+
+            /* ── BACKWARD COMPAT: auto-fix models missing `:free` suffix ──
+               Old saved settings may have models without `:free`, which causes 402 errors. */
+            if (state.settings.agentModels) {
+                var agentModelsFixed = false;
+                for (var amKey in state.settings.agentModels) {
+                    var amVal = state.settings.agentModels[amKey];
+                    if (amVal && amVal.indexOf('/') > -1 && amVal.indexOf(':free') === -1) {
+                        console.warn('[Storage] Auto-fixing agent model: "' + amVal + '" → "' + amVal + ':free"');
+                        state.settings.agentModels[amKey] = amVal + ':free';
+                        agentModelsFixed = true;
+                    }
+                }
+                if (agentModelsFixed) {
+                    repaired = true;
+                    toast('Auto-fixed multi-agent models to use free tier', 'info');
+                }
+            }
 
             if (repairDeadModels()) {
                 repaired = true;

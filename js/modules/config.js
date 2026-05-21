@@ -162,8 +162,10 @@ export const FREE_MODEL_FALLBACKS = [
     'minimax/minimax-m2.5:free',
     'nvidia/nemotron-3-super:free',
     'google/gemma-3-27b-it:free',
+    'stepfun/step-3.5-flash:free',
     'meta-llama/llama-3.1-70b-instruct:free',
     'deepseek/deepseek-chat-v3-0324:free',
+    'z-ai/glm-5-turbo:free',
     'qwen/qwen3-235b-a22b:free'
 ];
 

@@ -16,8 +16,8 @@ export var AGENTS = {
     planner: {
         name: 'Planner',
         description: 'Task decomposition and architecture design',
-        defaultModel: 'deepseek/deepseek-chat-v3-0324:free',
-        fallbackModels: ['xiaomi/mimo-v2-pro', 'minimax/minimax-m2.7'],
+        defaultModel: 'xiaomi/mimo-v2-pro:free',
+        fallbackModels: ['minimax/minimax-m2.7:free', 'stepfun/step-3.5-flash:free'],
         maxTokens: 8192,
         prompt: 'You are S.ai\'s Planner agent. Your ONLY responsibility is to understand the task and create a detailed, step-by-step implementation plan.\n\nCRITICAL RULES:\n1. If a workspace file tree is provided, use it to understand the project structure\n2. Reference specific file paths in your plan\n3. Break complex tasks into 3-7 actionable steps\n4. Each step must be specific, testable, and independent\n5. Consider file structure, dependencies, and integration points\n6. Output format: EXACTLY this structure:\n\n## PLAN\n**Objective:** [Clear one-sentence goal]\n\n**Steps:**\n1. [Step 1 description - specific action, referencing actual files]\n2. [Step 2 description]\n3. ...\n\n**Files to create/modify:**\n- path/to/file.ext (purpose)\n- path/to/file.ext (purpose)\n\n**Dependencies:**\n- [List any external requirements]\n\n**Risks:**\n- [Potential issues and mitigation]\n\nNEVER write code. NEVER review code. ONLY plan.',
 
@@ -102,8 +102,8 @@ export var AGENTS = {
     coder: {
         name: 'Coder',
         description: 'Implementation based on plan',
-        defaultModel: 'xiaomi/mimo-v2-pro',
-        fallbackModels: ['stepfun/step-3.5-flash', 'minimax/minimax-m2.7', 'z-ai/glm-5-turbo'],
+        defaultModel: 'minimax/minimax-m2.7:free',
+        fallbackModels: ['xiaomi/mimo-v2-pro:free', 'stepfun/step-3.5-flash:free', 'z-ai/glm-5-turbo:free'],
         maxTokens: 4096,
         currentModel: null,
         prompt: 'You are S.ai\'s Coder agent. Your ONLY responsibility is to write complete, production-ready code based on the Planner\'s plan.\n\nCRITICAL RULES:\n1. Follow the plan EXACTLY - do not deviate\n2. If workspace files are provided, READ THEM to understand existing code\n3. When modifying existing files, output the COMPLETE file — never "...", "// rest unchanged"\n4. Every file must be self-contained and runnable\n5. Include all necessary imports, error handling, and edge cases\n6. For each file, output:\n\nfile:path/to/filename.ext\n// FULL FILE CONTENT - NO OMISSIONS\n[complete code]\n\n7. NEVER hallucinate imports\n8. After writing ALL files, add: <|INTEGRATION_CHECK|>',
@@ -129,8 +129,8 @@ export var AGENTS = {
     critic: {
         name: 'Critic',
         description: 'Code review and quality gate',
-        defaultModel: 'minimax/minimax-m2.7',
-        fallbackModels: ['stepfun/step-3.5-flash', 'xiaomi/mimo-v2-pro'],
+        defaultModel: 'nvidia/nemotron-3-super:free',
+        fallbackModels: ['minimax/minimax-m2.5:free', 'stepfun/step-3.5-flash:free', 'xiaomi/mimo-v2-pro:free'],
         maxTokens: 2048,
         prompt: 'You are S.ai\'s Critic agent - the FINAL quality gate.\n\nOutput format: EXACTLY one of these:\n\nAPPROVED\n[Brief validation]\n\nREJECTED\n[Detailed reasons, numbered]\n\nIf in doubt, REJECT.',
 
@@ -147,8 +147,8 @@ export var AGENTS = {
     tester: {
         name: 'Tester',
         description: 'Validation and testing',
-        defaultModel: 'deepseek/deepseek-chat-v3-0324:free',
-        fallbackModels: ['xiaomi/mimo-v2-pro', 'minimax/minimax-m2.7'],
+        defaultModel: 'google/gemma-3-27b-it:free',
+        fallbackModels: ['xiaomi/mimo-v2-pro:free', 'minimax/minimax-m2.7:free'],
         maxTokens: 4096,
         prompt: 'You are S.ai\'s Tester agent.\n\nOutput format:\n\n## VALIDATION RESULT\nPASS | FAIL | NEEDS_REVIEW\n\n[Reasoning]',
 
@@ -480,7 +480,7 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
                     } else {
                         var fallbacks = agent.fallbackModels || [];
                         if (fallbacks.length > 0) {
-                            model = fallbacks[0];
+                            model = ensureFreeModel(fallbacks[0]);
                             if (attempts < maxAttempts) continue;
                         }
                     }
@@ -513,20 +513,37 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
     return result;
 };
 
+/* ── Ensure model ID has `:free` suffix on OpenRouter ──
+   Prevents accidental use of paid models (HTTP 402). */
+function ensureFreeModel(model) {
+    if (!model) return model;
+    /* Only applies to OpenRouter provider */
+    if (state.settings.provider !== 'openrouter') return model;
+    /* Skip if already has `:free` suffix */
+    if (model.indexOf(':free') > -1) return model;
+    /* Skip local providers (ollama, lmstudio) and Google AI Studio */
+    if (model.indexOf('/') === -1) return model;
+    /* Auto-append `:free` to prevent 402 errors */
+    console.warn('[MultiAgent] Auto-appending :free to model "' + model + '" to prevent 402 errors');
+    return model + ':free';
+}
+
 MultiAgentOrchestrator.prototype.selectModelForAgent = function(agent, agentName) {
+    var model = null;
     if (state.settings.agentModels) {
         var configured = state.settings.agentModels[agentName];
-        if (configured) return configured;
+        if (configured) model = configured;
     }
-    if (agentName === 'coder' && agent.currentModel) return agent.currentModel;
-    return agent.defaultModel;
+    if (!model && agentName === 'coder' && agent.currentModel) model = agent.currentModel;
+    if (!model) model = agent.defaultModel;
+    return ensureFreeModel(model);
 };
 
 MultiAgentOrchestrator.prototype.getNextCoderFallback = function(agent, currentModel) {
     var configuredFallback = (state.settings.agentModels || {}).coderFallback;
-    if (configuredFallback && configuredFallback !== currentModel) return configuredFallback;
+    if (configuredFallback && configuredFallback !== currentModel) return ensureFreeModel(configuredFallback);
     var fallbacks = agent.fallbackModels.filter(function(m) { return m !== currentModel; });
-    return fallbacks.length > 0 ? fallbacks[0] : null;
+    return fallbacks.length > 0 ? ensureFreeModel(fallbacks[0]) : null;
 };
 
 /* ═══════════════════════════════════════
