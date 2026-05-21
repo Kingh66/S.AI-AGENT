@@ -1,4 +1,4 @@
-file:js/modules/effects.js
+
 /* ═══════════════════════════════════════
    EFFECTS — Neural Wave Background
    ═══════════════════════════════════════ */

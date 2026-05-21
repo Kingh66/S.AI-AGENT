@@ -1,4 +1,4 @@
-file:js/modules/messages.js
+
 /* ═══════════════════════════════════════════════════
    MESSAGES — Rendering, streaming, actions
    ═══════════════════════════════════════════════════ */

@@ -1,4 +1,4 @@
-file:js/modules/connection.js
+
 /* ═══════════════════════════════════════════════════
    CONNECTION — LLM API calls, streaming
    ═══════════════════════════════════════════════════ */
