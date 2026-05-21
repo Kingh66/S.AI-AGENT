@@ -1,4 +1,3 @@
-file:js/modules/storage.js
 /* ═══════════════════════════════════════
    STORAGE — LocalStorage save/load
    ═══════════════════════════════════════ */
