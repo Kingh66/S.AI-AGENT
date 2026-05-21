@@ -1,4 +1,3 @@
-
 /* ═══════════════════════════════════════════════════
    CONNECTION — LLM API calls, streaming
    ═══════════════════════════════════════════════════ */
@@ -38,13 +37,7 @@ var CONTINUE_MSG_STALL = 'Your output was cut off. CONTINUE from the exact point
 
 var _lastRequestTime = 0;
 
-/* ═══════════════════════════════════════════════════
-   FIX: Track the ORIGINAL user message so
-   auto-continue can maintain file context and intent.
-   Without this, continuations pass '' to
-   buildSafeSystemPrompt which loses debug intent
-   and drops file context from 80K to 25K.
-   ═══════════════════════════════════════════════════ */
+/* Track the ORIGINAL user message so auto-continue can maintain file context and intent */
 var _originalUserMessage = '';
 
 function getNextFallbackModel(currentModel) {
@@ -265,7 +258,9 @@ function isNewProjectRequest(text) {
     if (/\bfix\b/.test(t) && /\b(error|bugs?|issues?|broken)\b/.test(t)) return false;
     if (/\b(modify|update|change|refactor|improve)\b/.test(t) && /\b(this|the|existing|current)\b/.test(t)) return false;
     if (/\.js\b|\.py\b|\.html\b|\.css\b|\.ts\b/.test(t) && /\b(file|in|from)\b/.test(t)) return false;
-    var newWords = ['code a ','code simple ','create a ','build a ','make a ','write a ','design a ','develop a ','simple ','basic ','new project','new app','new website','new page','new system','landing page'];
+    /* Only match "simple" and "basic" at the START of the message to avoid false positives */
+    if (/^(simple|basic)\s+/.test(t)) return true;
+    var newWords = ['code a ','code simple ','create a ','build a ','make a ','write a ','design a ','develop a ','new project','new app','new website','new page','new system','landing page'];
     for (var i = 0; i < newWords.length; i++) { if (t.indexOf(newWords[i]) > -1) return true; }
     return false;
 }
@@ -287,12 +282,8 @@ async function buildSafeSystemPrompt(userText) {
     return sys;
 }
 
-/* ═══════════════════════════════════════════════════
-   FIX: buildSafeMessages — use model context window
-   ═══════════════════════════════════════════════════ */
 function buildSafeMessages(userText, systemPrompt) {
     var sysTokens = estimateTokens(systemPrompt);
-
     var modelCtxTokens = 128000;
     var modelId = state.settings.model || '';
     if (state.modelContextLimits[modelId]) {
@@ -302,11 +293,9 @@ function buildSafeMessages(userText, systemPrompt) {
     } else if (modelId.indexOf('gemini') > -1) {
         modelCtxTokens = 1000000;
     }
-
     var maxOutputTokens = getEffectiveMaxTokens(state.settings.maxTokens);
     var maxInputTokens = modelCtxTokens - maxOutputTokens;
     var safeLimit = Math.floor(maxInputTokens * 0.85);
-
     console.log('[Connection] buildSafeMessages: sysTokens=' + sysTokens + ' safeLimit=' + safeLimit + ' modelCtx=' + modelCtxTokens);
 
     if (sysTokens > safeLimit) {
@@ -326,42 +315,38 @@ function buildSafeMessages(userText, systemPrompt) {
         historySlice.unshift(state.conversationHistory[i]);
         remainingTokens -= msgTokens;
     }
-
     return [{ role: 'system', content: systemPrompt }].concat(historySlice);
 }
 
 /* ═══════════════════════════════════════════════════
-   FIX: responseSeemsIncomplete — MUCH more conservative
+   responseSeemsIncomplete — Conservative detection
    
-   OLD BUG: This function triggered on almost EVERY
-   response because:
-   - Many valid responses end without ".!?)"
-   - Status lines like "⏳ In Progress" have no period
-   - Short responses in coding mode were always flagged
-   - This caused infinite auto-continue loops
+   Only flags STRONG evidence of truncation:
+   1. Unclosed code block
+   2. Ends with comma/colon in long responses
+   3. Ends with a connector/conjunction word
+   4. Incomplete conditional paragraph
+   5. Last word appears cut off mid-phrase
    
-   NEW: Only flag if there's STRONG evidence of truncation:
-   1. Unclosed code block (odd number of ```)
-   2. Text literally cut mid-word (no whitespace at end)
-   3. Response ends with a comma/conjunction AND is long
-   
-   Do NOT flag just because there's no period.
+   Does NOT flag just because there's no period.
    ═══════════════════════════════════════════════════ */
 function responseSeemsIncomplete(text) {
     if (!text || text.length < 200) return false;
 
-    /* Check for completion markers — definitely complete */
+    /* Completion markers — definitely NOT incomplete */
     var completionMarkers = [
-        '📦 FILES READY TO APPLY', 'FILES READY TO APPLY',
-        '📊 SUMMARY', '## SUMMARY',
-        'REVIEW BEFORE APPLYING', 'All files completed',
-        'Task Complete', 'Task Failed', 'END FILE'
+        'FILES READY TO APPLY', 'SUMMARY', 'REVIEW BEFORE APPLYING',
+        'All files completed', 'Task Complete', 'Task Failed', 'END FILE',
+        'Would you like me to', 'Let me know if', 'I hope this helps',
+        'Feel free to ask', 'Hope that helps', 'Let me know'
     ];
     for (var i = 0; i < completionMarkers.length; i++) {
         if (text.indexOf(completionMarkers[i]) > -1) return false;
     }
 
-    /* 1. Unclosed code block — DEFINITE truncation */
+    var trimmed = text.trimEnd();
+
+    /* 1. Unclosed code block */
     var codeBlockCount = 0;
     var codeRe = /```/g;
     while (codeRe.exec(text) !== null) codeBlockCount++;
@@ -370,37 +355,52 @@ function responseSeemsIncomplete(text) {
         return true;
     }
 
-    /* 2. Text cut mid-word — last line has no trailing whitespace and
-          ends with a partial word (lowercase letter, no punctuation) */
-    var trimmed = text.trimEnd();
-    var lastChar = trimmed.slice(-1);
-    var last30 = trimmed.slice(-30);
-
-    /* Ends with comma or colon followed by nothing = likely cut off */
-    if (/[,:]$/.test(last30.trim()) && trimmed.length > 1000) {
-        /* But only if it's a long response — short ones naturally end with ":" */
-        console.log('[Connection] Incomplete: ends with comma/colon in long response');
+    /* 2. Ends with comma or colon in a long response */
+    if (/[,:]\s*$/.test(trimmed) && trimmed.length > 1000) {
+        console.log('[Connection] Incomplete: ends with comma/colon');
         return true;
     }
 
-    /* 3. Ends with a conjunction word = definitely cut off */
-    if (/\b(and|or|then|also|further|additionally)\s*$/.test(last30)) {
-        console.log('[Connection] Incomplete: ends with conjunction');
+    /* 3. Ends with a connector/conjunction word — anchored to END of full trimmed text */
+    if (/\b(and|or|then|also|further|additionally|like|if|when|while|because|since|although|though|unless|until|whether|before|after|between|through|during|without|within|about|into|onto|upon|across|along|around|behind|below|beneath|beside|beyond|despite|except|inside|near|toward|towards|under|unlike|via|with)\s*$/i.test(trimmed)) {
+        console.log('[Connection] Incomplete: ends with connector word');
         return true;
     }
 
-    /* 4. Contains <|CONTINUE_TASK|> in system prompt but model didn't output it —
-          this means the model was told to use it but stopped before completing all files */
-    if (state.activeTask.isRunning && state.activeTask.loopCount > 0) {
-        /* If we're in a multi-file task and the response is short, it might be incomplete */
-        if (trimmed.length < 300 && !/[.!?]$/.test(trimmed)) {
-            console.log('[Connection] Incomplete: short response in active task without sentence ending');
-            return true;
+    /* 4. Last paragraph is an incomplete conditional — starts with
+       "If/When/For/The..." and doesn't end with sentence punctuation */
+    if (trimmed.length > 500) {
+        var lastNewline = trimmed.lastIndexOf('\n');
+        var lastPara = lastNewline > -1 ? trimmed.substring(lastNewline + 1).trim() : trimmed.slice(-150);
+        if (lastPara.length > 15 && lastPara.length < 300) {
+            var startsConditional = /^(If|When|For|The|This|That|These|Those|Each|Every|Any|All|Some|Most|Both|Neither|Either|Whether|Unless|Until|Although|Though|Because|Since|While|In|On|At|By|From|With|As|To|Note|Remember|Important|Warning|Caution|Tip|Example|Bug|Issue|Problem|Fix|Solution|Result)\b/i.test(lastPara);
+            if (startsConditional && !/[.!?]\s*$/.test(lastPara)) {
+                console.log('[Connection] Incomplete: last paragraph is an incomplete conditional');
+                return true;
+            }
         }
     }
 
-    /* DO NOT flag just because there's no period — many valid responses
-       end with status lines, code blocks, or formatted output */
+    /* 5. Last word appears cut off mid-phrase — the word before it is a
+       determiner, preposition, or verb suggesting more was coming */
+    if (trimmed.length > 1000) {
+        var lastWord = trimmed.split(/\s+/).pop();
+        if (lastWord && /^[a-z]+$/.test(lastWord) && lastWord.length >= 2) {
+            var validEndWords = ['yes','no','ok','done','thanks','please','here','there','now','today','always','never','sometimes','often','already','enough','too','more','less','much','many','some','all','none','both','either','neither','each','every','first','last','next','previous','true','false','null','undefined','zero','one','fine','right','left','up','down','out','off','over','under','again','away','back','else','home','soon','late','early','hard','easy','fast','slow','well','else','away','together','apart','instead','however','therefore','otherwise','meanwhile','furthermore','moreover','nevertheless','nonetheless','regardless','certainly','definitely','probably','possibly','usually','normally','generally','simply','clearly','obviously','naturally','basically','essentially','ultimately','finally','originally','initially','eventually','recently','previously','currently','immediately','directly','exactly','specifically','particularly','especially','generally','commonly','frequently','rarely','seldom','hardly','scarcely','merely','only','just','also','too','quite','very','rather','fairly','pretty','somewhat','slightly','extremely','incredibly','absolutely','completely','totally','entirely','perfectly','nearly','almost','about','around','approximately','roughly','exactly'];
+            var isLastWordValid = validEndWords.indexOf(lastWord.toLowerCase()) > -1;
+            if (!isLastWordValid) {
+                var words = trimmed.split(/\s+/);
+                if (words.length >= 2) {
+                    var prevWord = words[words.length - 2];
+                    if (/\b(a|an|the|this|that|these|those|my|your|his|her|its|our|their|some|any|no|every|each|all|both|few|many|much|more|most|several|such|what|which|who|whose|than|like|with|without|from|into|about|for|of|in|on|at|to|by|as|is|are|was|were|be|been|being|have|has|had|do|does|did|will|would|could|should|may|might|can|shall|must|need|contains|includes|requires|supports|provides|allows|enables|prevents|avoids|handles|processes|returns|accepts|checks|validates|ensures)\b$/i.test(prevWord)) {
+                        console.log('[Connection] Incomplete: ends mid-phrase after "' + prevWord + ' ' + lastWord + '"');
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
     return false;
 }
 
@@ -462,6 +462,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         var res = await fetchWithRetry(getApiUrl(), { method: 'POST', headers: buildHeaders(), body: JSON.stringify(buildPayload(messages, null, actualMaxTokens)), signal: state.abortController.signal });
         clearTimeout(fetchTimeoutId); fetchTimeoutId = null;
 
+        /* ── 402 ── */
         if (res.status === 402) {
             var err402Text = await res.text().catch(function () { return ''; });
             var retryTokens = resolveRetryTokens(err402Text, actualMaxTokens, overrideMaxTokens != null);
@@ -476,13 +477,14 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             throw new Error('INSUFFICIENT_CREDITS: Balance too low.');
         }
 
+        /* ── 429 ── */
         if (res.status === 429) {
             var err429Text = await res.text().catch(function () { return ''; });
             if (state.settings.provider === 'openrouter') {
                 var fallbackModel = getNextFallbackModel(state.settings.model);
                 if (fallbackModel) {
                     clearInterval(stallWatchdog); if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
-                    var sm429 = document.getElementById('streaming-msg'); if (sm42929 && !isAutoContinue) sm429.remove();
+                    var sm429 = document.getElementById('streaming-msg'); if (sm429 && !isAutoContinue) sm429.remove();
                     state.isStreaming = false; state.streamElement = null; state.streamBuffer = ''; state.thinkingContent = '';
                     var originalModel = state.settings.model; state.settings.model = fallbackModel;
                     await new Promise(function (r) { setTimeout(r, 1500); });
@@ -504,6 +506,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             return;
         }
 
+        /* ── Other HTTP errors ── */
         if (!res.ok) {
             var errText = await res.text().catch(function () { return ''; }); var status = res.status;
             if (status === 401 || status === 403) throw new Error('AUTH_ERROR:' + status);
@@ -512,7 +515,9 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             throw new Error('HTTP ' + status + ': ' + errText.substring(0, 300));
         }
 
-        /* STREAM READING */
+        /* ═════════════════════════
+           STREAM READING
+           ═════════════════════════ */
         resetFallbackTracking();
         var reader = res.body.getReader();
         var decoder = new TextDecoder();
@@ -553,7 +558,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         clearInterval(stallWatchdog); if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
 
         /* ═══════════════════════════════════════════════════
-           TRUNCATION DETECTION — conservative
+           TRUNCATION DETECTION
            ═══════════════════════════════════════════════════ */
         var hitLimit = (finishReason === 'length');
         var lastResponse = state.conversationHistory[state.conversationHistory.length - 1];
@@ -565,26 +570,15 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             console.log('[Connection] <|CONTINUE_TASK|> detected — auto-continuing');
         }
 
-        /* Only check for incomplete response if finish_reason is NOT 'length'
-           (if it IS 'length', we already know it's truncated) */
         var seemsIncomplete = false;
         if (!hitLimit && lastResponse && responseSeemsIncomplete(lastResponse.content)) {
             seemsIncomplete = true;
             hitLimit = true;
         }
 
-        /* ═══════════════════════════════════════════════════
-           FIX: Cap auto-continue at 3 loops max, not 10
-           
-           Free tier models hit 429 very quickly.
-           10 auto-continues = 10 API calls per user message
-           = guaranteed 429 on free tier.
-           
-           Also: only auto-continue for finish_reason='length'
-           or <|CONTINUE_TASK|> tag. Do NOT auto-continue
-           for "seemsIncomplete" — that should just show
-           the Continue button and let the user decide.
-           ═══════════════════════════════════════════════════ */
+        /* Auto-continue: only for finish_reason='length' or <|CONTINUE_TASK|>,
+           NOT for "seemsIncomplete" (that just shows the Continue button).
+           Cap at 3 loops to prevent 429 death spirals on free tier. */
         var shouldAutoContinue = (hitLimit && !seemsIncomplete) && state.activeTask.isRunning && state.activeTask.loopCount < 3;
 
         if (shouldAutoContinue) {
@@ -592,14 +586,10 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             toast('Continuing (' + state.activeTask.loopCount + '/3)...', 'info');
             setConnectionStatus('connecting', 'Continuing...');
 
-            /* ── FIX: Use ORIGINAL user message for context ──
-               This maintains debug/review intent and file context */
-            var continueMsg = CONTINUE_MSG_FILE;
-            state.conversationHistory.push({ role: 'user', content: continueMsg });
+            state.conversationHistory.push({ role: 'user', content: CONTINUE_MSG_FILE });
 
             /* Trim conversation history to prevent unbounded growth */
             if (state.conversationHistory.length > 16) {
-                /* Keep system message + last 14 messages */
                 var sysMsg = state.conversationHistory[0];
                 var recent = state.conversationHistory.slice(-14);
                 state.conversationHistory = [sysMsg].concat(recent);
@@ -685,7 +675,6 @@ export async function sendMessage(userText, isAutoContinue) {
             if (state.settings.provider !== 'ollama' && !state.settings.apiKey) { toast('No API key.', 'error'); return; }
             if (!state.settings.model) { toast('No model.', 'error'); return; }
 
-            /* ── FIX: Store original user message for continuations ── */
             _originalUserMessage = userText;
 
             addUserMessage(userText);
@@ -696,8 +685,6 @@ export async function sendMessage(userText, isAutoContinue) {
             state.activeTask.loopCount = 0;
         }
 
-        /* ── FIX: Use ORIGINAL user message for context, not empty string ──
-           This ensures buildSafeSystemPrompt gets the debug intent keywords */
         var contextMessage = isAutoContinue ? _originalUserMessage : userText;
         var systemPrompt = await buildSafeSystemPrompt(contextMessage || '');
         var messages = buildSafeMessages(contextMessage || '', systemPrompt);
@@ -711,9 +698,6 @@ export async function sendMessage(userText, isAutoContinue) {
     }
 }
 
-/* ═══════════════════════════════════════════════════
-   CONTINUE RESPONSE
-   ═══════════════════════════════════════════════════ */
 export async function continueResponse() {
     if (state.isStreaming) { toast('Wait for current response.', 'info'); return; }
     if (!state.responseTruncated) { toast('Nothing to continue.', 'info'); return; }
@@ -729,7 +713,6 @@ export async function continueResponse() {
     toast('Continuing...', 'info');
 
     try {
-        /* ── FIX: Use ORIGINAL user message for context ── */
         var systemPrompt = await buildSafeSystemPrompt(_originalUserMessage || '');
         var messages = buildSafeMessages(_originalUserMessage || '', systemPrompt);
         return executeStream(messages, null, true);
