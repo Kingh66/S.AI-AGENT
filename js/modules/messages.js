@@ -1,7 +1,6 @@
+file:js/modules/messages.js
 /* ═══════════════════════════════════════════════════
    MESSAGES — Rendering, streaming, actions
-   Optimized for Ollama: slower throttle, debounced scroll,
-   no thinking block overhead
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { parseMarkdown } from './markdown.js';
@@ -12,7 +11,6 @@ let streamPre = null;
 let streamTextNode = null;
 let renderTimer = null;
 
-/* ── Dynamic throttle: 25ms for cloud, 100ms for Ollama ── */
 function getRenderThrottle() {
     if (state.settings && state.settings.provider === 'ollama') return 100;
     return 25;
@@ -21,7 +19,6 @@ function getRenderThrottle() {
 let lastRenderTime = 0;
 let receivedAnyRealText = false;
 
-/* ── Debounced scroll — max 1 scroll per 80ms instead of every render ── */
 let scrollRaf = null;
 function fastScroll() {
     if (scrollRaf) return;
@@ -32,7 +29,6 @@ function fastScroll() {
     });
 }
 
-/* ── Detect Ollama once per session, not every chunk ── */
 let _isOllama = null;
 function isOllamaSession() {
     if (_isOllama !== null) return _isOllama;
@@ -40,7 +36,6 @@ function isOllamaSession() {
     return _isOllama;
 }
 
-/* Reset cached Ollama flag when provider changes */
 export function invalidateOllamaCache() {
     _isOllama = null;
 }
@@ -112,10 +107,16 @@ export function appendStreamChunk(chunk) {
 
     state.streamBuffer += chunk;
 
-    for (let i = 0; i < chunk.length - 2; i++) {
-        if (chunk[i] === '`' && chunk[i + 1] === '`' && chunk[i + 2] === '`') {
+    /* ── FIX: Count triple backticks correctly, including when split across chunks ──
+       OLD BUG: Only checked characters within a single chunk. If "``" was at the end
+       of one chunk and "`" at the start of the next, the transition was missed.
+       NEW: Count in the full buffer instead. */
+    backtickCount = 0;
+    var buf = state.streamBuffer;
+    for (var bi = 0; bi < buf.length - 2; bi++) {
+        if (buf[bi] === '`' && buf[bi + 1] === '`' && buf[bi + 2] === '`') {
             backtickCount++;
-            i += 2;
+            bi += 2;
         }
     }
     var inCode = (backtickCount % 2 !== 0);
@@ -134,7 +135,6 @@ export function appendStreamChunk(chunk) {
 
             if (!state.streamElement) return;
 
-            /* Ollama qwen2.5-coder never produces reasoning_content — skip thinking block check entirely */
             if (!isOllamaSession()) {
                 var thinkBlock = state.streamElement.querySelector('.thinking-block');
                 if (thinkBlock) thinkBlock.remove();
@@ -190,7 +190,6 @@ function removeCursor(container) {
 
 function buildFinalThinkingBlock(text) {
     if (!text || text.length < 10) return '';
-    /* Skip thinking block for Ollama — these models don't produce it */
     if (isOllamaSession()) return '';
     var display = text.length > 1200 ? '...' + text.slice(-1200) : text;
     display = escapeHtml(display).replace(/\n/g, '<br>');
@@ -237,6 +236,11 @@ export function finalizeStream() {
             }
         }
 
+        /* ── FIX: Also check for empty buffer with NO real text (connection died) ── */
+        if (clean.length === 0 && !receivedAnyRealText) {
+            clean = '⚠️ No response received. The connection may have been interrupted. Try again.';
+        }
+
         var thinkHtml = '';
         if (state.thinkingContent && state.thinkingContent.length > 10) {
             thinkHtml = buildFinalThinkingBlock(state.thinkingContent);
@@ -245,7 +249,6 @@ export function finalizeStream() {
 
         state.streamElement.innerHTML = thinkHtml + parseMarkdown(clean);
 
-        /* Defer code highlighting to next frame so finalizeStream returns fast */
         var el = state.streamElement;
         requestAnimationFrame(function () {
             highlightCodeBlocks(el);
@@ -298,7 +301,7 @@ window.toggleThinkingBlock = function (el) {
 };
 
 /* ═══════════════════════════════════════════════════
-   CONTINUE BUTTON — Shown when response is truncated
+   CONTINUE BUTTON
    ═══════════════════════════════════════════════════ */
 export function showContinueButton() {
     removeContinueButton();
@@ -360,7 +363,6 @@ export function editFileCode(btn) {
     var block = btn.closest('.file-block');
     if (!block) return;
 
-    /* If already editing, sync textarea → code and exit edit mode */
     if (block.classList.contains('editing')) {
         var textarea = block.querySelector('.edit-textarea');
         if (textarea) {
@@ -373,7 +375,6 @@ export function editFileCode(btn) {
         if (pre) pre.style.display = '';
         btn.innerHTML = '<i class="fas fa-pen"></i> Edit';
         btn.style.color = '';
-        /* Re-highlight after sync */
         var el = block.querySelector('code');
         if (el) {
             el.classList.remove('prism-highlighted');
@@ -382,7 +383,6 @@ export function editFileCode(btn) {
         return;
     }
 
-    /* Enter edit mode: overlay textarea on the code block */
     block.classList.add('editing');
     var pre = block.querySelector('pre');
     var currentCode = pre ? (pre.querySelector('code') ? pre.querySelector('code').textContent : '') : '';
@@ -401,7 +401,6 @@ export function editFileCode(btn) {
     btn.innerHTML = '<i class="fas fa-eye"></i> Preview';
     btn.style.color = 'var(--accent,#00d4aa)';
 
-    /* Tab key inserts spaces instead of changing focus */
     textarea.addEventListener('keydown', function (e) {
         if (e.key === 'Tab') {
             e.preventDefault();

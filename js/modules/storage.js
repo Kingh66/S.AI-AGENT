@@ -1,12 +1,11 @@
+file:js/modules/storage.js
 /* ═══════════════════════════════════════
    STORAGE — LocalStorage save/load
-   Auto-repairs broken endpoints on load
    ═══════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { SYSTEM_PROMPTS, PROVIDER_DEFAULTS, MULTI_AGENT_CONFIG } from './config.js';
 import { toast } from './ui.js';
 
-/* ── Settings version — bump to force-clear all saved settings ── */
 var SETTINGS_VERSION = 6;
 
 var BAD_ENDPOINTS = [
@@ -20,15 +19,11 @@ var DEAD_MODELS = {
     'openrouter/hunter-alpha': 'xiaomi/mimo-v2-pro:free'
 };
 
-/* ═══════════════════════════════════════
-   NUCLEAR SAFEGUARD — runs BEFORE loadSettings
-   If the known-corrupted 68539 value exists in
-   raw localStorage, nuke it immediately.
-   This survives browser caching of old JS files. ═══════════════════════════════════════ */
+/* ── Nuclear safeguard ── */
 try {
     var _rawSettings = localStorage.getItem('sai_settings');
     if (_rawSettings && _rawSettings.indexOf('68539') > -1) {
-        console.warn('[Storage] Detected corrupted maxTokens=68539 in localStorage. Nuking saved settings.');
+        console.warn('[Storage] Detected corrupted maxTokens=68539. Nuking.');
         localStorage.removeItem('sai_settings');
         _rawSettings = null;
     }
@@ -104,7 +99,6 @@ export function resetAllSettings() {
 }
 
 export function saveSettings() {
-    /* Clamp before saving — allow values down to 32 (for 402 auto-retry) */
     var mt = state.settings.maxTokens;
     if (typeof mt !== 'number' || mt < 32) mt = 2048;
     else if (mt > 32768) mt = 32768;
@@ -142,14 +136,12 @@ export function saveSettings() {
 export function loadSettings() {
     var repaired = false;
 
-    /* ── VERSION CHECK: If settings are from old version, nuke them ── */
     try {
         var savedRaw = localStorage.getItem('sai_settings');
         if (savedRaw) {
             var quickCheck = JSON.parse(savedRaw);
             if (quickCheck._version !== SETTINGS_VERSION) {
-                console.warn('[Storage] Settings version mismatch (got ' + quickCheck._version + ', need ' + SETTINGS_VERSION + '). Resetting.');
-                /* Preserve API key and model across version resets */
+                console.warn('[Storage] Settings version mismatch. Resetting.');
                 var keepKey = quickCheck.apiKey || '';
                 var keepModel = quickCheck.model || '';
                 localStorage.removeItem('sai_settings');
@@ -163,8 +155,7 @@ export function loadSettings() {
                 state.settings.systemPrompt = SYSTEM_PROMPTS[state.currentMode];
                 state.settings._version = SETTINGS_VERSION;
                 repaired = true;
-                toast('Settings updated to v' + SETTINGS_VERSION + ' (maxTokens set to 8192 for coding mode support)', 'info');
-                /* Skip normal load — we just reset everything */
+                toast('Settings updated to v' + SETTINGS_VERSION, 'info');
                 savedRaw = null;
             }
         }
@@ -172,7 +163,6 @@ export function loadSettings() {
         localStorage.removeItem('sai_settings');
     }
 
-    /* Normal load (only if version check didn't nuke it) */
     if (!repaired) {
         try {
             var saved = localStorage.getItem('sai_settings');
@@ -185,24 +175,18 @@ export function loadSettings() {
         }
     }
 
-    /* ── SANITY CLAMP: maxTokens ── */
-    /* Lower threshold from 256 to 32 so 402 auto-retry values (128, 64, 32) survive reload */
     if (typeof state.settings.maxTokens !== 'number' || state.settings.maxTokens < 32) {
         state.settings.maxTokens = 8192;
         repaired = true;
     } else if (state.settings.maxTokens > 32768) {
-        console.warn('[Storage] Clamped maxTokens from ' + state.settings.maxTokens + ' to 32768');
         state.settings.maxTokens = 32768;
         repaired = true;
     }
-    /* Bump very low values (402 auto-retry leftovers) to a usable coding floor */
     if (state.settings.maxTokens >= 32 && state.settings.maxTokens < 512) {
-        console.warn('[Storage] maxTokens very low (' + state.settings.maxTokens + '), bumping to 8192 for coding support');
         state.settings.maxTokens = 8192;
         repaired = true;
     }
 
-    /* ── SANITY CLAMP: contextBudget ── */
     if (typeof state.settings.contextBudget !== 'number' || state.settings.contextBudget < 5000) {
         state.settings.contextBudget = 25000;
         repaired = true;
@@ -211,7 +195,6 @@ export function loadSettings() {
         repaired = true;
     }
 
-    /* Ensure version is set */
     state.settings._version = SETTINGS_VERSION;
 
     try {
@@ -223,14 +206,11 @@ export function loadSettings() {
             state.settings.maxCoderAttempts = maParsed.maxCoderAttempts || MULTI_AGENT_CONFIG.maxCoderAttempts;
             state.settings.maxCriticRejections = maParsed.maxCriticRejections || MULTI_AGENT_CONFIG.maxCriticRejections;
 
-            /* ── BACKWARD COMPAT: auto-fix models missing `:free` suffix ──
-               Old saved settings may have models without `:free`, which causes 402 errors. */
             if (state.settings.agentModels) {
                 var agentModelsFixed = false;
                 for (var amKey in state.settings.agentModels) {
                     var amVal = state.settings.agentModels[amKey];
                     if (amVal && amVal.indexOf('/') > -1 && amVal.indexOf(':free') === -1) {
-                        console.warn('[Storage] Auto-fixing agent model: "' + amVal + '" → "' + amVal + ':free"');
                         state.settings.agentModels[amKey] = amVal + ':free';
                         agentModelsFixed = true;
                     }
@@ -252,7 +232,6 @@ export function loadSettings() {
             state.settings.maxCriticRejections = MULTI_AGENT_CONFIG.maxCriticRejections;
         }
     } catch (e) {
-        console.warn('Failed to load multi-agent settings, using defaults:', e);
         state.settings.multiAgentEnabled = false;
         state.settings.agentModels = Object.assign({}, MULTI_AGENT_CONFIG.agentModels);
         state.settings.maxCoderAttempts = MULTI_AGENT_CONFIG.maxCoderAttempts;
@@ -261,12 +240,35 @@ export function loadSettings() {
 
     repaired = repairEndpoint() || repaired;
 
+    /* ── FIX: Only reset endpoint if it's truly invalid, not just different from default ──
+       OLD BUG: This always reset the endpoint to the provider default,
+       even if the user intentionally set a custom URL (e.g. proxy, different region). */
     var defaults = PROVIDER_DEFAULTS[state.settings.provider];
     if (defaults) {
-        /* CRITICAL: Only check against the CURRENT provider's default endpoint.
-           Old logic checked ALL provider endpoints, so switching from OpenRouter
-           to Google AI would keep the OpenRouter URL since it was "valid". */
-        if (state.settings.endpoint !== defaults.endpoint) {
+        var ep = state.settings.endpoint;
+        /* Only reset if endpoint is empty, has double /v1, or matches a known-bad endpoint */
+        var epIsBad = !ep || ep.indexOf('/v1/v1') > -1;
+        if (!epIsBad) {
+            for (var bi = 0; bi < BAD_ENDPOINTS.length; bi++) {
+                if (ep === BAD_ENDPOINTS[bi]) { epIsBad = true; break; }
+            }
+        }
+        /* Also reset if the endpoint belongs to a DIFFERENT provider */
+        if (!epIsBad && defaults.endpoint) {
+            var allProviderEndpoints = Object.values(PROVIDER_DEFAULTS).map(function(d) { return d.endpoint; });
+            var epMatchesOtherProvider = false;
+            for (var pi = 0; pi < allProviderEndpoints.length; pi++) {
+                if (ep === allProviderEndpoints[pi] && ep !== defaults.endpoint) {
+                    epMatchesOtherProvider = true;
+                    break;
+                }
+            }
+            if (epMatchesOtherProvider) {
+                state.settings.endpoint = defaults.endpoint;
+                repaired = true;
+            }
+        }
+        if (epIsBad) {
             state.settings.endpoint = defaults.endpoint;
             repaired = true;
         }
@@ -279,6 +281,7 @@ export function loadSettings() {
         if (state.settings.model.indexOf('codellama') > -1) modelIsOk = true;
         if (state.settings.model.indexOf('llama') > -1) modelIsOk = true;
         if (state.settings.model.indexOf('gpt') > -1) modelIsOk = true;
+        if (state.settings.model.indexOf('gemini') > -1) modelIsOk = true;
         if (!modelIsOk) { state.settings.model = ''; repaired = true; }
     }
 
@@ -326,7 +329,9 @@ export function saveFromSettingsUI() {
     state.settings.model = document.getElementById('s-model').value.trim();
     state.settings.temperature = parseFloat(document.getElementById('q-temp').value);
     state.settings.maxTokens = parseInt(document.getElementById('q-tokens').value) || 8192;
-    state.settings.contextBudget = parseInt(document.getElementById('q-context-budget') ? document.getElementById('q-context-budget').value : 60000) || 60000;
+    /* ── FIX: Null check for dynamically-injected context budget element ── */
+    var ctxBudgetEl = document.getElementById('q-context-budget');
+    state.settings.contextBudget = ctxBudgetEl ? (parseInt(ctxBudgetEl.value) || 25000) : (state.settings.contextBudget || 25000);
     voiceState.lang = document.getElementById('q-voice-lang').value;
     voiceState.rate = parseFloat(document.getElementById('q-voice-rate').value);
     if (voiceState.recognition) voiceState.recognition.lang = voiceState.lang;

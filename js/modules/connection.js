@@ -1,3 +1,4 @@
+file:js/modules/connection.js
 /* ═══════════════════════════════════════════════════
    CONNECTION — LLM API calls, streaming
    ═══════════════════════════════════════════════════ */
@@ -32,6 +33,9 @@ var MIN_RETRY_TOKENS = 32;
 
 var CONTINUATION_MODES = ['custom', 'selfimprove', 'multiagent'];
 
+/* ── FIX: Match <|CONTINUE_TASK|> with OR without angle brackets ── */
+var CONTINUE_TAG_REGEX = /<\|CONTINUE_TASK\|>\s*$|\|CONTINUE_TASK\|\s*$/;
+
 var CONTINUE_MSG_FILE = 'CONTINUE your previous response EXACTLY where you left off. If you were in the middle of a code file, continue that SAME file from the exact cutoff point. Do NOT start a new file unless the previous one was complete. <|CONTINUE_TASK|> if more files remain, end normally if last. No commentary.';
 
 var CONTINUE_MSG_STALL = 'Your output was cut off. CONTINUE from the exact point where you stopped. If mid-code, continue the SAME code block. Do NOT restart or summarize. <|CONTINUE_TASK|> if more remain, end normally if last. No commentary.';
@@ -45,23 +49,17 @@ var _lastRequestTime = 0;
 function getNextFallbackModel(currentModel) {
     if (state.settings.provider !== 'openrouter') return null;
 
-    /* Build the effective fallback list: prefer dynamically verified free models,
-       fall back to the hardcoded FREE_MODEL_FALLBACKS seed list, and filter out
-       any model that we've already tried in this cycle. */
     var fallbackPool = [];
 
-    /* First: use dynamically verified list from last fetchOpenRouterModels() call */
     if (state.verifiedFreeModelIds && state.verifiedFreeModelIds.length > 0) {
         fallbackPool = state.verifiedFreeModelIds.slice();
     } else {
-        /* Fallback: try to load from localStorage (persisted by fetchOpenRouterModels) */
         try {
             var cached = localStorage.getItem('sai_verified_free_models');
             if (cached) fallbackPool = JSON.parse(cached);
-        } catch (e) { /* parse error — ignore */ }
+        } catch (e) { }
     }
 
-    /* If still empty, use the hardcoded seed list as last resort */
     if (fallbackPool.length === 0 && FREE_MODEL_FALLBACKS && FREE_MODEL_FALLBACKS.length > 0) {
         fallbackPool = FREE_MODEL_FALLBACKS.slice();
         console.log('[Connection] No verified model list available — using hardcoded fallback seed');
@@ -69,7 +67,6 @@ function getNextFallbackModel(currentModel) {
 
     if (fallbackPool.length === 0) return null;
 
-    /* Reset fallback tracking if this is a fresh request (not already in fallback chain) */
     if (state.fallbackModelsTried.indexOf(currentModel) === -1) {
         state.fallbackModelsTried = [currentModel];
     }
@@ -83,18 +80,14 @@ function getNextFallbackModel(currentModel) {
         }
     }
 
-    /* All fallbacks exhausted — return null to trigger cooldown */
     console.warn('[Connection] All ' + fallbackPool.length + ' fallback models exhausted');
     return null;
 }
 
-/* Reset fallback tracking when a request succeeds */
 function resetFallbackTracking() {
-    /* If we're using a fallback model (not the original), persist it */
     if (state.fallbackModelsTried.length > 1) {
         console.log('[Connection] Request succeeded with fallback model: ' + state.settings.model);
         toast('Switched to ' + state.settings.model + ' (original model was rate limited)', 'success');
-        /* Persist the new model so it sticks for future requests */
         import('./storage.js').then(function (s) { s.saveSettings(); });
         var modelInput = document.getElementById('s-model');
         if (modelInput) modelInput.value = state.settings.model;
@@ -113,14 +106,11 @@ function startCooldown(reason) {
 
     console.log('[Connection] Starting ' + secs + 's cooldown: ' + reason);
 
-    /* Clear any existing timer */
     if (state.cooldownTimer) { clearInterval(state.cooldownTimer); state.cooldownTimer = null; }
 
-    /* Update UI immediately */
     setConnectionStatus('disconnected', 'Cooldown ' + secs + 's');
     setSendButtonCooldown(secs);
 
-    /* Countdown timer — updates every second */
     var remaining = secs;
     state.cooldownTimer = setInterval(function() {
         remaining--;
@@ -131,7 +121,6 @@ function startCooldown(reason) {
             console.log('[Connection] Cooldown ended');
             setConnectionStatus('connected', 'Connected — ' + state.settings.model);
             clearSendButtonCooldown();
-            /* If there's a queued request, send it now */
             if (state.pendingRequest) {
                 var pending = state.pendingRequest;
                 state.pendingRequest = null;
@@ -162,7 +151,6 @@ function setSendButtonCooldown(secs) {
         btn.style.pointerEvents = 'none';
         btn.style.opacity = '0.5';
     }
-    /* Also disable the input */
     var input = document.getElementById('msg-input');
     if (input) input.setAttribute('readonly', true);
 }
@@ -176,7 +164,6 @@ function clearSendButtonCooldown() {
     }
     var input = document.getElementById('msg-input');
     if (input) input.removeAttribute('readonly');
-    /* Let updateSendButton reset the icon */
     updateSendButton();
 }
 
@@ -186,7 +173,6 @@ function getRLConfig() {
 
 function getFetchTimeout() {
     var cfg = getRLConfig();
-    /* Add extra time to accommodate retries (each retry can take baseDelay * backoffFactor^attempt) */
     var retryOverhead = 0;
     for (var i = 0; i < cfg.maxRetries; i++) {
         retryOverhead += cfg.baseDelay * Math.pow(cfg.backoffFactor, i);
@@ -194,22 +180,18 @@ function getFetchTimeout() {
     return FETCH_TIMEOUT + Math.round(retryOverhead);
 }
 
-/* ── Client-side throttle — ensures minimum interval between requests ── */
 async function throttleRequest() {
     var cfg = getRLConfig();
     var elapsed = Date.now() - _lastRequestTime;
     var wait = cfg.minInterval - elapsed;
     if (wait > 0) {
-        console.log('[Connection] Throttling: waiting ' + wait + 'ms (min interval ' + cfg.minInterval + 'ms)');
+        console.log('[Connection] Throttling: waiting ' + wait + 'ms');
         await new Promise(function(r) { setTimeout(r, wait); });
     }
 }
 
 /* ═══════════════════════════════════════════════════
    FETCH WITH RATE-LIMIT RETRY
-   Exponential backoff with jitter for 429 responses.
-   Returns a non-429 response, or the last 429 if
-   all retries are exhausted.
    ═══════════════════════════════════════════════════ */
 async function fetchWithRetry(url, options) {
     var cfg = getRLConfig();
@@ -219,9 +201,7 @@ async function fetchWithRetry(url, options) {
     for (var attempt = 0; attempt <= cfg.maxRetries; attempt++) {
         try {
             var fetchOpts = Object.assign({}, options);
-            /* On retry, create a fresh AbortController if the old one was consumed */
             if (attempt > 0 && state.abortController) {
-                /* Keep using the same abort controller so user-cancel still works */
                 fetchOpts.signal = state.abortController.signal;
             }
 
@@ -230,46 +210,38 @@ async function fetchWithRetry(url, options) {
 
             if (res.status !== 429) return res;
 
-            /* ── 429 received ── */
             lastResponse = res;
             last429Body = await res.text().catch(function() { return ''; });
 
             if (attempt >= cfg.maxRetries) {
                 console.warn('[Connection] 429 rate limit: all ' + cfg.maxRetries + ' retries exhausted');
-                return res; /* Caller will handle the 429 */
+                return res;
             }
 
-            /* Calculate delay with exponential backoff + jitter */
             var delay = cfg.baseDelay * Math.pow(cfg.backoffFactor, attempt);
-            /* Add 0-30% jitter to prevent thundering herd */
             delay += Math.round(Math.random() * delay * 0.3);
             delay = Math.round(delay);
 
-            /* Check Retry-After header — server knows best */
             var retryAfter = res.headers.get('retry-after');
             if (retryAfter) {
                 var serverDelay = parseInt(retryAfter, 10) * 1000;
-                if (serverDelay > 0 && serverDelay < 300000) { /* Cap at 5 minutes */
+                if (serverDelay > 0 && serverDelay < 300000) {
                     delay = Math.max(delay, serverDelay);
                 }
             }
 
-            /* Try to parse quota reset time from Google AI error body */
             try {
                 var parsed429 = JSON.parse(last429Body);
                 if (parsed429.error && parsed429.error.details) {
                     for (var d = 0; d < parsed429.error.details.length; d++) {
                         var detail = parsed429.error.details[d];
-                        if (detail['@type'] && detail['@type'].indexOf('QuotaFailure') > -1) {
-                            /* Google AI often includes retry delay in error details */
-                        }
                         if (detail.retryDelay) {
                             var googleDelay = parseInt(detail.retryDelay, 10) * 1000;
                             if (googleDelay > 0) delay = Math.max(delay, googleDelay);
                         }
                     }
                 }
-            } catch (e) { /* Not JSON or no details — use calculated delay */ }
+            } catch (e) { }
 
             var delaySec = (delay / 1000).toFixed(1);
             console.log('[Connection] 429 rate limited. Retry #' + (attempt + 1) + '/' + cfg.maxRetries + ' in ' + delaySec + 's');
@@ -279,11 +251,8 @@ async function fetchWithRetry(url, options) {
             await new Promise(function(r) { setTimeout(r, delay); });
 
         } catch (fetchErr) {
-            /* AbortError = user cancelled or timeout — don't retry */
             if (fetchErr.name === 'AbortError') throw fetchErr;
-            /* Network error on retry — throw */
             if (attempt > 0) throw fetchErr;
-            /* First attempt network error — let caller handle */
             throw fetchErr;
         }
     }
@@ -302,28 +271,19 @@ function clampMaxTokens(val) {
     return val;
 }
 
-/* ── Mode-aware maxTokens floor ──
-   Coding modes (custom, selfimprove, multiagent) need MUCH more output tokens
-   than chat modes. A user with maxTokens=2048 gets truncated after ~1.5KB of
-   code — way too short for any real file. This function ensures coding modes
-   never use less than the mode's floor, regardless of the user's setting. */
 function getEffectiveMaxTokens(requestedTokens) {
     var clamped = clampMaxTokens(requestedTokens);
-
-    /* Use mode-specific floor from config */
     var mode = state.currentMode || '';
     var modeFloor = (MODE_MAX_TOKENS_FLOOR && MODE_MAX_TOKENS_FLOOR[mode]) || 2048;
-
     if (clamped < modeFloor) {
         console.log('[Connection] Boosting maxTokens from ' + clamped + ' to ' + modeFloor + ' for ' + mode + ' mode');
         return modeFloor;
     }
-
     return clamped;
 }
 
 /* ═══════════════════════════════════════
-   402 PARSER — Always extracts a number, floors at minimum
+   402 PARSER
    ═══════════════════════════════════════ */
 function parse402Affordable(errText) {
     if (!errText) return null;
@@ -352,9 +312,6 @@ function parse402Affordable(errText) {
     return null;
 }
 
-/* ═══════════════════════════════════════════════════
-   402 HANDLER — Always retries at least once
-   ═══════════════════════════════════════════════════ */
 var FALLBACK_RETRY_TOKENS = 128;
 
 function resolveRetryTokens(errText, actualMaxTokens, isRetry) {
@@ -363,28 +320,22 @@ function resolveRetryTokens(errText, actualMaxTokens, isRetry) {
         ? Math.max(extracted - TOKEN_402_SAFETY_MARGIN, MIN_RETRY_TOKENS)
         : FALLBACK_RETRY_TOKENS;
 
-    /* First attempt: retry with reduced tokens if possible */
     if (!isRetry && retryAmount < actualMaxTokens) {
         return retryAmount;
     }
 
-    /* Retry attempt: try one more time with a safe free-tier value instead of giving up */
     if (isRetry) {
         var safeRetry = Math.max(retryAmount, MIN_RETRY_TOKENS);
-        /* Persist the reduced value so future requests don't hit the same wall */
         state.settings.maxTokens = safeRetry;
         import('./storage.js').then(function (s) { s.saveSettings(); });
         var tokensInput = document.getElementById('q-tokens');
         if (tokensInput) tokensInput.value = safeRetry;
-        console.warn('[Connection] 402 retry: persisted maxTokens=' + safeRetry);
-        /* Only give up if we're already at the absolute minimum */
         if (safeRetry <= MIN_RETRY_TOKENS && retryAmount <= MIN_RETRY_TOKENS && extracted == null) {
             return null;
         }
         return safeRetry;
     }
 
-    /* Non-retry fallback: persist if reasonable */
     if (retryAmount >= MIN_MAX_TOKENS) {
         state.settings.maxTokens = retryAmount;
         import('./storage.js').then(function (s) { s.saveSettings(); });
@@ -398,9 +349,7 @@ export function getApiUrl() {
     var endpoint = state.settings.endpoint.replace(/\/+$/, '');
     if (state.settings.provider === 'ollama') return endpoint + '/api/chat';
     if (state.settings.provider === 'openrouter') return 'https://openrouter.ai/api/v1/chat/completions';
-    /* Google AI Studio endpoint already ends with /openai — just append /chat/completions */
     if (state.settings.provider === 'google-ai') return endpoint + '/chat/completions';
-    /* Generic OpenAI-compatible: strip trailing /v1, then append /v1/chat/completions */
     endpoint = endpoint.replace(/\/v1$/, '');
     return endpoint + '/v1/chat/completions';
 }
@@ -458,7 +407,8 @@ function isTrivialMessage(text) {
 
 function isNewProjectRequest(text) {
     var t = text.toLowerCase();
-    if (/\bfix\b/.test(t) && /\b(error|bug|issue|broken)\b/.test(t)) return false;
+    /* ── FIX: Match "bugs" as well as "bug" ── */
+    if (/\bfix\b/.test(t) && /\b(error|bugs?|issues?|broken)\b/.test(t)) return false;
     if (/\b(modify|update|change|refactor|improve)\b/.test(t) && /\b(this|the|existing|current)\b/.test(t)) return false;
     if (/\.js\b|\.py\b|\.html\b|\.css\b|\.ts\b/.test(t) && /\b(file|in|from)\b/.test(t)) return false;
     var newWords = ['code a ', 'code simple ', 'create a ', 'build a ', 'make a ', 'write a ',
@@ -495,7 +445,12 @@ async function buildSafeSystemPrompt(userText) {
             var { getSmartFileContext } = await import('./smart-context.js');
             fileCtx = await getSmartFileContext(userText, budget);
         }
-        if (fileCtx) sys += '\n\n' + FILE_SYSTEM_INSTRUCTIONS + '\n\n' + fileCtx;
+        if (fileCtx) {
+            console.log('[Connection] File context built: ' + fileCtx.length + ' chars');
+            sys += '\n\n' + FILE_SYSTEM_INSTRUCTIONS + '\n\n' + fileCtx;
+        } else {
+            console.log('[Connection] No file context available');
+        }
     } catch (fsError) {
         console.warn('[Connection] File context build failed (non-fatal):', fsError.message);
     }
@@ -503,10 +458,47 @@ async function buildSafeSystemPrompt(userText) {
     return sys;
 }
 
+/* ═══════════════════════════════════════════════════
+   FIX: buildSafeMessages — use model context window
+   instead of contextBudget for total input limit.
+   
+   OLD BUG: contextBudget (25K chars ≈ 7K tokens) was
+   used as the TOTAL input limit. But the system prompt
+   alone (custom mode) + file context can be 30K+ chars.
+   This caused file context to ALWAYS get stripped.
+   
+   NEW: The file context is already limited by
+   contextBudget in getSmartFileContext(). The total
+   input budget should be based on the model's actual
+   context window, not the file budget.
+   ═══════════════════════════════════════════════════ */
 function buildSafeMessages(userText, systemPrompt) {
     var sysTokens = estimateTokens(systemPrompt);
-    var maxInputTokens = estimateTokens(state.settings.contextBudget || 25000);
-    var safeLimit = Math.floor(maxInputTokens * 0.8);
+
+    /* ── FIX: Use model's actual context window for total input budget ── */
+    var modelCtxTokens = 128000; /* Safe default */
+    var modelId = state.settings.model || '';
+    if (state.modelContextLimits[modelId]) {
+        modelCtxTokens = state.modelContextLimits[modelId];
+    } else if (modelId.indexOf(':free') > -1) {
+        /* Free models typically have 128K+ context */
+        modelCtxTokens = 128000;
+    }
+    /* Convert from chars (stored as chars*3.5 approximation) to actual token estimate */
+    /* modelContextLimits stores chars, so convert to tokens */
+    var modelCtxTokensActual = Math.floor(modelCtxTokens / 3.5);
+    if (modelCtxTokensActual < 32000) modelCtxTokensActual = 128000;
+
+    /* Reserve tokens for output */
+    var maxOutputTokens = getEffectiveMaxTokens(state.settings.maxTokens);
+    var maxInputTokens = modelCtxTokensActual - maxOutputTokens;
+    /* Cap at 100K input tokens for credit safety on free tier */
+    if (state.settings.provider === 'openrouter' && !state.settings.apiKey) {
+        maxInputTokens = Math.min(maxInputTokens, 100000);
+    }
+    var safeLimit = Math.floor(maxInputTokens * 0.85);
+
+    console.log('[Connection] buildSafeMessages: sysTokens=' + sysTokens + ' safeLimit=' + safeLimit + ' modelCtx=' + modelCtxTokensActual);
 
     if (sysTokens > safeLimit) {
         console.warn('[Connection] System prompt (' + sysTokens + ' tokens) exceeds safe limit (' + safeLimit + '). Stripping file context.');
@@ -516,17 +508,18 @@ function buildSafeMessages(userText, systemPrompt) {
         var strippedTokens = estimateTokens(sys);
         if (strippedTokens <= safeLimit) {
             systemPrompt = sys;
-            toast('File context stripped — too large for your budget.', 'info');
+            toast('File context stripped — system prompt too large for context window.', 'info');
         } else {
             systemPrompt = state.settings.systemPrompt;
             var st = estimateTokens(systemPrompt);
             if (st > safeLimit) {
                 systemPrompt = systemPrompt.substring(0, Math.floor(safeLimit * 3.5)) + '\n\n[System prompt truncated]';
-                toast('System prompt truncated to fit budget.', 'error');
+                toast('System prompt truncated to fit context window.', 'error');
             }
         }
     }
 
+    /* ── Trim conversation history to fit ── */
     var remainingTokens = safeLimit - estimateTokens(systemPrompt);
     var historySlice = [];
     for (var i = state.conversationHistory.length - 1; i >= 0; i--) {
@@ -549,7 +542,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     for (var m = 0; m < messages.length; m++) totalEstTokens += estimateTokens(messages[m].content);
     console.log('[Connection] Sending ~' + totalEstTokens + ' input + ' + actualMaxTokens + ' output tokens');
 
-    /* ── Client-side throttle before any request ── */
     await throttleRequest();
 
     state.isStreaming = true;
@@ -605,9 +597,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
     state.abortController.abort = function () { if (!abortSource) abortSource = 'user'; originalAbort(); };
 
     try {
-        /* ═══════════════════════════════════════════════════
-           FETCH with automatic 429 retry (exponential backoff)
-           ═══════════════════════════════════════════════════ */
         var res = await fetchWithRetry(getApiUrl(), {
             method: 'POST',
             headers: buildHeaders(),
@@ -618,7 +607,7 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         clearTimeout(fetchTimeoutId);
         fetchTimeoutId = null;
 
-        /* ── Handle 402 (insufficient credits) ── */
+        /* ── Handle 402 ── */
         if (res.status === 402) {
             var err402Text = await res.text().catch(function () { return ''; });
             var retryTokens = resolveRetryTokens(err402Text, actualMaxTokens, overrideMaxTokens != null);
@@ -644,22 +633,20 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                 var reason = (overrideMaxTokens != null)
                     ? 'Auto-retry failed even at reduced tokens. Balance too low.'
                     : 'Balance too low for any response.';
-                throw new Error('INSUFFICIENT_CREDITS: ' + reason + ' Wait for free tier refill (usually ~24h), or reduce Max Tokens in Settings, or add credits at openrouter.ai/settings/credits');
+                throw new Error('INSUFFICIENT_CREDITS: ' + reason + ' Wait for free tier refill, reduce Max Tokens, or add credits.');
             }
         }
 
-        /* ── Handle 429 (rate limit) after all retries exhausted ── */
+        /* ── Handle 429 ── */
         if (res.status === 429) {
             var err429Text = await res.text().catch(function () { return ''; });
 
-            /* ── AUTO MODEL FALLBACK for OpenRouter ── */
             if (state.settings.provider === 'openrouter') {
                 var fallbackModel = getNextFallbackModel(state.settings.model);
                 if (fallbackModel) {
                     console.log('[Connection] 429 exhausted on ' + state.settings.model + ', switching to fallback: ' + fallbackModel);
                     toast('Rate limited on ' + state.settings.model + '. Switching to ' + fallbackModel + '...', 'info');
 
-                    /* Clean up current stream state */
                     clearInterval(stallWatchdog);
                     if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
                     if (fetchTimeoutId) { clearTimeout(fetchTimeoutId); fetchTimeoutId = null; }
@@ -670,7 +657,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                     state.streamBuffer = '';
                     state.thinkingContent = '';
 
-                    /* Temporarily switch model and retry */
                     var originalModel = state.settings.model;
                     state.settings.model = fallbackModel;
                     setConnectionStatus('connecting', 'Retrying with ' + fallbackModel + '...');
@@ -681,15 +667,11 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                         return executeStream(messages, overrideMaxTokens, isAutoContinue);
                     } catch (fallbackErr) {
                         var fbErrMsg = (fallbackErr.message || '').toLowerCase();
-                        /* If fallback returned 404 (model discontinued), try the NEXT fallback instead of giving up */
                         if (fbErrMsg.indexOf('404') > -1 || fbErrMsg.indexOf('not found') > -1 || fbErrMsg.indexOf('does not exist') > -1) {
                             console.warn('[Connection] Fallback ' + fallbackModel + ' returned 404 — trying next fallback');
-                            /* Don't restore original — keep trying more fallbacks */
                             state.settings.model = originalModel;
-                            /* Re-enter the 429 handler with the next fallback model */
                             var nextFallback = getNextFallbackModel(fallbackModel);
                             if (nextFallback) {
-                                console.log('[Connection] Trying next fallback: ' + nextFallback);
                                 toast(fallbackModel + ' unavailable (404). Trying ' + nextFallback + '...', 'info');
                                 state.settings.model = nextFallback;
                                 setConnectionStatus('connecting', 'Retrying with ' + nextFallback + '...');
@@ -702,14 +684,12 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                                 }
                             }
                         }
-                        /* Any other error — restore original model and go to cooldown */
                         state.settings.model = originalModel;
                         throw new Error('RATE_LIMIT: Fallback ' + fallbackModel + ' also failed. ' + err429Text.substring(0, 150));
                     }
                 }
             }
 
-            /* No fallback available — go to cooldown instead of just erroring */
             console.warn('[Connection] 429 rate limit: all retries exhausted, no fallback available');
             state.activeTask.isRunning = false;
             state.activeTask.loopCount = 0;
@@ -719,7 +699,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             updateSendButton();
             startCooldown('429 exhausted on ' + state.settings.model);
             toast('Rate limited. Cooling down for 45s — your message will auto-send.', 'error');
-            /* Queue the current request so it auto-sends after cooldown */
             if (!isAutoContinue) {
                 state.pendingRequest = { type: 'message', text: messages && messages.length > 0 ? (messages[messages.length - 1].content || '') : '' };
             }
@@ -737,10 +716,9 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             else throw new Error('HTTP ' + status + ': ' + errText.substring(0, 300));
         }
 
-        /* ═══════════════════════════════════════
+        /* ═════════════════════════
            STREAM READING
-           ═══════════════════════════════════════ */
-        /* Reset fallback tracking — this model works! */
+           ═════════════════════════ */
         resetFallbackTracking();
         var reader = res.body.getReader();
         var decoder = new TextDecoder();
@@ -798,13 +776,16 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         clearInterval(stallWatchdog);
         if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
 
+        /* ── FIX: Check for <|CONTINUE_TASK|> with proper regex ── */
         var hitLimit = (finishReason === 'length');
         var lastResponse = state.conversationHistory[state.conversationHistory.length - 1];
-        var hasContinueTag = lastResponse && lastResponse.content.match(/\|CONTINUE_TASK\|\s*$/);
+        var hasContinueTag = lastResponse && CONTINUE_TAG_REGEX.test(lastResponse.content);
 
         if (hasContinueTag) {
-            lastResponse.content = lastResponse.content.replace(/\|CONTINUE_TASK\|\s*$/, '').trimEnd();
+            /* ── FIX: Strip the full tag including angle brackets ── */
+            lastResponse.content = lastResponse.content.replace(/<\|CONTINUE_TASK\|>\s*$|\|CONTINUE_TASK\|\s*$/, '').trimEnd();
             hitLimit = true;
+            console.log('[Connection] Detected <|CONTINUE_TASK|> tag — auto-continuing');
         }
 
         if (state.activeTask.isRunning && hitLimit && state.activeTask.loopCount < state.activeTask.maxLoops) {
@@ -813,7 +794,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             setConnectionStatus('connecting', 'Requesting file ' + (state.activeTask.loopCount + 1) + '...');
             state.conversationHistory.push({ role: 'user', content: CONTINUE_MSG_FILE });
 
-            /* ── Provider-aware auto-continue delay ── */
             var continueDelay = getRLConfig().continueDelay;
             setTimeout(function () { sendMessage('', true); }, continueDelay);
         } else {
@@ -845,8 +825,8 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                 setConnectionStatus('disconnected', 'Timeout');
             } else if (abortSource === 'stall') {
                 var stallLastResponse = state.conversationHistory[state.conversationHistory.length - 1];
-                var stallTag = stallLastResponse && stallLastResponse.content.match(/\|CONTINUE_TASK\|\s*$/);
-                if (stallTag) stallLastResponse.content = stallLastResponse.content.replace(/\|CONTINUE_TASK\|\s*$/, '').trimEnd();
+                var stallTag = stallLastResponse && CONTINUE_TAG_REGEX.test(stallLastResponse.content);
+                if (stallTag) stallLastResponse.content = stallLastResponse.content.replace(/<\|CONTINUE_TASK\|>\s*$|\|CONTINUE_TASK\|\s*$/, '').trimEnd();
                 if (state.activeTask.isRunning && (finishReason === 'length' || stallTag) && state.activeTask.loopCount < state.activeTask.maxLoops) {
                     state.activeTask.loopCount++;
                     toast('Stalled. Requesting next file (' + state.activeTask.loopCount + ')...', 'error');
@@ -878,7 +858,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
         } else if (errMsg.indexOf('RATE_LIMIT:') === 0) {
             state.activeTask.isRunning = false; state.activeTask.loopCount = 0;
             state.isStreaming = false; updateSendButton();
-            /* Go to cooldown instead of just showing an error */
             startCooldown('rate limit from fallback');
             var provider = state.settings.provider;
             var advice = provider === 'google-ai'
@@ -938,7 +917,6 @@ export async function sendMessage(userText, isAutoContinue) {
             return;
         }
 
-        /* ── Cooldown guard: queue the request instead of failing ── */
         if (!isAutoContinue && isInCooldown()) {
             var remainingSecs = Math.ceil((state.cooldownUntil - Date.now()) / 1000);
             toast('Rate limited. Your message will auto-send in ' + remainingSecs + 's...', 'info');
@@ -948,7 +926,6 @@ export async function sendMessage(userText, isAutoContinue) {
 
         if (!isAutoContinue) {
             if (!userText.trim()) return;
-            /* Intercept plain 'continue' when last response was truncated */
             if (state.responseTruncated && /^continue$/i.test(userText.trim())) {
                 continueResponse();
                 return;
@@ -959,7 +936,6 @@ export async function sendMessage(userText, isAutoContinue) {
             addUserMessage(userText);
             state.conversationHistory.push({ role: 'user', content: userText });
 
-            /* Clear truncated flag and remove button when user sends a new message */
             state.responseTruncated = false;
             removeContinueButton();
 
@@ -984,8 +960,7 @@ export async function sendMessage(userText, isAutoContinue) {
 }
 
 /* ═══════════════════════════════════════════════════
-   CONTINUE RESPONSE — Resumes a truncated response
-   Called by: Continue button, /continue command, or typing "continue"
+   CONTINUE RESPONSE
    ═══════════════════════════════════════════════════ */
 export async function continueResponse() {
     if (state.isStreaming) {
@@ -997,11 +972,16 @@ export async function continueResponse() {
         return;
     }
 
-    /* Clear the truncated flag and remove the continue button */
     state.responseTruncated = false;
     removeContinueButton();
 
-    /* Push a continuation prompt without showing it as a user bubble */
+    /* ── FIX: Set activeTask.isRunning so auto-continue works for subsequent truncations ── */
+    if (CONTINUATION_MODES.indexOf(state.currentMode) !== -1) {
+        state.activeTask.isRunning = true;
+        /* Preserve existing loop count if any */
+        if (state.activeTask.loopCount === 0) state.activeTask.loopCount = 1;
+    }
+
     state.conversationHistory.push({ role: 'user', content: 'Continue exactly where you left off. Do not repeat anything already said.' });
 
     toast('Continuing response...', 'info');
@@ -1013,6 +993,7 @@ export async function continueResponse() {
     } catch (err) {
         console.error('[Connection] FATAL in continueResponse:', err);
         state.isStreaming = false;
+        state.activeTask.isRunning = false;
         updateSendButton();
         toast('Failed to continue: ' + (err.message || 'unknown').substring(0, 100), 'error');
     }
@@ -1170,11 +1151,9 @@ async function fetchGoogleAIModels() {
     toast('Loaded ' + geminiModels.length + ' Gemini models', 'success');
 }
 
-/* ── Check if a model from OpenRouter API is completely free (zero cost) ── */
 function isModelFree(m) {
     if (!m || !m.pricing) return false;
     var p = m.pricing;
-    /* pricing.prompt and pricing.completion are strings like "0", "0.00001", etc. */
     var promptFree = (p.prompt === '0' || p.prompt === '0.0' || p.prompt === '0.00' || parseFloat(p.prompt) === 0);
     var completionFree = (p.completion === '0' || p.completion === '0.0' || p.completion === '0.00' || parseFloat(p.completion) === 0);
     return promptFree && completionFree;
@@ -1192,26 +1171,16 @@ async function fetchOpenRouterModels() {
         var d = await r.json();
         var allModels = d.data || [];
 
-        /* Store context limits for all models */
         for (var x = 0; x < allModels.length; x++) { var ctx = allModels[x].context_length; if (ctx) state.modelContextLimits[allModels[x].id] = Math.floor(ctx * 3.5); }
 
-        /* ═══════════════════════════════════════════════════
-           FILTER: Only models with pricing.prompt=0 AND pricing.completion=0
-           This is the authoritative way to determine free models on OpenRouter.
-           The :free suffix is NOT reliable — some :free models have been
-           discontinued (404) and some free models lack the :free suffix.
-           ═══════════════════════════════════════════════════ */
         var trulyFree = allModels.filter(isModelFree);
-        console.log('[Connection] OpenRouter: ' + allModels.length + ' total models, ' + trulyFree.length + ' completely free (pricing=0)');
+        console.log('[Connection] OpenRouter: ' + allModels.length + ' total models, ' + trulyFree.length + ' completely free');
 
-        /* ── Build dynamic fallback list from verified free models ── */
         state.verifiedFreeModelIds = trulyFree.map(function (m) { return m.id; });
-        /* Persist for fallback use even before next fetch */
         try {
             localStorage.setItem('sai_verified_free_models', JSON.stringify(state.verifiedFreeModelIds));
-        } catch (e) { /* localStorage might be full — non-fatal */ }
+        } catch (e) { }
 
-        /* ── Top tier: preferred free models for coding/chat ── */
         var topTierIds = [
             'xiaomi/mimo-v2-pro:free',
             'minimax/minimax-m2.7:free',
@@ -1226,7 +1195,6 @@ async function fetchOpenRouterModels() {
         var topTierModels = [];
         for (var t = 0; t < topTierIds.length; t++) {
             var found = trulyFree.find(function (m) { return m.id === topTierIds[t]; });
-            /* Also try base model name in case :free variant has a different ID */
             if (!found) {
                 var baseId = topTierIds[t].replace(/:free$/, '');
                 found = trulyFree.find(function (m) { return m.id === baseId; });
@@ -1234,25 +1202,21 @@ async function fetchOpenRouterModels() {
             if (found) topTierModels.push(found);
         }
 
-        /* ── All other free models (excluding top tier and reasoning) ── */
         var topTierIdSet = {};
         for (var ti = 0; ti < topTierModels.length; ti++) topTierIdSet[topTierModels[ti].id] = true;
         var freeModels = trulyFree.filter(function (m) {
             return !topTierIdSet[m.id];
         }).sort(function (a, b) { return a.id.localeCompare(b.id); });
 
-        /* ── Free reasoning models ── */
         var reasoningModels = trulyFree.filter(function (m) {
             var id = m.id.toLowerCase();
             return (id.indexOf('deepseek-r1') > -1 || id.indexOf('qwq') > -1 || id.indexOf('reasoner') > -1);
         }).sort(function (a, b) { return a.id.localeCompare(b.id); });
 
-        /* ── Remove reasoning models from the general free list to avoid duplicates ── */
         var reasoningIdSet = {};
         for (var ri = 0; ri < reasoningModels.length; ri++) reasoningIdSet[reasoningModels[ri].id] = true;
         freeModels = freeModels.filter(function (m) { return !reasoningIdSet[m.id]; });
 
-        /* ── Build the dropdown HTML ── */
         var html = '';
         if (topTierModels.length > 0) {
             html += '<option disabled style="color:var(--accent);font-weight:700">── 🔥 Free Top Tier (pricing = $0) ──</option>';
@@ -1278,7 +1242,7 @@ async function fetchOpenRouterModels() {
             listEl.value = defaultModel;
             toast('Auto-selected: ' + defaultModel + ' (verified free)', 'success');
         } else {
-            toast(topTierModels.length + ' top tier, ' + freeModels.length + ' other free models loaded (all verified $0)', 'success');
+            toast(topTierModels.length + ' top tier, ' + freeModels.length + ' other free models loaded', 'success');
         }
     } catch (e) { toast('Failed: ' + e.message, 'error'); listEl.style.display = 'none'; }
 }

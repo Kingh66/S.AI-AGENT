@@ -1,6 +1,6 @@
+file:js/modules/effects.js
 /* ═══════════════════════════════════════
    EFFECTS — Neural Wave Background
-   Futuristic AI brain waves visualization
    ═══════════════════════════════════════ */
 import { state } from './state.js';
 
@@ -41,15 +41,12 @@ class NeuralNode {
     }
 
     update() {
-        // Gentle floating motion
         this.x += this.vx;
         this.y += this.vy;
 
-        // Boundary bounce
         if (this.x < 50 || this.x > canvas.width - 50) this.vx *= -1;
         if (this.y < 50 || this.y > canvas.height - 50) this.vy *= -1;
 
-        // Mouse attraction
         if (mouse.active) {
             const dx = mouse.x - this.x;
             const dy = mouse.y - this.y;
@@ -61,11 +58,9 @@ class NeuralNode {
             }
         }
 
-        // Damping
         this.vx *= 0.99;
         this.vy *= 0.99;
 
-        // Pulse animation
         this.pulsePhase += this.pulseSpeed;
         this.thoughtLevel = (Math.sin(this.pulsePhase) + 1) / 2;
     }
@@ -74,7 +69,6 @@ class NeuralNode {
         const pulse = 1 + Math.sin(this.pulsePhase) * 0.3;
         const r = this.radius * pulse;
 
-        // Outer glow
         const gradient = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, r * 4);
         gradient.addColorStop(0, this.getColor(0.6));
         gradient.addColorStop(0.5, this.getColor(0.2));
@@ -85,13 +79,11 @@ class NeuralNode {
         ctx.fillStyle = gradient;
         ctx.fill();
 
-        // Core
         ctx.beginPath();
         ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
         ctx.fillStyle = this.getColor(1);
         ctx.fill();
 
-        // Inner bright spot
         ctx.beginPath();
         ctx.arc(this.x, this.y, r * 0.4, 0, Math.PI * 2);
         ctx.fillStyle = '#ffffff';
@@ -100,13 +92,9 @@ class NeuralNode {
 
     getColor(alpha) {
         const t = this.thoughtLevel;
-        if (t < 0.33) {
-            return `rgba(0, 245, 255, ${alpha})`;
-        } else if (t < 0.66) {
-            return `rgba(139, 92, 246, ${alpha})`;
-        } else {
-            return `rgba(6, 255, 165, ${alpha})`;
-        }
+        if (t < 0.33) return `rgba(0, 245, 255, ${alpha})`;
+        else if (t < 0.66) return `rgba(139, 92, 246, ${alpha})`;
+        else return `rgba(6, 255, 165, ${alpha})`;
     }
 }
 
@@ -118,22 +106,24 @@ class NeuralWave {
         this.maxRadius = 400;
         this.alpha = 0.8;
         this.speed = CONFIG.waveSpeed;
+        this.alive = true; /* ── FIX: Track alive state separately ── */
     }
 
     update() {
         this.radius += this.speed;
         this.alpha -= CONFIG.waveDecay;
-        return this.alpha > 0 && this.radius < this.maxRadius;
+        this.alive = this.alpha > 0 && this.radius < this.maxRadius;
+        return this.alive;
     }
 
     draw() {
+        if (!this.alive) return;
         ctx.beginPath();
         ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
         ctx.strokeStyle = `rgba(0, 245, 255, ${this.alpha * 0.5})`;
         ctx.lineWidth = 2;
         ctx.stroke();
 
-        // Inner wave
         ctx.beginPath();
         ctx.arc(this.x, this.y, this.radius * 0.7, 0, Math.PI * 2);
         ctx.strokeStyle = `rgba(139, 92, 246, ${this.alpha * 0.3})`;
@@ -155,7 +145,6 @@ class DataStream {
         this.progress += this.speed;
         if (this.progress >= 1) {
             this.progress = 0;
-            // Trigger a neural wave at destination
             if (Math.random() < 0.3) {
                 neuralWaves.push(new NeuralWave(this.end.x, this.end.y));
             }
@@ -166,7 +155,6 @@ class DataStream {
         const x = this.start.x + (this.end.x - this.start.x) * this.progress;
         const y = this.start.y + (this.end.y - this.start.y) * this.progress;
 
-        // Data packet glow
         const gradient = ctx.createRadialGradient(x, y, 0, x, y, this.packetSize * 3);
         gradient.addColorStop(0, 'rgba(6, 255, 165, 0.9)');
         gradient.addColorStop(0.5, 'rgba(6, 255, 165, 0.3)');
@@ -177,7 +165,6 @@ class DataStream {
         ctx.fillStyle = gradient;
         ctx.fill();
 
-        // Core packet
         ctx.beginPath();
         ctx.arc(x, y, this.packetSize, 0, Math.PI * 2);
         ctx.fillStyle = '#06ffa5';
@@ -197,7 +184,6 @@ function initBackground() {
     ctx = canvas.getContext('2d');
     resizeCanvas();
 
-    // Create neural nodes
     particles = [];
     for (let i = 0; i < CONFIG.particleCount; i++) {
         particles.push(new NeuralNode(
@@ -206,7 +192,6 @@ function initBackground() {
         ));
     }
 
-    // Create some initial data streams
     dataStreams = [];
     for (let i = 0; i < 15; i++) {
         const start = particles[Math.floor(Math.random() * particles.length)];
@@ -216,7 +201,6 @@ function initBackground() {
         }
     }
 
-    // Event listeners
     window.addEventListener('resize', resizeCanvas);
     canvas.addEventListener('mousemove', (e) => {
         mouse.x = e.clientX;
@@ -236,7 +220,6 @@ function resizeCanvas() {
 }
 
 function drawBackground() {
-    // Dark gradient background
     const gradient = ctx.createRadialGradient(
         canvas.width / 2, canvas.height / 2, 0,
         canvas.width / 2, canvas.height / 2, canvas.width
@@ -289,16 +272,13 @@ function drawBrainOutline() {
     ctx.save();
     ctx.translate(cx, cy);
 
-    // Subtle brain silhouette
     ctx.beginPath();
-    // Left hemisphere
     ctx.moveTo(-scale * 0.3, -scale * 0.5);
     ctx.bezierCurveTo(
         -scale * 0.6, -scale * 0.4,
         -scale * 0.7, scale * 0.2,
         -scale * 0.3, scale * 0.5
     );
-    // Right hemisphere
     ctx.bezierCurveTo(
         -scale * 0.1, scale * 0.4,
         -scale * 0.1, -scale * 0.2,
@@ -330,35 +310,28 @@ function animate() {
     drawBackground();
     drawBrainOutline();
 
-    // Update and draw neural waves
-    neuralWaves = neuralWaves.filter(wave => {
-        wave.update();
-        wave.draw();
-        return wave.update();
-    });
+    /* ── FIX: Update and draw waves in separate passes, don't call update() twice ── */
+    for (let i = neuralWaves.length - 1; i >= 0; i--) {
+        neuralWaves[i].draw();
+        if (!neuralWaves[i].update()) {
+            neuralWaves.splice(i, 1);
+        }
+    }
 
-    // Update particles
     particles.forEach(p => p.update());
-
-    // Draw connections
     drawConnections();
-
-    // Draw particles
     particles.forEach(p => p.draw());
 
-    // Update and draw data streams
     dataStreams.forEach(stream => {
         stream.update();
         stream.draw();
     });
 
-    // Randomly spawn new waves from active nodes
     if (Math.random() < 0.02) {
         const activeNode = particles[Math.floor(Math.random() * particles.length)];
         neuralWaves.push(new NeuralWave(activeNode.x, activeNode.y));
     }
 
-    // Add floating data streams occasionally
     if (dataStreams.length < 20 && Math.random() < 0.01) {
         const start = particles[Math.floor(Math.random() * particles.length)];
         const end = particles[Math.floor(Math.random() * particles.length)];
@@ -367,13 +340,11 @@ function animate() {
         }
     }
 
-    // Limit neural waves
     if (neuralWaves.length > 10) {
-        neuralWaves.shift();
+        neuralWaves.splice(0, neuralWaves.length - 10);
     }
 
     animationId = requestAnimationFrame(animate);
 }
 
-// Export for external trigger
 export { initBackground };
