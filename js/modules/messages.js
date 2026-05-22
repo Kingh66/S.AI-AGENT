@@ -2,12 +2,8 @@
    MESSAGES — Rendering, streaming, actions
    Advanced rendering with collapsible phases
    
-   PERF FIX: Fast path for simple responses.
-   - Short responses (<500 chars, no code blocks)
-     skip the full markdown parser entirely
-   - wrapThinkingPhases() no longer double-parses
-   - Prism.js only runs when code blocks exist
-   - Streaming render throttle reduced from 25ms → 16ms
+   PERF: Fast path for simple responses.
+   FIX: Always clear streaming state in finalizeStream.
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { parseMarkdown } from './markdown.js';
@@ -20,7 +16,7 @@ let renderTimer = null;
 
 function getRenderThrottle() {
     if (state.settings && state.settings.provider === 'ollama') return 80;
-    return 16; /* ~60fps instead of 25ms ~40fps */
+    return 16;
 }
 
 let lastRenderTime = 0;
@@ -112,7 +108,6 @@ export function appendStreamChunk(chunk) {
     receivedAnyRealText = true;
     state.streamBuffer += chunk;
 
-    /* Count backticks in full buffer for code block detection */
     backtickCount = 0;
     var buf = state.streamBuffer;
     for (var bi = 0; bi < buf.length - 2; bi++) {
@@ -137,7 +132,6 @@ export function appendStreamChunk(chunk) {
 
             if (!state.streamElement) return;
 
-            /* Remove thinking block during streaming (non-Ollama) */
             if (!isOllamaSession()) {
                 var thinkBlock = state.streamElement.querySelector('.thinking-block');
                 if (thinkBlock) thinkBlock.remove();
@@ -191,14 +185,6 @@ function removeCursor(container) {
     if (cursor) cursor.remove();
 }
 
-/* ═══════════════════════════════════════════════════
-   SIMPLE TEXT → HTML — Fast path for short responses
-   
-   For responses under 500 chars with no code blocks,
-   this avoids the full markdown parser entirely.
-   Handles: bold, italic, inline code, line breaks.
-   ~50x faster than parseMarkdown for simple text.
-   ═══════════════════════════════════════════════════ */
 function simpleTextToHtml(text) {
     var html = escapeHtml(text);
     html = html.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>');
@@ -209,12 +195,6 @@ function simpleTextToHtml(text) {
     return '<p>' + html + '</p>';
 }
 
-/* ═══════════════════════════════════════════════════
-   CHECK IF RESPONSE NEEDS FULL PARSING
-   
-   Only responses with code blocks, tables, headers,
-   or structured markers need the full parser.
-   ═══════════════════════════════════════════════════ */
 function needsFullParse(text) {
     if (text.length > 2000) return true;
     if (text.indexOf('```') > -1) return true;
@@ -230,8 +210,12 @@ function needsFullParse(text) {
 /* ═══════════════════════════════════════════════════
    FINALIZE — Render the complete message
    
-   PERF: Uses fast path for simple responses.
-   Complex responses get full parsing + highlighting.
+   FIX: Always clear isStreaming and update the send
+   button. The old code only did this when
+   !state.activeTask.isRunning, which meant custom/
+   selfimprove/multiagent modes kept the stop button
+   and streaming cursor visible until connection.js
+   got around to clearing it seconds later.
    ═══════════════════════════════════════════════════ */
 export function finalizeStream() {
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
@@ -255,41 +239,24 @@ export function finalizeStream() {
             clean = '⚠️ No response received. Connection may have been interrupted.';
         }
 
-        /* ── Build thinking block if we have reasoning content ── */
         var thinkHtml = '';
         if (state.thinkingContent && state.thinkingContent.length > 10 && !isOllamaSession()) {
             thinkHtml = buildFinalThinkingBlock(state.thinkingContent);
         }
         state.thinkingContent = '';
 
-        /* ═══════════════════════════════════════════════════
-           FAST PATH vs FULL PATH
-           
-           Simple responses ("Hello!", "Sure, I can help.")
-           skip the full markdown parser entirely.
-           This makes short responses appear instantly
-           instead of waiting for parser overhead.
-           ═══════════════════════════════════════════════════ */
         var renderedContent;
         var hasCodeBlocks = clean.indexOf('```') > -1;
 
         if (!needsFullParse(clean)) {
-            /* FAST PATH: Simple text, no code blocks, no structure */
             renderedContent = simpleTextToHtml(clean);
         } else {
-            /* FULL PATH: Markdown parsing + phase wrapping */
             renderedContent = parseMarkdown(clean);
             renderedContent = wrapThinkingPhases(renderedContent, clean);
         }
 
         state.streamElement.innerHTML = thinkHtml + renderedContent;
 
-        /* ═══════════════════════════════════════════════════
-           CONDITIONAL HIGHLIGHTING
-           
-           Only run Prism.js if there are actual code blocks.
-           A simple "Hello!" response doesn't need it.
-           ═══════════════════════════════════════════════════ */
         if (hasCodeBlocks) {
             var el = state.streamElement;
             requestAnimationFrame(function () { highlightCodeBlocks(el); });
@@ -297,7 +264,6 @@ export function finalizeStream() {
 
         state.conversationHistory.push({ role: 'assistant', content: clean });
 
-        /* Voice chat TTS */
         if (voiceState.isVoiceChat) {
             import('./voice.js').then(function (m) {
                 m.stopListening();
@@ -316,44 +282,34 @@ export function finalizeStream() {
         fastScroll();
     }
 
-    if (!state.activeTask.isRunning) {
-        state.isStreaming = false;
-        updateSendButton();
-    }
+    /* ═══════════════════════════════════════════════════
+       FIX: Always clear streaming state immediately.
+       
+       OLD BUG: This was gated on !state.activeTask.isRunning.
+       For custom/selfimprove/multiagent modes, isRunning
+       was true, so the stop button and streaming cursor
+       persisted for seconds until connection.js cleared
+       them in its finally block.
+       
+       NEW: Always clear immediately. connection.js will
+       re-set isStreaming=true if it needs to auto-continue.
+       ═══════════════════════════════════════════════════ */
+    state.isStreaming = false;
+    updateSendButton();
 }
 
-/* ═══════════════════════════════════════════════════
-   WRAP THINKING PHASES
-   
-   PERF: No longer double-parses markdown. The phase
-   section (which is collapsed by default) is rendered
-   with simpleTextToHtml instead of the full parser.
-   Only the visible output section gets full parsing.
-   ═══════════════════════════════════════════════════ */
 function wrapThinkingPhases(html, rawText) {
-    /* Only wrap if the response starts with a plan or reading phase */
     var hasPlan = rawText.indexOf('📋') > -1 || /\bPLAN\b/i.test(rawText.substring(0, 500));
     var hasReading = rawText.indexOf('📁') > -1 || /\bWORKING ON\b/i.test(rawText.substring(0, 500));
     var hasChecklist = rawText.indexOf('☐') > -1;
 
     if (!hasPlan && !hasReading && !hasChecklist) return html;
 
-    /* Find where the "real output" starts */
     var phaseEndMarker = null;
     var markers = [
-        '📊 SUMMARY',
-        '📦 FILES READY',
-        'REVIEW BEFORE APPLYING',
-        'FILES READY TO APPLY',
-        '## Findings',
-        '## Bugs Found',
-        '## Issues',
-        '## Results',
-        '🐛',
-        '🔴',
-        'Bug #',
-        'Issue #',
-        '```file:'
+        '📊 SUMMARY', '📦 FILES READY', 'REVIEW BEFORE APPLYING',
+        'FILES READY TO APPLY', '## Findings', '## Bugs Found',
+        '## Issues', '## Results', '🐛', '🔴', 'Bug #', 'Issue #', '```file:'
     ];
 
     for (var m = 0; m < markers.length; m++) {
@@ -363,13 +319,11 @@ function wrapThinkingPhases(html, rawText) {
         }
     }
 
-    /* If no end marker found, don't wrap */
     if (phaseEndMarker === null || phaseEndMarker < 100) return html;
 
     var phaseText = rawText.substring(0, phaseEndMarker);
     var outputText = rawText.substring(phaseEndMarker);
 
-    /* Count items in the phase */
     var stepCount = (phaseText.match(/☐/g) || []).length;
     var fileCount = (phaseText.match(/📁/g) || []).length;
     var doneCount = (phaseText.match(/✅/g) || []).length;
@@ -381,12 +335,6 @@ function wrapThinkingPhases(html, rawText) {
 
     var uid = 'phase-' + Date.now();
 
-    /* ═══════════════════════════════════════════════════
-       PERF: Phase section uses simpleTextToHtml
-       because it's COLLAPSED by default — the user
-       won't see it unless they click to expand.
-       No need for full markdown parsing on hidden content.
-       ═══════════════════════════════════════════════════ */
     var phaseHtml = '<div class="thinking-phase" id="' + uid + '">' +
         '<div class="thinking-phase-header" onclick="toggleThinkingPhase(\'' + uid + '\')">' +
         '<span class="phase-icon"><i class="fas fa-route"></i></span>' +
@@ -397,14 +345,11 @@ function wrapThinkingPhases(html, rawText) {
         simpleTextToHtml(phaseText) +
         '</div></div>';
 
-    /* The visible output section gets full parsing (already done — use the pre-parsed html,
-       but we need to extract the output portion from it) */
     var outputHtml = parseMarkdown(outputText);
 
     return phaseHtml + outputHtml;
 }
 
-/* ── Thinking block for reasoning models ── */
 function buildFinalThinkingBlock(text) {
     if (!text || text.length < 10) return '';
     if (isOllamaSession()) return '';
@@ -424,7 +369,6 @@ function buildFinalThinkingBlock(text) {
         '</div>';
 }
 
-/* ── Global toggle for thinking/phase blocks ── */
 window.toggleThinkingPhase = function (uid) {
     var block = document.getElementById(uid);
     if (!block) return;
@@ -435,16 +379,9 @@ window.toggleThinkingPhase = function (uid) {
     if (body.classList.contains('collapsed')) {
         body.classList.remove('collapsed');
         toggle.classList.remove('collapsed');
-        /* ═══════════════════════════════════════════════════
-           LAZY RE-RENDER: When the user expands a collapsed
-           phase that was rendered with simpleTextToHtml,
-           re-render it with full parseMarkdown for proper
-           formatting (code blocks, tables, etc.)
-           ═══════════════════════════════════════════════════ */
         var phaseBody = body;
         var currentHtml = phaseBody.innerHTML;
         if (currentHtml.indexOf('language-') === -1 && currentHtml.indexOf('<table') === -1) {
-            /* This was rendered with simpleTextToHtml — upgrade to full */
             var rawText = phaseBody.textContent || '';
             if (rawText.length > 50) {
                 phaseBody.innerHTML = parseMarkdown(rawText);
@@ -457,7 +394,6 @@ window.toggleThinkingPhase = function (uid) {
     }
 };
 
-/* Keep the old toggle for backward compat */
 window.toggleThinkingBlock = function (el) {
     var block;
     if (el && el.closest) block = el.closest('.thinking-phase') || el.closest('.thinking-block');
@@ -479,9 +415,6 @@ window.toggleThinkingBlock = function (el) {
     }
 };
 
-/* ═══════════════════════════════════════════════════
-   CONTINUE BUTTON
-   ═══════════════════════════════════════════════════ */
 export function showContinueButton() {
     removeContinueButton();
     var lastBotMsg = document.querySelector('.message.bot:last-child .msg-content');
@@ -505,6 +438,7 @@ export function removeContinueButton() {
 
 export function updateSendButton() {
     var btn = document.getElementById('send-btn');
+    if (!btn) return;
     if (state.isStreaming) {
         btn.classList.add('stop');
         btn.innerHTML = '<i class="fas fa-stop"></i>';
