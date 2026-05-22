@@ -942,23 +942,102 @@ MultiAgentOrchestrator.prototype._doFetch = function(agentName, model, systemCon
 
         fetch(url, { method: 'POST', headers: headers, body: JSON.stringify(payload), signal: controller.signal }).then(function(response) {
             clearTimeout(fetchTimeout); clearTimeout(timeoutId);
-            if (!response.ok) { return response.text().then(function(errText) { throw new Error('HTTP ' + response.status + ': ' + errText.substring(0, 500)); }); }
-            var reader = response.body.getReader(), decoder = new TextDecoder(), fullContent = '';
+            if (!response.ok) {
+                return response.text().then(function(errText) {
+                    throw new Error('HTTP ' + response.status + ': ' + errText.substring(0, 500));
+                });
+            }
+            var reader = response.body.getReader(),
+                decoder = new TextDecoder(),
+                fullContent = '',
+                streamDone = false;  // ← FIX: track stream completion
+
             function readChunk() {
                 return reader.read().then(function(result) {
                     if (result.done) {
-                        multiAgentState.conversationHistory.push({ role: 'user', content: prompt }, { role: 'assistant', content: fullContent });
-                        if (multiAgentState.conversationHistory.length > 20) multiAgentState.conversationHistory = multiAgentState.conversationHistory.slice(-10);
-                        resolve(self.parseAgentResult(agentName, fullContent)); return;
+                        finishStream();
+                        return;
                     }
                     var chunk = decoder.decode(result.value, { stream: true });
-                    if (useOllama) { var lines = chunk.split('\n').filter(function(l) { return l.trim(); }); for (var i = 0; i < lines.length; i++) { try { var d = JSON.parse(lines[i]); if (d.message && d.message.content) fullContent += d.message.content; } catch (e) {} } }
-                    else { var sseLines = chunk.split('\n'); for (var j = 0; j < sseLines.length; j++) { if (!sseLines[j].startsWith('data: ')) continue; var data = sseLines[j].slice(6).trim(); if (data === '[DONE]') continue; try { var parsed = JSON.parse(data); var content = parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content; if (content) fullContent += content; } catch (e) {} } }
+
+                    if (useOllama) {
+                        var lines = chunk.split('\n').filter(function(l) { return l.trim(); });
+                        for (var i = 0; i < lines.length; i++) {
+                            try {
+                                var d = JSON.parse(lines[i]);
+                                if (d.message && d.message.content) fullContent += d.message.content;
+                                if (d.done) {
+                                    streamDone = true;
+                                    break;  // ← FIX: break inner loop
+                                }
+                            } catch (e) {}
+                        }
+                    } else {
+                        var sseLines = chunk.split('\n');
+                        for (var j = 0; j < sseLines.length; j++) {
+                            if (!sseLines[j].startsWith('data:')) continue;
+                            var data = sseLines[j].replace(/^data:\s*/, '').trim();
+
+                            /* ═══════════════════════════════════════════════════
+                               FIX: Break immediately on [DONE] or finish_reason
+                               
+                               OLD BUG: `if (data === '[DONE]') continue;`
+                               kept the outer while loop alive, calling
+                               reader.read() until HTTP closed (2-5s delay).
+                               If the connection dropped after [DONE], the
+                               promise never resolved → "No response" error.
+                               ═══════════════════════════════════════════════════ */
+                            if (data === '[DONE]') {
+                                streamDone = true;
+                                break;  // ← FIX: break inner SSE loop
+                            }
+
+                            if (!data) continue;
+
+                            try {
+                                var parsed = JSON.parse(data);
+                                if (!parsed.choices || !parsed.choices[0]) continue;
+                                var delta = parsed.choices[0].delta;
+                                var content = delta && delta.content ? delta.content : null;
+                                if (content) fullContent += content;
+
+                                /* FIX: Also break on finish_reason */
+                                if (parsed.choices[0].finish_reason 
+                                    && parsed.choices[0].finish_reason !== 'null') {
+                                    streamDone = true;
+                                    break;  // ← FIX: break on finish_reason
+                                }
+                            } catch (e) {}
+                        }
+                    }
+
+                    /* FIX: If stream is done, stop reading immediately */
+                    if (streamDone) {
+                        finishStream();
+                        return;
+                    }
+
                     readChunk();
                 });
             }
+
+            function finishStream() {
+                multiAgentState.conversationHistory.push(
+                    { role: 'user', content: prompt },
+                    { role: 'assistant', content: fullContent }
+                );
+                if (multiAgentState.conversationHistory.length > 20) {
+                    multiAgentState.conversationHistory = 
+                        multiAgentState.conversationHistory.slice(-10);
+                }
+                resolve(self.parseAgentResult(agentName, fullContent));
+            }
+
             readChunk();
-        }).catch(function(error) { clearTimeout(fetchTimeout); clearTimeout(timeoutId); reject(error); });
+        }).catch(function(error) {
+            clearTimeout(fetchTimeout); clearTimeout(timeoutId);
+            reject(error);
+        });
     });
 };
 
