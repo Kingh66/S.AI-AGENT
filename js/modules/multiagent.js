@@ -1,14 +1,11 @@
 /* ═══════════════════════════════════════
    MULTI-AGENT ORCHESTRATION
-   Planner → Coder → Critic → Tester flow
-   Self-contained payload + chat rendering
-   + smart file context (truncated per agent)
-   + auto-retry on 402 with token reduction
-   + DYNAMIC MODEL DISCOVERY (no hardcoded models)
+   + DYNAMIC MODEL DISCOVERY
    + 429 rate-limit model switching
-   + 404 model pruning from verified list
-   + Lenient parsing for free models
-   + Inter-agent delay to avoid rate limit cascade
+   + 404 model pruning
+   + LENIENT validation for free models
+   + Inter-agent delay
+   + Trivial plan detection
    ═══════════════════════════════════════ */
 import { state } from './state.js';
 import { toast, setConnectionStatus, autoResize, getTimeStr, highlightCodeBlocks } from './ui.js';
@@ -40,30 +37,22 @@ var RATE_LIMIT_COOLDOWN_MS = 90000;
 function markRateLimited(modelId) {
     if (!modelId) return;
     _rateLimitedModels[modelId] = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-    console.log('[MultiAgent] Rate-limited: ' + modelId + ' (cooldown ' + (RATE_LIMIT_COOLDOWN_MS / 1000) + 's)');
+    console.log('[MultiAgent] Rate-limited: ' + modelId + ' (cooldown 90s)');
 }
 
 function isRateLimited(modelId) {
     if (!modelId) return false;
     var expiry = _rateLimitedModels[modelId];
     if (!expiry) return false;
-    if (Date.now() > expiry) {
-        delete _rateLimitedModels[modelId];
-        return false;
-    }
+    if (Date.now() > expiry) { delete _rateLimitedModels[modelId]; return false; }
     return true;
 }
 
-function clearRateLimits() {
-    _rateLimitedModels = {};
-}
+function clearRateLimits() { _rateLimitedModels = {}; }
 
 function countRateLimitedModels() {
-    var count = 0;
-    var now = Date.now();
-    for (var key in _rateLimitedModels) {
-        if (_rateLimitedModels[key] > now) count++;
-    }
+    var count = 0, now = Date.now();
+    for (var key in _rateLimitedModels) { if (_rateLimitedModels[key] > now) count++; }
     return count;
 }
 
@@ -73,28 +62,11 @@ function countRateLimitedModels() {
 function pruneDeadModel(modelId) {
     if (!modelId || !_verifiedFreeModels) return;
     var idx = _verifiedFreeModels.indexOf(modelId);
-    if (idx > -1) {
-        _verifiedFreeModels.splice(idx, 1);
-        console.log('[MultiAgent] Pruned 404 model: ' + modelId + ' (' + _verifiedFreeModels.length + ' remaining)');
-    }
-    if (state.verifiedFreeModelIds) {
-        var sIdx = state.verifiedFreeModelIds.indexOf(modelId);
-        if (sIdx > -1) state.verifiedFreeModelIds.splice(sIdx, 1);
-    }
-    try {
-        var cached = localStorage.getItem('sai_verified_free_models');
-        if (cached) {
-            var parsed = JSON.parse(cached);
-            var cIdx = parsed.indexOf(modelId);
-            if (cIdx > -1) {
-                parsed.splice(cIdx, 1);
-                localStorage.setItem('sai_verified_free_models', JSON.stringify(parsed));
-            }
-        }
-    } catch (e) {}
+    if (idx > -1) { _verifiedFreeModels.splice(idx, 1); console.log('[MultiAgent] Pruned 404 model: ' + modelId + ' (' + _verifiedFreeModels.length + ' remaining)'); }
+    if (state.verifiedFreeModelIds) { var sIdx = state.verifiedFreeModelIds.indexOf(modelId); if (sIdx > -1) state.verifiedFreeModelIds.splice(sIdx, 1); }
+    try { var cached = localStorage.getItem('sai_verified_free_models'); if (cached) { var parsed = JSON.parse(cached); var cIdx = parsed.indexOf(modelId); if (cIdx > -1) { parsed.splice(cIdx, 1); localStorage.setItem('sai_verified_free_models', JSON.stringify(parsed)); } } } catch (e) {}
 }
 
-/* Preference patterns per agent role */
 var AGENT_MODEL_PREFERENCES = {
     planner: ['mimo', 'minimax', 'qwen3', 'deepseek', 'nemotron', 'llama-4', 'gemma', 'step', 'glm'],
     coder:   ['minimax', 'qwen3', 'deepseek', 'mimo', 'llama-4', 'gemma', 'nemotron', 'step', 'glm'],
@@ -103,27 +75,10 @@ var AGENT_MODEL_PREFERENCES = {
 };
 
 async function fetchAvailableFreeModels() {
-    if (_verifiedFreeModels && _verifiedFreeModels.length > 0) {
-        return _verifiedFreeModels;
-    }
-    if (state.verifiedFreeModelIds && state.verifiedFreeModelIds.length > 0) {
-        _verifiedFreeModels = state.verifiedFreeModelIds.slice();
-        return _verifiedFreeModels;
-    }
-    try {
-        var cached = localStorage.getItem('sai_verified_free_models');
-        if (cached) {
-            var parsed = JSON.parse(cached);
-            if (parsed && parsed.length > 0) {
-                _verifiedFreeModels = parsed;
-                state.verifiedFreeModelIds = parsed;
-                return _verifiedFreeModels;
-            }
-        }
-    } catch (e) {}
-
+    if (_verifiedFreeModels && _verifiedFreeModels.length > 0) return _verifiedFreeModels;
+    if (state.verifiedFreeModelIds && state.verifiedFreeModelIds.length > 0) { _verifiedFreeModels = state.verifiedFreeModelIds.slice(); return _verifiedFreeModels; }
+    try { var cached = localStorage.getItem('sai_verified_free_models'); if (cached) { var parsed = JSON.parse(cached); if (parsed && parsed.length > 0) { _verifiedFreeModels = parsed; state.verifiedFreeModelIds = parsed; return _verifiedFreeModels; } } } catch (e) {}
     if (_modelFetchPromise) return _modelFetchPromise;
-
     _modelFetchPromise = (async function () {
         try {
             console.log('[MultiAgent] Fetching available free models from OpenRouter...');
@@ -134,14 +89,8 @@ async function fetchAvailableFreeModels() {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             var d = await r.json();
             var allModels = d.data || [];
-            for (var x = 0; x < allModels.length; x++) {
-                if (allModels[x].context_length) state.modelContextLimits[allModels[x].id] = Math.floor(allModels[x].context_length * 3.5);
-            }
-            var trulyFree = allModels.filter(function (m) {
-                if (!m || !m.pricing) return false;
-                var p = m.pricing;
-                return (p.prompt === '0' || parseFloat(p.prompt) === 0) && (p.completion === '0' || parseFloat(p.completion) === 0);
-            });
+            for (var x = 0; x < allModels.length; x++) { if (allModels[x].context_length) state.modelContextLimits[allModels[x].id] = Math.floor(allModels[x].context_length * 3.5); }
+            var trulyFree = allModels.filter(function (m) { if (!m || !m.pricing) return false; var p = m.pricing; return (p.prompt === '0' || parseFloat(p.prompt) === 0) && (p.completion === '0' || parseFloat(p.completion) === 0); });
             trulyFree.sort(function (a, b) { return (b.context_length || 0) - (a.context_length || 0); });
             _verifiedFreeModels = trulyFree.map(function (m) { return m.id; });
             state.verifiedFreeModelIds = _verifiedFreeModels;
@@ -157,33 +106,16 @@ async function fetchAvailableFreeModels() {
             return _verifiedFreeModels;
         } finally { _modelFetchPromise = null; }
     })();
-
     return _modelFetchPromise;
 }
 
 function pickModelForRole(agentName, availableModels) {
     if (!availableModels || availableModels.length === 0) return null;
     var preferences = AGENT_MODEL_PREFERENCES[agentName] || AGENT_MODEL_PREFERENCES.planner;
-    for (var p = 0; p < preferences.length; p++) {
-        var pattern = preferences[p];
-        for (var m = 0; m < availableModels.length; m++) {
-            var candidate = availableModels[m];
-            if (multiAgentState.triedModels && multiAgentState.triedModels.has(candidate)) continue;
-            if (isRateLimited(candidate)) continue;
-            if (candidate.toLowerCase().indexOf(pattern.toLowerCase()) > -1) return candidate;
-        }
-    }
-    for (var i = 0; i < availableModels.length; i++) {
-        if (multiAgentState.triedModels && multiAgentState.triedModels.has(availableModels[i])) continue;
-        if (isRateLimited(availableModels[i])) continue;
-        return availableModels[i];
-    }
-    /* All tried or rate-limited — clear expired and retry */
-    var now = Date.now();
-    var hasExpired = false;
-    for (var rlKey in _rateLimitedModels) {
-        if (_rateLimitedModels[rlKey] <= now) { delete _rateLimitedModels[rlKey]; hasExpired = true; }
-    }
+    for (var p = 0; p < preferences.length; p++) { var pattern = preferences[p]; for (var m = 0; m < availableModels.length; m++) { var candidate = availableModels[m]; if (multiAgentState.triedModels && multiAgentState.triedModels.has(candidate)) continue; if (isRateLimited(candidate)) continue; if (candidate.toLowerCase().indexOf(pattern.toLowerCase()) > -1) return candidate; } }
+    for (var i = 0; i < availableModels.length; i++) { if (multiAgentState.triedModels && multiAgentState.triedModels.has(availableModels[i])) continue; if (isRateLimited(availableModels[i])) continue; return availableModels[i]; }
+    var now = Date.now(); var hasExpired = false;
+    for (var rlKey in _rateLimitedModels) { if (_rateLimitedModels[rlKey] <= now) { delete _rateLimitedModels[rlKey]; hasExpired = true; } }
     if (hasExpired) return pickModelForRole(agentName, availableModels);
     console.warn('[MultiAgent] All models exhausted. Resetting tracking.');
     if (multiAgentState.triedModels) multiAgentState.triedModels.clear();
@@ -198,7 +130,9 @@ function getNextAvailableModel(currentModel, agentName) {
     return pickModelForRole(agentName, _verifiedFreeModels);
 }
 
-/* ── Agent definitions ── */
+/* ═══════════════════════════════════════════════════
+   AGENT DEFINITIONS
+   ═══════════════════════════════════════════════════ */
 export var AGENTS = {
     planner: {
         name: 'Planner',
@@ -211,60 +145,24 @@ export var AGENTS = {
         parsePlan: function(text) {
             var planMatch = text.match(/##\s*PLAN([\s\S]*?)(?=##\s*(?!PLAN)|$)/i);
             if (!planMatch) planMatch = text.match(/#\s*PLAN([\s\S]*?)(?=#[^#]|$)/i);
-            if (!planMatch) {
-                if (text && text.length > 50) planMatch = [null, '\n' + text];
-                else return null;
-            }
+            if (!planMatch) { if (text && text.length > 50) planMatch = [null, '\n' + text]; else return null; }
             var planText = planMatch[1];
             var objectiveMatch = planText.match(/(?:Objective|Goal|Summary|Purpose|Task)\s*[:\-]\s*(.+)/i);
             var stepsMatch = planText.match(/(?:Steps|Tasks|Actions|Implementation)\s*[:\-]?\s*([\s\S]*?)(?=Files|Dependencies|Risks|Notes|##|$)/i);
             var filesMatch = planText.match(/Files?\s*(?:to\s*)?(?:create|modify|touch|generate|output)?\s*[:\-]?\s*([\s\S]*?)(?=Dependencies|Risks|Notes|##|$)/i);
             var depsMatch = planText.match(/Dependencies?\s*[:\-]\s*([\s\S]*?)(?=Risks|Notes|##|$)/i);
             var risksMatch = planText.match(/Risks?\s*[:\-]\s*([\s\S]*?)$/i);
-
             var steps = [];
-            if (stepsMatch) {
-                steps = stepsMatch[1].split('\n')
-                    .filter(function(l) { return l.trim().match(/^\d+[\.\)]\s*/); })
-                    .map(function(l) { return l.replace(/^\d+[\.\)]\s*/, '').trim(); })
-                    .filter(function(l) { return l.length > 0; });
-            }
-            if (steps.length === 0 && stepsMatch) {
-                steps = stepsMatch[1].split('\n')
-                    .filter(function(l) { return l.trim().match(/^[-*]\s*/); })
-                    .map(function(l) { return l.replace(/^[-*\s]+/, '').trim(); })
-                    .filter(function(l) { return l.length > 0; });
-            }
-            if (steps.length === 0) {
-                steps = planText.split('\n')
-                    .filter(function(l) { return l.trim().match(/^\d+[\.\)]\s+\S/); })
-                    .map(function(l) { return l.replace(/^\d+[\.\)]\s*/, '').trim(); })
-                    .filter(function(l) { return l.length > 10; });
-            }
-            if (steps.length === 0) {
-                steps = planText.split('\n')
-                    .filter(function(l) { return l.trim().match(/^[-*]\s+\S/); })
-                    .map(function(l) { return l.replace(/^[-*\s]+/, '').trim(); })
-                    .filter(function(l) { return l.length > 10; });
-            }
-
+            if (stepsMatch) { steps = stepsMatch[1].split('\n').filter(function(l) { return l.trim().match(/^\d+[\.\)]\s*/); }).map(function(l) { return l.replace(/^\d+[\.\)]\s*/, '').trim(); }).filter(function(l) { return l.length > 0; }); }
+            if (steps.length === 0 && stepsMatch) { steps = stepsMatch[1].split('\n').filter(function(l) { return l.trim().match(/^[-*]\s*/); }).map(function(l) { return l.replace(/^[-*\s]+/, '').trim(); }).filter(function(l) { return l.length > 0; }); }
+            if (steps.length === 0) { steps = planText.split('\n').filter(function(l) { return l.trim().match(/^\d+[\.\)]\s+\S/); }).map(function(l) { return l.replace(/^\d+[\.\)]\s*/, '').trim(); }).filter(function(l) { return l.length > 10; }); }
+            if (steps.length === 0) { steps = planText.split('\n').filter(function(l) { return l.trim().match(/^[-*]\s+\S/); }).map(function(l) { return l.replace(/^[-*\s]+/, '').trim(); }).filter(function(l) { return l.length > 10; }); }
             var files = [];
-            if (filesMatch) {
-                files = filesMatch[1].split('\n')
-                    .map(function(l) { var cleaned = l.replace(/^[-*\d\.\)]+\s*/, '').trim(); cleaned = cleaned.replace(/\s*\(.*\)\s*$/, '').trim(); return cleaned; })
-                    .filter(function(l) { return l.length > 0 && l.indexOf(':') === -1 && l.length < 120; });
-            }
+            if (filesMatch) { files = filesMatch[1].split('\n').map(function(l) { var cleaned = l.replace(/^[-*\d\.\)]+\s*/, '').trim(); cleaned = cleaned.replace(/\s*\(.*\)\s*$/, '').trim(); return cleaned; }).filter(function(l) { return l.length > 0 && l.indexOf(':') === -1 && l.length < 120; }); }
             if (files.length === 0) {
                 var filePattern = planText.match(/[\w\-./]+\.(js|ts|jsx|tsx|py|java|html|css|json|md|yaml|yml|sh|sql|go|rs|cpp|c|h|rb|php|dart|kt)/gi);
-                if (filePattern) {
-                    var seen = {};
-                    for (var fi = 0; fi < filePattern.length; fi++) {
-                        var fname = filePattern[fi].trim();
-                        if (!seen[fname] && fname.indexOf('.') > 0) { seen[fname] = true; files.push(fname); }
-                    }
-                }
+                if (filePattern) { var seen = {}; for (var fi = 0; fi < filePattern.length; fi++) { var fname = filePattern[fi].trim(); if (!seen[fname] && fname.indexOf('.') > 0) { seen[fname] = true; files.push(fname); } } }
             }
-
             return {
                 objective: objectiveMatch ? objectiveMatch[1].trim() : (multiAgentState.currentTask ? multiAgentState.currentTask.userPrompt.substring(0, 120) : 'Task implementation'),
                 steps: steps, files: files,
@@ -281,60 +179,121 @@ export var AGENTS = {
         fallbackModels: [],
         maxTokens: 16384,
         currentModel: null,
-        prompt: 'You are S.ai\'s Coder agent. Your ONLY responsibility is to write complete, production-ready code based on the Planner\'s plan.\n\nCRITICAL RULES:\n1. Follow the plan EXACTLY - do not deviate\n2. If workspace files are provided, READ THEM to understand existing code\n3. When modifying existing files, output the COMPLETE file — never "...", "// rest unchanged"\n4. Every file must be self-contained and runnable\n5. Include all necessary imports, error handling, and edge cases\n6. For each file, output:\n\nfile:path/to/filename.ext\n// FULL FILE CONTENT - NO OMISSIONS\n[complete code]\n\n7. NEVER hallucinate imports\n8. After writing ALL files, add: <|INTEGRATION_CHECK|>',
+        prompt: 'You are S.ai\'s Coder agent. Write COMPLETE, production-ready code based on the plan.\n\nOUTPUT FORMAT — follow EXACTLY:\nFor EACH file, output:\n\nfile:path/to/filename.ext\nCOMPLETE file content here — every line, no omissions\n\nAfter ALL files, output: <|INTEGRATION_CHECK|>\n\nCRITICAL RULES:\n- Output COMPLETE files. No "...", no "// rest unchanged", no "// existing code"\n- Every import, every function, every line must be present\n- If modifying an existing file, output the ENTIRE file\n- Include all necessary imports and error handling\n- NEVER abbreviate or skip any part of a file',
 
+        /* ═══════════════════════════════════════════════════
+           LENIENT VALIDATION FOR FREE MODELS
+           
+           Free models often don't follow the exact format.
+           We accept output if it contains ANY of:
+           1. file:path markers (standard format)
+           2. Markdown code blocks with substantial content
+           3. Raw code with identifiable file patterns
+           
+           We also use SMART "..." detection that only
+           flags lazy abbreviations, not spread operators
+           or CSS values.
+           ═══════════════════════════════════════════════════ */
         validateOutput: function(text) {
-            var lazyPatterns = [/\.\.\.[\s\S]*?\.\.\./, /\/\/\s*\.\.\.[\s\S]*?\/\/\s*\.\.\./, /\/\*\s*\.\.\.[\s\S]*?\*\//, /#\s*\.\.\.[\s\S]*?#\s*\.\.\./];
-            for (var i = 0; i < lazyPatterns.length; i++) {
-                if (lazyPatterns[i].test(text)) return { valid: false, error: 'Lazy code snippet detected (contains "...")' };
+            if (!text || text.length < 50) return { valid: false, error: 'Output too short' };
+
+            /* ═══════════════════════════════════════════════════
+               SMART "..." DETECTION
+               
+               OLD BUG: Regex /\.\.\.[\s\S]*?\.\.\./ caught
+               spread operators (...args), CSS (0 0 ... 10px),
+               and any two "..." anywhere in the text.
+               
+               NEW: Only flag "..." when it's used as a lazy
+               abbreviation — on its own line or in a comment
+               that says "rest", "unchanged", "existing", etc.
+               ═══════════════════════════════════════════════════ */
+            var lines = text.split('\n');
+            var lazyLineCount = 0;
+            for (var li = 0; li < lines.length; li++) {
+                var line = lines[li].trim();
+
+                /* Line is JUST "..." — always lazy */
+                if (line === '...' || line === '…') { lazyLineCount++; continue; }
+
+                /* Comment with "..." and lazy keywords */
+                if ((line.startsWith('//') || line.startsWith('#') || line.startsWith('/*') || line.startsWith('*')) &&
+                    /\.\.\./.test(line) &&
+                    /\b(rest|unchanged|existing|same|omitted|continued|previous|unchanged|unchanged code|existing code|other code|more code|etc)\b/i.test(line)) {
+                    lazyLineCount++;
+                    continue;
+                }
+
+                /* "// ..." at end of line suggesting continuation */
+                if (/\/\/\s*\.\.\.\s*$/.test(line)) { lazyLineCount++; continue; }
+                if (/#\s*\.\.\.\s*$/.test(line)) { lazyLineCount++; continue; }
+            }
+
+            /* Allow up to 2 lazy lines — free models sometimes add "// ..." as section dividers */
+            if (lazyLineCount > 2) {
+                return { valid: false, error: 'Lazy code detected — ' + lazyLineCount + ' lines contain abbreviated "..."' };
             }
 
             /* ═══════════════════════════════════════════════════
-               LENIENT FILE BLOCK DETECTION
-               
-               Free models don't always follow the exact format.
-               We now match multiple variations:
-               - file:path/to/file.ext     (standard)
-               - file: path/to/file.ext    (space after colon)
-               - **file:path**             (bold markdown)
-               - `file:path`              (code markdown)
-               
-               We also accept output WITHOUT <|INTEGRATION_CHECK|>
-               as long as file blocks are found — free models
-               often forget the marker.
+               FILE BLOCK DETECTION — Multiple strategies
                ═══════════════════════════════════════════════════ */
-            var fileBlocks = text.match(/file:([^\n]+)\n([\s\S]*?)(?=\nfile:|<\|INTEGRATION_CHECK\|>|$)/g) || [];
+            var fileCount = 0;
 
-            /* Also try lenient pattern: "file:" with optional space */
-            if (fileBlocks.length === 0) {
-                fileBlocks = text.match(/file:\s*([^\n]+)\n([\s\S]*?)(?=\nfile:|<\|INTEGRATION_CHECK\|>|$)/g) || [];
+            /* Strategy 1: Standard file:path format */
+            var standardBlocks = text.match(/file:([^\n]+)\n([\s\S]*?)(?=\nfile:|<\|INTEGRATION_CHECK\|>|$)/g);
+            if (standardBlocks && standardBlocks.length > 0) {
+                fileCount = standardBlocks.length;
+                console.log('[MultiAgent] Coder validation: ' + fileCount + ' file blocks (standard format)');
+                return { valid: true, fileCount: fileCount };
             }
 
-            /* Also try markdown-style: **file:path** or `file:path` */
-            if (fileBlocks.length === 0) {
-                fileBlocks = text.match(/\*{0,2}file:`?([^\n*`]+)`?\*{0,2}\n([\s\S]*?)(?=\n\*{0,2}file:|<\|INTEGRATION_CHECK\|>|$)/g) || [];
+            /* Strategy 2: file: with space */
+            var spaceBlocks = text.match(/file:\s*([^\n]+)\n([\s\S]*?)(?=\nfile:|<\|INTEGRATION_CHECK\|>|$)/g);
+            if (spaceBlocks && spaceBlocks.length > 0) {
+                fileCount = spaceBlocks.length;
+                console.log('[MultiAgent] Coder validation: ' + fileCount + ' file blocks (space format)');
+                return { valid: true, fileCount: fileCount };
             }
 
-            /* Last resort: look for code blocks with filename hints */
-            if (fileBlocks.length === 0) {
-                /* Match ```language:path or ```path patterns */
-                var codeBlockFiles = text.match(/```[\w]*[:/]?([^\n]*\.(js|ts|jsx|tsx|py|java|html|css|json|md|yaml|yml|sh|sql|go|rs|cpp|c|h|rb|php|dart|kt))[^\n]*\n([\s\S]*?)```/g) || [];
-                if (codeBlockFiles.length > 0) {
-                    fileBlocks = codeBlockFiles;
+            /* Strategy 3: Markdown code blocks with filenames */
+            /* Matches ```lang:path or ```lang path or ```path.ext */
+            var mdBlocks = text.match(/```[\w]*\s*[:/]?([^\n]*\.(js|ts|jsx|tsx|py|java|html|css|json|md|yaml|yml|sh|sql|go|rs|cpp|c|h|rb|php|dart|kt|svg))[^\n]*\n([\s\S]*?)```/g);
+            if (mdBlocks && mdBlocks.length > 0) {
+                fileCount = mdBlocks.length;
+                console.log('[MultiAgent] Coder validation: ' + fileCount + ' file blocks (markdown+filename format)');
+                return { valid: true, fileCount: fileCount };
+            }
+
+            /* Strategy 4: Any markdown code blocks with substantial content */
+            var codeBlocks = text.match(/```[\w]*\n([\s\S]*?)```/g);
+            if (codeBlocks && codeBlocks.length > 0) {
+                /* Count blocks with meaningful content (>100 chars) */
+                var substantialBlocks = 0;
+                for (var cb = 0; cb < codeBlocks.length; cb++) {
+                    /* Remove the ``` markers and check size */
+                    var blockContent = codeBlocks[cb].replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '');
+                    if (blockContent.length > 100) substantialBlocks++;
+                }
+                if (substantialBlocks > 0) {
+                    fileCount = substantialBlocks;
+                    console.log('[MultiAgent] Coder validation: ' + fileCount + ' file blocks (code block format, ' + codeBlocks.length + ' total blocks)');
+                    return { valid: true, fileCount: fileCount };
                 }
             }
 
-            if (fileBlocks.length === 0) {
-                return { valid: false, error: 'No file blocks found' };
+            /* Strategy 5: Substantial raw output (no code blocks but >2000 chars of content) */
+            /* This handles models that output raw code without markdown */
+            var textWithoutMarkup = text.replace(/<[^>]+>/g, '').replace(/```/g, '').trim();
+            if (textWithoutMarkup.length > 2000) {
+                /* Check if it looks like code (has braces, semicolons, or indentation) */
+                var codeIndicators = (textWithoutMarkup.match(/[{};]/g) || []).length;
+                if (codeIndicators > 20) {
+                    console.log('[MultiAgent] Coder validation: accepting raw code output (' + textWithoutMarkup.length + ' chars, ' + codeIndicators + ' code indicators)');
+                    return { valid: true, fileCount: 1 };
+                }
             }
 
-            /* <|INTEGRATION_CHECK|> is nice but not required for free models */
-            var hasIntegrationCheck = text.indexOf('<|INTEGRATION_CHECK|>') > -1;
-            if (!hasIntegrationCheck) {
-                console.log('[MultiAgent] Coder output missing <|INTEGRATION_CHECK|> but has ' + fileBlocks.length + ' file blocks — accepting');
-            }
-
-            return { valid: true, fileCount: fileBlocks.length };
+            return { valid: false, error: 'No file blocks found' };
         }
     },
 
@@ -346,52 +305,20 @@ export var AGENTS = {
         maxTokens: 8192,
         prompt: 'You are S.ai\'s Critic agent - the FINAL quality gate.\n\nOutput format: EXACTLY one of these:\n\nAPPROVED\n[Brief validation]\n\nREJECTED\n[Detailed reasons, numbered]\n\nIf in doubt, REJECT.',
 
-        /* ═══════════════════════════════════════════════════
-           LENIENT CRITIC PARSING
-           
-           Free models often wrap APPROVED/REJECTED in:
-           - <|APPROVED|>     (special tokens)
-           - **APPROVED**     (markdown bold)
-           - ## APPROVED      (markdown heading)
-           - `APPROVED`       (code)
-           - [APPROVED]       (brackets)
-           
-           We now strip these wrappers before checking.
-           ═══════════════════════════════════════════════════ */
         parseDecision: function(text) {
             if (!text) return { approved: false, feedback: 'No response from critic' };
-
-            /* Strip common wrapper patterns from the start */
             var cleaned = text.trim();
-
-            /* Remove <|TOKEN|> style wrappers */
             cleaned = cleaned.replace(/^<\|[^>]*\|\s*/, '');
-            /* Remove markdown bold/italic */
             cleaned = cleaned.replace(/^\*{1,3}/, '');
-            /* Remove markdown headings */
             cleaned = cleaned.replace(/^#+\s*/, '');
-            /* Remove backtick wrappers */
             cleaned = cleaned.replace(/^`+/, '');
-            /* Remove bracket wrappers */
             cleaned = cleaned.replace(/^\[/, '');
-            /* Remove leading whitespace again after stripping */
             cleaned = cleaned.trim();
-
-            /* Now check the first word */
             var firstWord = cleaned.split(/[\s\n:.\-]+/)[0].toUpperCase();
             var isApproved = (firstWord === 'APPROVED' || firstWord === 'APPROVE' || firstWord === 'ACCEPT' || firstWord === 'PASS' || firstWord === 'YES');
-
-            /* Also check if APPROVED appears very early in the original text (within first 50 chars) */
-            if (!isApproved) {
-                var earlyText = text.substring(0, 50).toUpperCase();
-                isApproved = earlyText.indexOf('APPROVED') > -1;
-            }
-
+            if (!isApproved) { var earlyText = text.substring(0, 50).toUpperCase(); isApproved = earlyText.indexOf('APPROVED') > -1; }
             var reasons = cleaned.replace(/^(APPROVED|REJECTED|APPROVE|REJECT|ACCEPT|DENY|PASS|FAIL|YES|NO)\s*/i, '').trim();
-            return {
-                approved: isApproved,
-                feedback: reasons || (isApproved ? 'Code approved' : 'Code rejected')
-            };
+            return { approved: isApproved, feedback: reasons || (isApproved ? 'Code approved' : 'Code rejected') };
         }
     },
 
@@ -405,16 +332,8 @@ export var AGENTS = {
 
         parseResult: function(text) {
             var resultMatch = text.match(/##\s*VALIDATION RESULT\s+(PASS|FAIL|NEEDS_REVIEW)/i);
-            if (!resultMatch) {
-                /* Lenient: look for PASS/FAIL anywhere near the start */
-                var earlyText = (text || '').substring(0, 100).toUpperCase();
-                if (earlyText.indexOf('PASS') > -1) return { status: 'PASS', details: text };
-                if (earlyText.indexOf('FAIL') > -1) return { status: 'FAIL', details: text };
-            }
-            return {
-                status: resultMatch ? resultMatch[1].toUpperCase() : 'UNKNOWN',
-                details: text.replace(/## VALIDATION RESULT[\s\S]*/, '').trim()
-            };
+            if (!resultMatch) { var earlyText = (text || '').substring(0, 100).toUpperCase(); if (earlyText.indexOf('PASS') > -1) return { status: 'PASS', details: text }; if (earlyText.indexOf('FAIL') > -1) return { status: 'FAIL', details: text }; }
+            return { status: resultMatch ? resultMatch[1].toUpperCase() : 'UNKNOWN', details: text.replace(/## VALIDATION RESULT[\s\S]*/, '').trim() };
         }
     }
 };
@@ -428,7 +347,7 @@ export var multiAgentState = {
     coderAttempts: 0,
     maxCoderAttempts: 3,
     criticRejections: 0,
-    maxCriticRejections: 3, /* Increased from 2 to 3 — critic parser was buggy, causing false rejections */
+    maxCriticRejections: 3,
     conversationHistory: [],
     taskQueue: [],
     activeLoop: null,
@@ -436,7 +355,7 @@ export var multiAgentState = {
 };
 
 /* ═══════════════════════════════════════
-   SELF-CONTAINED API HELPERS
+   API HELPERS
    ═══════════════════════════════════════ */
 function getApiUrl() {
     var endpoint = (state.settings.endpoint || '').replace(/\/+$/, '');
@@ -469,8 +388,7 @@ function getSmartFileContext(agentName) {
     var fullCtx = getFileContext();
     if (!fullCtx) return '';
     if (agentName === 'planner') {
-        var lines = fullCtx.split('\n');
-        var treeLines = [];
+        var lines = fullCtx.split('\n'); var treeLines = [];
         for (var i = 0; i < lines.length; i++) { if (lines[i].indexOf('--- FILE:') > -1) break; treeLines.push(lines[i]); }
         var tree = treeLines.join('\n').trim();
         if (tree.length < 50) return '';
@@ -511,10 +429,8 @@ function scrollMessages() { var msgs = document.getElementById('messages'); msgs
 function showAgentWorking(agentName) {
     removeWelcome();
     var msgs = document.getElementById('messages');
-    var div = document.createElement('div');
-    div.className = 'message bot';
-    var uid = 'aw-' + agentName + '-' + Date.now();
-    div.id = uid;
+    var div = document.createElement('div'); div.className = 'message bot';
+    var uid = 'aw-' + agentName + '-' + Date.now(); div.id = uid;
     div.innerHTML = '<div class="msg-avatar" style="background:rgba(0,212,170,0.12)"><i class="fas ' + (AGENT_ICONS[agentName] || 'fa-robot') + '"></i></div><div class="msg-body"><div class="msg-meta"><span class="msg-name" style="color:var(--accent)">' + (AGENT_NAMES[agentName] || agentName) + ' Agent</span><span style="color:var(--yellow);font-size:0.75rem;font-weight:600"><i class="fas fa-spinner fa-spin"></i> Working...</span><span class="msg-time">' + getTimeStr() + '</span></div><div class="msg-content"><div class="typing-indicator"><span></span><span></span><span></span></div></div></div>';
     msgs.appendChild(div); scrollMessages(); return uid;
 }
@@ -524,10 +440,40 @@ function removeWorking(uid) { if (!uid) return; var el = document.getElementById
 function renderAgentMessage(agentName, content, status) {
     removeWelcome();
     var msgs = document.getElementById('messages');
-    var div = document.createElement('div');
-    div.className = 'message bot';
+    var div = document.createElement('div'); div.className = 'message bot';
     div.innerHTML = '<div class="msg-avatar" style="background:rgba(0,212,170,0.12)"><i class="fas ' + (AGENT_ICONS[agentName] || 'fa-robot') + '"></i></div><div class="msg-body"><div class="msg-meta"><span class="msg-name" style="color:var(--accent)">' + (AGENT_NAMES[agentName] || agentName) + ' Agent</span>' + (STATUS_HTML[status] || '') + '<span class="msg-time">' + getTimeStr() + '</span></div><div class="msg-content">' + parseMarkdown(content) + '</div></div>';
     msgs.appendChild(div); highlightCodeBlocks(div); scrollMessages();
+}
+
+/* ═══════════════════════════════════════════════════
+   TRIVIAL TASK DETECTION
+   
+   When the user's message is a greeting or simple
+   question, there's nothing to code. The planner
+   will say "no files needed" and the coder will
+   fail because there's nothing to implement.
+   
+   We detect this and skip the coder/critic/tester.
+   ═══════════════════════════════════════════════════ */
+function isTrivialPlan(plan) {
+    if (!plan) return true;
+    /* No files to create/modify */
+    if ((!plan.files || plan.files.length === 0) &&
+        (!plan.steps || plan.steps.length === 0)) return true;
+    /* Objective mentions greeting/acknowledgment */
+    var obj = (plan.objective || '').toLowerCase();
+    if (/\b(greet|acknowledge|respond to|say hello|welcome|no files|no code|nothing to|chat|conversation)\b/i.test(obj)) return true;
+    /* Very few steps and no files */
+    if (plan.steps && plan.steps.length <= 2 && (!plan.files || plan.files.length === 0)) return true;
+    return false;
+}
+
+function isTrivialMessage(text) {
+    if (!text) return true;
+    var t = text.trim().toLowerCase();
+    var trivial = ['hi','hello','hey','hola','yo','sup','howdy','thanks','thx','ty','ok','okay','bye','goodbye','lol','nice','cool','yes','no'];
+    for (var i = 0; i < trivial.length; i++) { if (t === trivial[i]) return true; }
+    return false;
 }
 
 /* ── Orchestrator ── */
@@ -538,32 +484,33 @@ export function MultiAgentOrchestrator() {
     this.abortController = null;
 }
 
-/* ═══════════════════════════════════════════════════
-   INTER-AGENT DELAY
-   
-   Free tier rate limits are very aggressive.
-   Adding a delay between agents prevents
-   cascading 429 errors when running the
-   planner → coder → critic → tester sequence.
-   
-   Delay increases when many models are rate-limited.
-   ═══════════════════════════════════════════════════ */
 function getInterAgentDelay() {
     var rlCount = countRateLimitedModels();
-    if (rlCount >= 5) return 8000;  /* 8s when most models are rate-limited */
-    if (rlCount >= 3) return 5000;  /* 5s when several are rate-limited */
-    if (rlCount >= 1) return 3000;  /* 3s when some are rate-limited */
-    return 1500;                     /* 1.5s baseline between agents */
+    if (rlCount >= 5) return 8000;
+    if (rlCount >= 3) return 5000;
+    if (rlCount >= 1) return 3000;
+    return 1500;
 }
 
 MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt) {
     if (multiAgentState.isActive) { toast('Multi-agent task already running', 'error'); return false; }
 
+    /* ═══════════════════════════════════════════════════
+       TRIVIAL MESSAGE SHORT-CIRCUIT
+       
+       If the user just says "hi" or "thanks", don't
+       waste 4 agent calls on it. Respond directly.
+       ═══════════════════════════════════════════════════ */
+    if (isTrivialMessage(userPrompt)) {
+        renderAgentMessage('system', 'Hello! 👋 How can I help you today? Give me a coding task and the multi-agent team will get to work.', 'success');
+        return true;
+    }
+
     if (state.settings.provider === 'openrouter') {
         try {
             await fetchAvailableFreeModels();
             if (_verifiedFreeModels && _verifiedFreeModels.length > 0) console.log('[MultiAgent] Using ' + _verifiedFreeModels.length + ' dynamically discovered models');
-            else console.warn('[MultiAgent] No free models found — will try hardcoded fallbacks');
+            else console.warn('[MultiAgent] No free models found');
         } catch (e) { console.warn('[MultiAgent] Model discovery failed:', e.message); }
     }
 
@@ -582,10 +529,18 @@ MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt
     try {
         while (multiAgentState.isActive && this.currentAgentIndex < this.agentOrder.length) {
             /* ═══════════════════════════════════════════════════
-               INTER-AGENT DELAY
-               Wait between agents to avoid rate limit cascade.
-               Skip delay for the first agent (planner).
+               TRIVIAL PLAN SHORT-CIRCUIT
+               
+               After the planner runs, check if the plan
+               actually needs code. If not, skip the
+               coder/critic/tester — they'll just fail.
                ═══════════════════════════════════════════════════ */
+            if (this.currentAgentIndex === 1 && multiAgentState.plan && isTrivialPlan(multiAgentState.plan)) {
+                console.log('[MultiAgent] Trivial plan detected — skipping coder/critic/tester');
+                toast('No code needed for this task — plan only', 'info');
+                break;
+            }
+
             if (this.currentAgentIndex > 0) {
                 var delay = getInterAgentDelay();
                 console.log('[MultiAgent] Waiting ' + (delay / 1000) + 's before ' + this.agentOrder[this.currentAgentIndex] + ' (rate-limited: ' + countRateLimitedModels() + ')');
@@ -597,8 +552,13 @@ MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt
             var prompt = (this.currentAgentIndex === 0) ? userPrompt : null;
             var result = await this.runAgent(agentName, prompt);
 
-            if (!result) throw new Error('Agent ' + agentName + ' returned no result (null)');
-            if (!result.success) throw new Error('Agent ' + agentName + ' failed: ' + (result.error || 'no error details provided'));
+            if (!result) throw new Error('Agent ' + agentName + ' returned no result');
+            if (!result.success) throw new Error('Agent ' + agentName + ' failed: ' + (result.error || 'no details'));
+
+            /* Store the plan after planner succeeds */
+            if (agentName === 'planner' && result.plan) {
+                multiAgentState.plan = result.plan;
+            }
 
             this.currentAgentIndex++;
         }
@@ -619,7 +579,6 @@ MultiAgentOrchestrator.prototype.selectModelForAgent = function(agent, agentName
         var dynamicModel = pickModelForRole(agentName, _verifiedFreeModels);
         if (dynamicModel) { console.log('[MultiAgent] Selected dynamic model for ' + agentName + ': ' + dynamicModel); return dynamicModel; }
     }
-    console.warn('[MultiAgent] No dynamic models available for ' + agentName);
     return null;
 };
 
@@ -641,33 +600,24 @@ function ensureFreeModel(model) {
 }
 
 /* ═══════════════════════════════════════════════════
-   RUN AGENT — With 429/404 model switching
+   RUN AGENT
    ═══════════════════════════════════════════════════ */
 MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customPrompt) {
     var agent = AGENTS[agentName];
     if (!agent) return { success: false, error: 'Unknown agent: ' + agentName };
-
     multiAgentState.currentAgent = agentName;
     setConnectionStatus('connecting', 'Multi-Agent: Running ' + agent.name + '...');
-
     var model = this.selectModelForAgent(agent, agentName);
-    if (!model) return { success: false, error: 'No available model for ' + agentName + '. All models are rate-limited or unavailable.' };
-
+    if (!model) return { success: false, error: 'No available model for ' + agentName };
     var prompt = customPrompt || this.buildAgentPrompt(agentName);
     if (this.taskContext) prompt = this.taskContext + '\n\n' + prompt;
 
-    var result = null;
-    var lastError = 'No response received from ' + agentName;
-    var attempts = 0;
-    var maxAttempts = 6; /* Increased from 5 to give more room for model rotation */
-
+    var result = null, lastError = 'No response from ' + agentName, attempts = 0, maxAttempts = 6;
     var workingId = showAgentWorking(agentName);
 
     try {
         while (attempts < maxAttempts && !(result && result.success)) {
-            attempts++;
-            lastError = 'Attempt ' + attempts + ' failed';
-
+            attempts++; lastError = 'Attempt ' + attempts + ' failed';
             try {
                 result = await this.executeAgentCall(agentName, model, prompt);
                 if (!result.success && !result.error) result.error = agentName + ' returned failure with no details';
@@ -684,21 +634,17 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
                     multiAgentState.criticRejections++;
                     var maxRejections = state.settings.maxCriticRejections || multiAgentState.maxCriticRejections;
                     if (multiAgentState.criticRejections >= maxRejections) {
-                        /* ═══════════════════════════════════════════════════
-                           CRITIC REJECTION OVERRIDE
-                           
-                           If the critic has rejected maxCriticRejections
-                           times but the coder DID produce file blocks,
-                           accept the code anyway. Free models are
-                           overly critical — better to ship imperfect
-                           code than fail the entire task.
-                           ═══════════════════════════════════════════════════ */
                         if (this.taskContext && this.taskContext.indexOf('file:') > -1) {
                             toast('Critic rejected but code exists — accepting anyway', 'info');
-                            result.success = true;
-                            result.decision = 'APPROVED';
-                            result.feedback = 'Accepted despite critic concerns (code files present)';
-                            renderAgentMessage('critic', '**Accepted (Override)**\n\nCritic rejected but code files were produced. Accepting to avoid task failure.', 'success');
+                            result.success = true; result.decision = 'APPROVED';
+                            renderAgentMessage('critic', '**Accepted (Override)**\n\nCritic rejected but code files were produced.', 'success');
+                            break;
+                        }
+                        /* Also accept if there are substantial code blocks in context */
+                        if (this.taskContext && this.taskContext.indexOf('```') > -1 && this.taskContext.length > 500) {
+                            toast('Critic rejected but code produced — accepting', 'info');
+                            result.success = true; result.decision = 'APPROVED';
+                            renderAgentMessage('critic', '**Accepted (Override)**\n\nCode was produced despite critic concerns.', 'success');
                             break;
                         }
                         toast('Critic rejected ' + maxRejections + ' times — task failed', 'error');
@@ -713,32 +659,15 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
             } catch (error) {
                 lastError = error.message || error.name || String(error);
                 console.warn('Agent ' + agentName + ' attempt ' + attempts + ' error:', lastError);
-
                 if (error.name === 'AbortError') return { success: false, error: 'Task aborted by user' };
 
-                /* ═══════════════════════════════════════════════════
-                   429 RATE LIMIT — SWITCH MODEL + BACKOFF
-                   
-                   KEY: Add a small delay before trying the next
-                   model. Without this, we hit 429 on the next
-                   model too because the API hasn't cooled down.
-                   ═══════════════════════════════════════════════════ */
                 if (lastError.indexOf('HTTP 429') > -1) {
                     markRateLimited(model);
-
-                    /* Small backoff: 2s on first 429, 4s on second, etc. */
                     var backoffDelay = Math.min(2000 * attempts, 10000);
-                    console.log('[MultiAgent] 429 backoff: ' + (backoffDelay / 1000) + 's before trying next model');
+                    console.log('[MultiAgent] 429 backoff: ' + (backoffDelay / 1000) + 's');
                     await this.delay(backoffDelay);
-
                     var nextOn429 = getNextAvailableModel(model, agentName);
-                    if (nextOn429) {
-                        model = nextOn429;
-                        toast(agentName + ' rate-limited, switching to ' + model, 'info');
-                        continue;
-                    }
-
-                    /* All models rate-limited — wait for shortest cooldown */
+                    if (nextOn429) { model = nextOn429; toast(agentName + ' rate-limited, switching to ' + model, 'info'); continue; }
                     var shortestWait = findShortestRateLimitWait();
                     if (shortestWait > 0 && attempts < maxAttempts) {
                         var waitSecs = Math.ceil(shortestWait / 1000);
@@ -749,11 +678,9 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
                         model = this.selectModelForAgent(agent, agentName);
                         if (model) continue;
                     }
-                    result = { success: false, error: 'All models rate-limited. Please try again in a few minutes.' };
-                    break;
+                    result = { success: false, error: 'All models rate-limited. Try again in a few minutes.' }; break;
                 }
 
-                /* 402 CREDITS */
                 if (lastError.indexOf('HTTP 402') > -1 || lastError.indexOf('credits') > -1) {
                     if (model) multiAgentState.triedModels.add(model);
                     var nextOn402 = getNextAvailableModel(model, agentName);
@@ -761,7 +688,6 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
                     return { success: false, error: lastError };
                 }
 
-                /* 404 NOT FOUND — PRUNE + SWITCH */
                 if (lastError.indexOf('is not a valid model ID') > -1 || lastError.indexOf('HTTP 404') > -1) {
                     if (model) multiAgentState.triedModels.add(model);
                     pruneDeadModel(model);
@@ -770,13 +696,8 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
                     if (attempts < maxAttempts) { await this.delay(1000 * attempts); } else { result = { success: false, error: lastError }; }
                 }
 
-                /* Generic error — retry with delay */
-                if (attempts < maxAttempts && !result) {
-                    toast(agentName + ' attempt ' + attempts + ' failed, retrying...', 'info');
-                    await this.delay(1000 * attempts);
-                } else if (!result) {
-                    result = { success: false, error: lastError };
-                }
+                if (attempts < maxAttempts && !result) { toast(agentName + ' attempt ' + attempts + ' failed, retrying...', 'info'); await this.delay(1000 * attempts); }
+                else if (!result) { result = { success: false, error: lastError }; }
             }
         }
 
@@ -797,7 +718,7 @@ function findShortestRateLimitWait() {
 }
 
 /* ═══════════════════════════════════════
-   SELF-CONTAINED EXECUTE
+   EXECUTE
    ═══════════════════════════════════════ */
 MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, model, prompt) {
     var self = this, agent = AGENTS[agentName], timeoutMs = 120000;
@@ -832,7 +753,7 @@ MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, mo
 MultiAgentOrchestrator.prototype._doFetch = function(agentName, model, systemContent, prompt, maxTokens, timeoutMs) {
     var self = this;
     return new Promise(function(resolve, reject) {
-        var timeoutId = setTimeout(function() { reject(new Error(agentName + ' timeout after ' + timeoutMs + 'ms')); }, timeoutMs);
+        var timeoutId = setTimeout(function() { reject(new Error(agentName + ' timeout')); }, timeoutMs);
         var agentMessages = [{ role: 'system', content: systemContent }];
         var recentCtx = multiAgentState.conversationHistory.slice(-6);
         for (var i = 0; i < recentCtx.length; i++) agentMessages.push(recentCtx[i]);
@@ -856,13 +777,8 @@ MultiAgentOrchestrator.prototype._doFetch = function(agentName, model, systemCon
                         resolve(self.parseAgentResult(agentName, fullContent)); return;
                     }
                     var chunk = decoder.decode(result.value, { stream: true });
-                    if (useOllama) {
-                        var lines = chunk.split('\n').filter(function(l) { return l.trim(); });
-                        for (var i = 0; i < lines.length; i++) { try { var d = JSON.parse(lines[i]); if (d.message && d.message.content) fullContent += d.message.content; } catch (e) {} }
-                    } else {
-                        var sseLines = chunk.split('\n');
-                        for (var j = 0; j < sseLines.length; j++) { if (!sseLines[j].startsWith('data: ')) continue; var data = sseLines[j].slice(6).trim(); if (data === '[DONE]') continue; try { var parsed = JSON.parse(data); var content = parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content; if (content) fullContent += content; } catch (e) {} }
-                    }
+                    if (useOllama) { var lines = chunk.split('\n').filter(function(l) { return l.trim(); }); for (var i = 0; i < lines.length; i++) { try { var d = JSON.parse(lines[i]); if (d.message && d.message.content) fullContent += d.message.content; } catch (e) {} } }
+                    else { var sseLines = chunk.split('\n'); for (var j = 0; j < sseLines.length; j++) { if (!sseLines[j].startsWith('data: ')) continue; var data = sseLines[j].slice(6).trim(); if (data === '[DONE]') continue; try { var parsed = JSON.parse(data); var content = parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content; if (content) fullContent += content; } catch (e) {} } }
                     readChunk();
                 });
             }
@@ -893,26 +809,31 @@ MultiAgentOrchestrator.prototype.parseAgentResult = function(agentName, content)
 
 MultiAgentOrchestrator.prototype.buildAgentPrompt = function(agentName, plan, criticFeedback) {
     switch (agentName) {
-        case 'planner': return 'Create an implementation plan for this task:\n\n' + (multiAgentState.currentTask ? multiAgentState.currentTask.userPrompt : 'No task provided');
+        case 'planner': return 'Create an implementation plan for this task:\n\n' + (multiAgentState.currentTask ? multiAgentState.currentTask.userPrompt : 'No task');
         case 'coder':
             var prompt = 'Implement the code according to this plan:\n\n';
             if (plan) { prompt += '## PLAN\nObjective: ' + plan.objective + '\n\nSteps:\n'; for (var i = 0; i < plan.steps.length; i++) prompt += (i + 1) + '. ' + plan.steps[i] + '\n'; prompt += '\n'; if (plan.files.length) prompt += 'Files to create/modify:\n' + plan.files.join('\n') + '\n\n'; }
             if (criticFeedback) prompt += '## CRITIC FEEDBACK — FIX THESE ISSUES\n' + criticFeedback + '\n\n';
             if (this.taskContext) prompt += '## WORKSPACE CONTEXT\n' + this.taskContext + '\n\n';
-            prompt += 'REMEMBER: Output COMPLETE files with NO omissions. End with <|INTEGRATION_CHECK|>';
+            prompt += 'REMEMBER: Output COMPLETE files. No "...", no "// unchanged". Use format:\nfile:path/to/filename.ext\nCOMPLETE code here\n\nEnd with <|INTEGRATION_CHECK|>';
             return prompt;
         case 'critic':
-            var cp = 'Review this code:\n\n'; if (this.taskContext) cp += this.taskContext + '\n\n'; cp += 'APPROVE only if production-ready. REJECT with numbered issues if not.'; return cp;
-        case 'tester': return 'Validate the implemented code:\n\n' + (this.taskContext || 'No code context available') + '\n\nReport PASS/FAIL.';
+            var cp = 'Review this code:\n\n'; if (this.taskContext) cp += this.taskContext + '\n\n'; cp += 'APPROVE if production-ready. REJECT with numbered issues if not.'; return cp;
+        case 'tester': return 'Validate the code:\n\n' + (this.taskContext || 'No code') + '\n\nReport PASS/FAIL.';
         default: return multiAgentState.currentTask ? multiAgentState.currentTask.userPrompt : 'No task';
     }
 };
 
 MultiAgentOrchestrator.prototype.accumulateContext = function(agentName, content) {
     if (agentName === 'coder') {
+        /* Try standard file: format first */
         var fileBlocks = content.match(/file:([^\n]+)\n([\s\S]*?)(?=\nfile:|<\|INTEGRATION_CHECK\|>|$)/g) || [];
-        var filesContext = fileBlocks.map(function(block) { var lines = block.split('\n'); var filePath = lines[0].replace('file:', '').trim(); var code = lines.slice(1).join('\n'); return 'file:' + filePath + '\n' + code; }).join('\n\n');
-        return '## IMPLEMENTED CODE\n' + filesContext + '\n\n';
+        if (fileBlocks.length > 0) {
+            var filesContext = fileBlocks.map(function(block) { var lines = block.split('\n'); var filePath = lines[0].replace('file:', '').trim(); var code = lines.slice(1).join('\n'); return 'file:' + filePath + '\n' + code; }).join('\n\n');
+            return '## IMPLEMENTED CODE\n' + filesContext + '\n\n';
+        }
+        /* Fallback: just use the raw content — critic can still review it */
+        return '## IMPLEMENTED CODE\n' + content + '\n\n';
     }
     return '## ' + agentName.toUpperCase() + ' OUTPUT\n' + content + '\n\n';
 };
@@ -934,7 +855,7 @@ MultiAgentOrchestrator.prototype.completeTask = function(status, error) {
     }
     setConnectionStatus('connected', 'Connected — ' + state.settings.model);
     removeMultiAgentStatus();
-    setTimeout(function() { multiAgentState.currentTask = null; multiAgentState.conversationHistory = []; multiAgentState.criticRejections = 0; multiAgentState.coderAttempts = 0; multiAgentState.triedModels = new Set(); }, 1000);
+    setTimeout(function() { multiAgentState.currentTask = null; multiAgentState.conversationHistory = []; multiAgentState.criticRejections = 0; multiAgentState.coderAttempts = 0; multiAgentState.triedModels = new Set(); multiAgentState.plan = null; }, 1000);
 };
 
 MultiAgentOrchestrator.prototype.abort = function() { if (this.abortController) this.abortController.abort(); this.completeTask('aborted', 'Task aborted by user'); };
@@ -956,12 +877,9 @@ export function startMultiAgentMode() {
 
 function showMultiAgentStatus() {
     var header = document.getElementById('chat-header');
-    var existing = document.getElementById('multiagent-status');
-    if (existing) existing.remove();
-    var actionsEl = header.querySelector('.header-actions');
-    if (!actionsEl) return;
-    var statusEl = document.createElement('div');
-    statusEl.id = 'multiagent-status';
+    var existing = document.getElementById('multiagent-status'); if (existing) existing.remove();
+    var actionsEl = header.querySelector('.header-actions'); if (!actionsEl) return;
+    var statusEl = document.createElement('div'); statusEl.id = 'multiagent-status';
     statusEl.style.cssText = 'display:flex;align-items:center;gap:6px;padding:6px 12px;background:rgba(0,212,170,0.1);border:1px solid rgba(0,212,170,0.2);border-radius:6px;font-size:0.75rem;color:var(--accent);font-weight:600;';
     actionsEl.insertAdjacentElement('beforebegin', statusEl);
     var updateLoop = setInterval(function() {
