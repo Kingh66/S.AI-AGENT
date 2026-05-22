@@ -477,13 +477,25 @@ function showAgentWorking(agentName) {
 function removeWorking(uid) { if (!uid) return; var el = document.getElementById(uid); if (el) el.remove(); }
 
 /* ═══════════════════════════════════════════════════
-   FORMAT CODER OUTPUT
+   FORMAT CODER OUTPUT — Convert file: blocks to
+   markdown code fences so parseMarkdown() renders
+   them with Apply buttons.
+   
+   FIX: Adaptive fence length. If the file content
+   contains ``` (3 backticks), we use ```` (4) or
+   more for the outer fence so the inner backticks
+   don't prematurely close the code block.
+   
+   The parseMarkdown() line-by-line parser tracks
+   fence length and only closes on >= matching length.
    ═══════════════════════════════════════════════════ */
 function formatCoderOutput(text) {
     if (!text || text.indexOf('file:') === -1) return text;
 
+    /* Remove integration check markers */
     var cleaned = text.replace(/<\|INTEGRATION_CHECK\|>/g, '').trimEnd();
 
+    /* Split on file: markers (must be at start of line) */
     var parts = cleaned.split(/(?=^file:)/m);
     var output = [];
 
@@ -491,18 +503,55 @@ function formatCoderOutput(text) {
         var part = parts[i];
         if (!part || !part.trim()) continue;
 
+        /* Check if this part starts with file: */
         var trimmed = part.trimStart();
         if (trimmed.startsWith('file:')) {
+            /* Find the first newline — everything before is the path, after is content */
             var firstNewline = trimmed.indexOf('\n');
             if (firstNewline === -1) {
+                /* Just a path with no content — skip */
                 continue;
             }
 
             var filePath = trimmed.substring(5, firstNewline).trim();
             var content = trimmed.substring(firstNewline + 1).trimEnd();
 
-            output.push('```file:' + filePath + '\n' + content + '\n```');
+            /* ═══════════════════════════════════════════════════════
+               ADAPTIVE FENCE LENGTH
+               
+               If the file content contains ``` (e.g. a README.md
+               with code examples), using ``` for the outer fence
+               would cause the inner ``` to prematurely close the
+               code block, breaking the display.
+               
+               Solution: count the longest backtick run in the
+               content and use one more backtick for the fence.
+               
+               Example:
+               Content has ``` → we use ```` (4 backticks)
+               Content has ```` → we use ````` (5 backticks)
+               
+               The parseMarkdown() parser tracks fence length and
+               only closes when it sees >= matching backticks, so
+               ``` inside a ```` block is treated as literal text.
+               ═══════════════════════════════════════════════════════ */
+            var maxBackticksInContent = 0;
+            var btMatches = content.match(/`{3,}/g);
+            if (btMatches) {
+                for (var b = 0; b < btMatches.length; b++) {
+                    if (btMatches[b].length > maxBackticksInContent) {
+                        maxBackticksInContent = btMatches[b].length;
+                    }
+                }
+            }
+            var fenceLen = Math.max(3, maxBackticksInContent + 1);
+            var fence = '';
+            for (var f = 0; f < fenceLen; f++) fence += '`';
+
+            /* Build markdown code fence with adaptive length */
+            output.push(fence + 'file:' + filePath + '\n' + content + '\n' + fence);
         } else {
+            /* Non-file content (commentary, etc.) — keep as-is */
             output.push(part.trim());
         }
     }

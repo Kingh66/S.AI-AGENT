@@ -1,8 +1,12 @@
-
 /* ═══════════════════════════════════════
    MARKDOWN — Advanced parser for bot responses
    Handles: code blocks, file blocks, plans,
    progress markers, tables, and more
+   
+   FIX: Replaced regex-based code block extraction
+   with a line-by-line state machine that correctly
+   handles fenced code blocks containing ``` inside
+   the content (e.g. README.md with code examples).
    ═══════════════════════════════════════ */
 
 export function escapeHtml(str) {
@@ -12,27 +16,82 @@ export function escapeHtml(str) {
 /* ── Lazy snippet detection ── */
 var LAZY_SNIPPETS = ['// ...', '/* ...', '# ...', '// rest', '// unchanged', '// existing', '... rest of', '// remaining', '... more'];
 
-/* ═══════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════
    PHASE 1: Extract code blocks first
    (they must not be processed by inline rules)
-   ═══════════════════════════════════════ */
+   
+   FIX: Line-by-line state machine instead of regex.
+   
+   The old regex /```([^\n]*)\n([\s\S]*?)```/g used a
+   LAZY quantifier (*?) which closed the code block at
+   the FIRST ``` found inside the content. If a file
+   (like README.md) contained ``` in its body, the
+   block would break open and the rest would render as
+   markdown text.
+   
+   The new parser:
+   1. Scans line-by-line
+   2. When it finds N backticks opening a fence, it
+      only closes when it finds >= N backticks at the
+      start of a line followed by only whitespace
+   3. This means ``` inside a ```` block is treated
+      as literal content, not a fence closer
+   ═══════════════════════════════════════════════════════════════ */
 export function parseMarkdown(text) {
     if (!text) return '';
 
     var segments = [];
-    var codeRegex = /```([^\n]*)\n([\s\S]*?)```/g;
-    var remaining = text;
-    var match;
+    var lines = text.split('\n');
+    var i = 0;
 
-    while ((match = codeRegex.exec(remaining)) !== null) {
-        if (match.index > 0) {
-            segments.push({ type: 'text', content: remaining.substring(0, match.index) });
+    while (i < lines.length) {
+        var line = lines[i];
+
+        /* Check for opening fence: 3+ backticks at the start of a line */
+        var openMatch = line.match(/^(`{3,})([^`]*)$/);
+
+        if (openMatch) {
+            var fenceLen = openMatch[1].length;
+            var lang = openMatch[2].trim();
+            var codeLines = [];
+            i++; /* Move past the opening fence line */
+
+            /* Read until closing fence:
+               - Must be at the start of a line
+               - Must have >= fenceLen backticks
+               - Must have only whitespace after the backticks
+               This means ``` inside a ```` block is content, not a closer. */
+            var foundClose = false;
+            while (i < lines.length) {
+                var closeMatch = lines[i].match(/^(`{3,})\s*$/);
+                if (closeMatch && closeMatch[1].length >= fenceLen) {
+                    i++; /* Move past the closing fence line */
+                    foundClose = true;
+                    break;
+                }
+                codeLines.push(lines[i]);
+                i++;
+            }
+
+            /* Even if no closing fence found (truncated response),
+               still create the code block with whatever we have */
+            var code = codeLines.join('\n').trimEnd();
+            segments.push({ type: 'code', lang: lang, code: code });
+        } else {
+            /* Accumulate text lines until we hit a code block opening */
+            var textLines = [];
+            while (i < lines.length) {
+                /* Stop if this line opens a code fence */
+                if (lines[i].match(/^`{3,}[^`]*$/)) break;
+                textLines.push(lines[i]);
+                i++;
+            }
+            var textContent = textLines.join('\n');
+            if (textContent) {
+                segments.push({ type: 'text', content: textContent });
+            }
         }
-        segments.push({ type: 'code', lang: match[1].trim(), code: match[2].trimEnd() });
-        remaining = remaining.substring(match.index + match[0].length);
-        codeRegex.lastIndex = 0;
     }
-    if (remaining) segments.push({ type: 'text', content: remaining });
 
     return segments.map(function(seg) {
         if (seg.type === 'code') return renderCodeBlock(seg.lang, seg.code);
@@ -219,7 +278,6 @@ function renderPlanCard(header, items) {
     for (var i = 0; i < itemLines.length; i++) {
         var line = itemLines[i].trim();
         if (!line) continue;
-        /* Remove ☐ prefix if present */
         line = line.replace(/^☐\s*/, '');
         checkItems += renderCheckItem(line, false);
     }
@@ -265,14 +323,12 @@ function renderStatusLine(emoji, content) {
    TABLE RENDERING
    ═══════════════════════════════════════ */
 function renderTables(text) {
-    /* Find table blocks: line with |, separator line with |---|, then data rows */
     var tableRegex = /((?:^\|.+\|$)\n)+/gm;
     return text.replace(tableRegex, function(tableBlock) {
         var rows = tableBlock.trim().split('\n');
         if (rows.length < 2) return tableBlock;
 
         var headerCells = parseTableRow(rows[0]);
-        /* Check if second row is a separator */
         var isSeparator = /^\|[\s\-:]+\|/.test(rows[1]);
         var dataStartIdx = isSeparator ? 2 : 1;
 
@@ -299,5 +355,5 @@ function renderTables(text) {
 
 function parseTableRow(row) {
     if (!row || row.indexOf('|') === -1) return [];
-    return row.split('|').slice(1, -1); /* Remove empty first/last from leading/trailing | */
+    return row.split('|').slice(1, -1);
 }
