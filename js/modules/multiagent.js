@@ -1,4 +1,4 @@
-/* ═══════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════
    MULTI-AGENT ORCHESTRATION
    + DYNAMIC MODEL DISCOVERY
    + 429 rate-limit model switching
@@ -7,12 +7,13 @@
    + Inter-agent delay
    + Trivial plan detection
    + Coder output → Apply button conversion
-   ═══════════════════════════════════════ */
+   + FULL file content injection for target files
+   ═══════════════════════════════════════════════════════════════ */
 import { state } from './state.js';
 import { toast, setConnectionStatus, autoResize, getTimeStr, highlightCodeBlocks } from './ui.js';
 import { removeWelcome, addUserMessage } from './messages.js';
 import { parseMarkdown } from './markdown.js';
-import { getFileContext, isConnected } from './filesystem.js';
+import { getFileContext, isConnected, readFile, getTree } from './filesystem.js';
 
 /* ═══════════════════════════════════════════════════
    DYNAMIC MODEL DISCOVERY
@@ -180,7 +181,18 @@ export var AGENTS = {
         fallbackModels: [],
         maxTokens: 16384,
         currentModel: null,
-        prompt: 'You are S.ai\'s Coder agent. Write COMPLETE, production-ready code based on the plan.\n\nOUTPUT FORMAT — follow EXACTLY:\nFor EACH file, output:\n\nfile:path/to/filename.ext\nCOMPLETE file content here — every line, no omissions\n\nAfter ALL files, output: <|INTEGRATION_CHECK|>\n\nCRITICAL RULES:\n- Output COMPLETE files. No "...", no "// rest unchanged", no "// existing code"\n- Every import, every function, every line must be present\n- If modifying an existing file, output the ENTIRE file\n- Include all necessary imports and error handling\n- NEVER abbreviate or skip any part of a file',
+
+        /* ═══════════════════════════════════════════════════════════════
+           CODER PROMPT — Emphasize preserving existing code
+
+           The #1 problem with free models: they invent new file
+           contents from scratch instead of modifying existing
+           files. This prompt explicitly tells the coder:
+           1. The FULL content of each file to modify is provided
+           2. It MUST output the entire file with changes applied
+           3. It MUST NOT invent new structure or drop existing code
+           ═══════════════════════════════════════════════════════════════ */
+        prompt: 'You are S.ai\'s Coder agent. You modify EXISTING files in a real project.\n\nCRITICAL RULES:\n1. You will receive the FULL current content of each file you need to modify.\n2. You MUST output the COMPLETE file with ALL existing code preserved plus your changes.\n3. NEVER invent new HTML structure, never drop existing elements, never replace a file with a different one.\n4. If adding a feature (e.g. a dropdown), ADD it to the EXISTING structure — keep everything else exactly as-is.\n5. Every existing import, function, element, and style MUST appear in your output unchanged.\n6. If a file is large, output it in full anyway — do NOT use "..." or "// rest unchanged".\n\nOUTPUT FORMAT — follow EXACTLY:\nFor EACH file, output:\n\nfile:path/to/filename.ext\nCOMPLETE file content here — every line, no omissions\n\nAfter ALL files, output: <|INTEGRATION_CHECK|>\n\nREMEMBER: You are MODIFYING existing files, not creating new ones from scratch. Preserve ALL existing code.',
 
         validateOutput: function(text) {
             if (!text || text.length < 50) return { valid: false, error: 'Output too short' };
@@ -313,7 +325,8 @@ export var multiAgentState = {
     conversationHistory: [],
     taskQueue: [],
     activeLoop: null,
-    triedModels: new Set()
+    triedModels: new Set(),
+    targetFileContents: ''   /* ← full contents of files the plan targets */
 };
 
 /* ═══════════════════════════════════════
@@ -343,6 +356,36 @@ function buildAgentHeaders() {
     return h;
 }
 
+/* ═══════════════════════════════════════════════════
+   READ TARGET FILE CONTENTS
+
+   After the Planner identifies which files to modify,
+   we read the FULL content of each file so the Coder
+   agent sees what it's working with instead of inventing
+   new contents from scratch.
+   ═══════════════════════════════════════════════════ */
+async function readTargetFileContents(filePaths) {
+    if (!filePaths || filePaths.length === 0) return '';
+    var contents = [];
+    var readCount = 0;
+    for (var i = 0; i < filePaths.length; i++) {
+        var path = filePaths[i].trim();
+        if (!path || path.indexOf('.') === -1) continue;
+        try {
+            var content = await readFile(path);
+            if (content && content.length > 0) {
+                contents.push('--- EXISTING FILE: ' + path + ' ---\n' + content + '\n--- END FILE: ' + path + ' ---');
+                readCount++;
+                console.log('[MultiAgent] Read target file: ' + path + ' (' + content.length + ' chars)');
+            }
+        } catch (e) {
+            console.warn('[MultiAgent] Could not read file: ' + path + ' — ' + (e.message || e));
+        }
+    }
+    console.log('[MultiAgent] Read ' + readCount + '/' + filePaths.length + ' target files');
+    return contents.join('\n\n');
+}
+
 /* ═══════════════════════════════════════
    SMART FILE CONTEXT
    ═══════════════════════════════════════ */
@@ -357,7 +400,14 @@ function getSmartFileContext(agentName) {
         return tree + '\n\nNote: Full file contents will be provided to the Coder agent.';
     }
     if (agentName === 'coder') {
-        var MAX_CODER_CTX = 30000;
+        /* ═══════════════════════════════════════════════════════
+           CODER CONTEXT BUDGET: 80KB (up from 30KB)
+
+           The coder needs as much context as possible so it
+           can see existing file contents and preserve them.
+           Free models with 128K context can easily handle 80K.
+           ═══════════════════════════════════════════════════════ */
+        var MAX_CODER_CTX = 80000;
         if (fullCtx.length <= MAX_CODER_CTX) return fullCtx;
         var fileSections = fullCtx.split(/(?=--- FILE: )/);
         var treeSection = '';
@@ -403,13 +453,13 @@ function removeWorking(uid) { if (!uid) return; var el = document.getElementById
    FORMAT CODER OUTPUT — Convert file: blocks to
    markdown code fences so parseMarkdown() renders
    them with Apply buttons.
-   
+
    Coder outputs:        Markdown needs:
    file:path.ext         ```file:path.ext
    content here          content here
    next line             next line
                          ```
-   
+
    Without this conversion, parseMarkdown() never
    sees code fences with "file:" prefix, so it
    renders them as plain text with no Apply button.
@@ -454,7 +504,7 @@ function formatCoderOutput(text) {
 
 /* ═══════════════════════════════════════════════════
    RENDER AGENT MESSAGE
-   
+
    For coder output, we convert file: blocks to
    ```file:path format so parseMarkdown() renders
    Apply/Edit buttons that call applyFileChange().
@@ -539,6 +589,7 @@ MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt
     multiAgentState.isActive = true;
     multiAgentState.triedModels = new Set();
     clearRateLimits();
+    multiAgentState.targetFileContents = '';
     multiAgentState.currentTask = { id: Date.now(), userPrompt: userPrompt, startTime: Date.now(), status: 'initializing', logs: [], agentsUsed: [], coderModelsUsed: [] };
     this.abortController = new AbortController();
     this.currentAgentIndex = 0;
@@ -570,8 +621,24 @@ MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt
             if (!result) throw new Error('Agent ' + agentName + ' returned no result');
             if (!result.success) throw new Error('Agent ' + agentName + ' failed: ' + (result.error || 'no details'));
 
+            /* ═══════════════════════════════════════════════════════
+               AFTER PLANNER SUCCEEDS: Read the full content of
+               every file the plan targets, so the Coder gets the
+               actual source instead of inventing it from scratch.
+               ═══════════════════════════════════════════════════════ */
             if (agentName === 'planner' && result.plan) {
                 multiAgentState.plan = result.plan;
+                if (result.plan.files && result.plan.files.length > 0 && isConnected()) {
+                    try {
+                        multiAgentState.targetFileContents = await readTargetFileContents(result.plan.files);
+                        if (multiAgentState.targetFileContents) {
+                            console.log('[MultiAgent] Injected ' + multiAgentState.targetFileContents.length + ' chars of target file contents for Coder');
+                            toast('Read ' + result.plan.files.length + ' target files for Coder context', 'info');
+                        }
+                    } catch (e) {
+                        console.warn('[MultiAgent] Could not read target files:', e.message);
+                    }
+                }
             }
 
             this.currentAgentIndex++;
@@ -734,10 +801,28 @@ MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, mo
     if (projectCtx && projectCtx.value.trim()) systemContent += '\n\n--- PROJECT CONTEXT ---\n' + projectCtx.value.trim() + '\n--- END CONTEXT ---';
     var fileCtx = getSmartFileContext(agentName);
     if (fileCtx) systemContent += '\n\n' + fileCtx;
+
+    /* ═══════════════════════════════════════════════════════
+       INJECT TARGET FILE CONTENTS INTO CODER SYSTEM PROMPT
+
+       This is the critical fix: the coder gets the FULL
+       content of every file the plan identified, so it
+       knows what already exists and can modify it rather
+       than inventing new contents from scratch.
+       ═══════════════════════════════════════════════════════ */
+    if (agentName === 'coder' && multiAgentState.targetFileContents) {
+        systemContent += '\n\n--- EXISTING FILES YOU MUST MODIFY (FULL CONTENT) ---\n';
+        systemContent += 'IMPORTANT: These are the CURRENT contents of files you need to modify.\n';
+        systemContent += 'You MUST preserve ALL existing code and only add/modify the parts needed by the plan.\n';
+        systemContent += 'Do NOT invent new structure. Do NOT drop existing elements.\n\n';
+        systemContent += multiAgentState.targetFileContents;
+        systemContent += '\n--- END EXISTING FILES ---';
+    }
+
     var userMax = state.settings.maxTokens || 4096, agentBudget = agent.maxTokens || 8192;
     var startTokens = Math.max(agentBudget, Math.min(userMax, 32768));
     var fileCount = fileCtx ? (fileCtx.match(/--- FILE:/g) || []).length : 0;
-    console.log('[MultiAgent] ' + agentName + ' model=' + model + ' startTokens=' + startTokens + ' fileCtx=' + fileCtx.length + ' chars ' + fileCount + ' files');
+    console.log('[MultiAgent] ' + agentName + ' model=' + model + ' startTokens=' + startTokens + ' fileCtx=' + fileCtx.length + ' chars ' + fileCount + ' files' + (agentName === 'coder' && multiAgentState.targetFileContents ? ' targetFileCtx=' + multiAgentState.targetFileContents.length + ' chars' : ''));
     var MAX_402_RETRIES = 4, currentTokens = startTokens;
     for (var retry402 = 0; retry402 < MAX_402_RETRIES; retry402++) {
         try {
@@ -814,15 +899,30 @@ MultiAgentOrchestrator.prototype.parseAgentResult = function(agentName, content)
     }
 };
 
+/* ═══════════════════════════════════════════════════════════════
+   BUILD AGENT PROMPT — now includes target file contents
+   for the coder so it knows what it's modifying.
+   ═══════════════════════════════════════════════════════════════ */
 MultiAgentOrchestrator.prototype.buildAgentPrompt = function(agentName, plan, criticFeedback) {
     switch (agentName) {
         case 'planner': return 'Create an implementation plan for this task:\n\n' + (multiAgentState.currentTask ? multiAgentState.currentTask.userPrompt : 'No task');
         case 'coder':
             var prompt = 'Implement the code according to this plan:\n\n';
             if (plan) { prompt += '## PLAN\nObjective: ' + plan.objective + '\n\nSteps:\n'; for (var i = 0; i < plan.steps.length; i++) prompt += (i + 1) + '. ' + plan.steps[i] + '\n'; prompt += '\n'; if (plan.files.length) prompt += 'Files to create/modify:\n' + plan.files.join('\n') + '\n\n'; }
+            /* ═══════════════════════════════════════════════════════
+               INJECT FULL TARGET FILE CONTENTS INTO CODER PROMPT
+               This ensures the coder sees what it's modifying
+               even if the system prompt context was truncated.
+               ═══════════════════════════════════════════════════════ */
+            if (multiAgentState.targetFileContents) {
+                prompt += '## EXISTING FILES TO MODIFY (FULL CURRENT CONTENT)\n';
+                prompt += 'Below is the FULL current content of each file you must modify.\n';
+                prompt += 'You MUST preserve ALL existing code and only add/modify the parts needed.\n\n';
+                prompt += multiAgentState.targetFileContents + '\n\n';
+            }
             if (criticFeedback) prompt += '## CRITIC FEEDBACK — FIX THESE ISSUES\n' + criticFeedback + '\n\n';
             if (this.taskContext) prompt += '## WORKSPACE CONTEXT\n' + this.taskContext + '\n\n';
-            prompt += 'REMEMBER: Output COMPLETE files. No "...", no "// unchanged". Use format:\nfile:path/to/filename.ext\nCOMPLETE code here\n\nEnd with <|INTEGRATION_CHECK|>';
+            prompt += 'REMEMBER: Output COMPLETE files. No "...", no "// unchanged". You are MODIFYING existing files — preserve ALL existing code, only add/change what the plan requires.\n\nUse format:\nfile:path/to/filename.ext\nCOMPLETE code here\n\nEnd with <|INTEGRATION_CHECK|>';
             return prompt;
         case 'critic':
             var cp = 'Review this code:\n\n'; if (this.taskContext) cp += this.taskContext + '\n\n'; cp += 'APPROVE if production-ready. REJECT with numbered issues if not.'; return cp;
@@ -860,7 +960,7 @@ MultiAgentOrchestrator.prototype.completeTask = function(status, error) {
     }
     setConnectionStatus('connected', 'Connected — ' + state.settings.model);
     removeMultiAgentStatus();
-    setTimeout(function() { multiAgentState.currentTask = null; multiAgentState.conversationHistory = []; multiAgentState.criticRejections = 0; multiAgentState.coderAttempts = 0; multiAgentState.triedModels = new Set(); multiAgentState.plan = null; }, 1000);
+    setTimeout(function() { multiAgentState.currentTask = null; multiAgentState.conversationHistory = []; multiAgentState.criticRejections = 0; multiAgentState.coderAttempts = 0; multiAgentState.triedModels = new Set(); multiAgentState.plan = null; multiAgentState.targetFileContents = ''; }, 1000);
 };
 
 MultiAgentOrchestrator.prototype.abort = function() { if (this.abortController) this.abortController.abort(); this.completeTask('aborted', 'Task aborted by user'); };
