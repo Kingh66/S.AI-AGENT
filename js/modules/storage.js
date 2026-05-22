@@ -138,13 +138,26 @@ function repairDeadModels() {
 }
 
 export function resetAllSettings() {
+    /* ═══════════════════════════════════════════════════
+       CLEAR ALL PERSISTED STATE FROM LOCALSTORAGE
+       
+       FIX: Added sai_runtime_state removal.
+       
+       OLD BUG: resetAllSettings() cleared settings and
+       multi-agent config but left sai_runtime_state
+       intact. This meant stale activeTask.isRunning=true
+       and cooldownUntil timestamps survived a full reset,
+       poisoning the next session with ghost auto-continues
+       and stuck cooldowns.
+       ═══════════════════════════════════════════════════ */
     localStorage.removeItem('sai_settings');
     localStorage.removeItem('sai_context');
     localStorage.removeItem('sai_mode');
     localStorage.removeItem('sai_voice_lang');
     localStorage.removeItem('sai_voice_rate');
     localStorage.removeItem('sai_multiagent');
-    localStorage.removeItem('sai_verified_free_models'); /* Clear cached model list too */
+    localStorage.removeItem('sai_verified_free_models');
+    localStorage.removeItem('sai_runtime_state'); /* ← FIX: Clear persisted runtime state */
 
     state.settings.provider = 'openrouter';
     state.settings.endpoint = PROVIDER_DEFAULTS.openrouter.endpoint;
@@ -160,6 +173,29 @@ export function resetAllSettings() {
     state.settings.agentModels = Object.assign({}, MULTI_AGENT_CONFIG.agentModels);
     state.settings.maxCoderAttempts = MULTI_AGENT_CONFIG.maxCoderAttempts;
     state.settings.maxCriticRejections = MULTI_AGENT_CONFIG.maxCriticRejections;
+
+    /* ═══════════════════════════════════════════════════
+       FIX: RESET IN-MEMORY RUNTIME STATE FLAGS
+       
+       OLD BUG: Only localStorage keys were cleared, but
+       the in-memory state object still held stale values.
+       The next saveRuntimeState() call would write them
+       right back to localStorage, defeating the reset.
+       
+       Now we explicitly zero out all transient runtime
+       flags so both storage AND memory are clean.
+       ═══════════════════════════════════════════════════ */
+    state.responseTruncated = false;
+    state.cooldownUntil = 0;
+    if (state.cooldownTimer) {
+        clearInterval(state.cooldownTimer);
+        state.cooldownTimer = null;
+    }
+    state.pendingRequest = null;
+    state.fallbackModelsTried = [];
+    state.activeTask.isRunning = false;
+    state.activeTask.loopCount = 0;
+    state.activeTask.pendingIntegrations = [];
 
     document.getElementById('project-context').value = '';
     toast('All settings reset to defaults', 'success');
