@@ -515,12 +515,21 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             throw new Error('HTTP ' + status + ': ' + errText.substring(0, 300));
         }
 
-        /* ═════════════════════════
+                /* ═════════════════════════
            STREAM READING
+           
+           FIX: Break immediately on [DONE] or finish_reason.
+           The old code used `continue` for [DONE], which kept
+           the loop alive waiting for the HTTP connection to
+           close. This caused:
+           1. 2-5 second delay after last token (cursor blink)
+           2. If the connection dropped, no content was received
+              → "No response received" error
            ═════════════════════════ */
         resetFallbackTracking();
         var reader = res.body.getReader();
         var decoder = new TextDecoder();
+        var streamDone = false;
 
         while (true) {
             var result = await reader.read();
@@ -531,13 +540,28 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
 
             if (isOllamaProvider()) {
                 var lines = chunk.split('\n').filter(function (l) { return l.trim(); });
-                for (var i = 0; i < lines.length; i++) { try { var d = JSON.parse(lines[i]); if (d.message && d.message.content) appendStreamChunk(d.message.content); if (d.done) finishReason = 'stop'; } catch (e) { } }
+                for (var i = 0; i < lines.length; i++) {
+                    try {
+                        var d = JSON.parse(lines[i]);
+                        if (d.message && d.message.content) appendStreamChunk(d.message.content);
+                        if (d.done) {
+                            finishReason = 'stop';
+                            streamDone = true;
+                            break;
+                        }
+                    } catch (e) { }
+                }
             } else {
                 var sseLines = chunk.split('\n');
                 for (var j = 0; j < sseLines.length; j++) {
-                    if (!sseLines[j].startsWith('data: ')) continue;
-                    var data = sseLines[j].slice(6).trim();
-                    if (data === '[DONE]') continue;
+                    if (!sseLines[j].startsWith('data:')) continue;
+                    var data = sseLines[j].replace(/^data:\s*/, '').trim();
+                    if (data === '[DONE]') {
+                        finishReason = finishReason || 'stop';
+                        streamDone = true;
+                        break;
+                    }
+                    if (!data) continue;
                     try {
                         var parsed = JSON.parse(data);
                         if (!parsed.choices || !parsed.choices[0]) continue;
@@ -547,9 +571,17 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                         var content = delta.content || null;
                         if (reasoning) { if (!isThinkingPhase) isThinkingPhase = true; thinkingContent += reasoning; showThinkingBlock(thinkingContent); }
                         if (content) appendStreamChunk(content);
+                        /* Break as soon as finish_reason is set — nothing more to read */
+                        if (finishReason && finishReason !== 'null') {
+                            streamDone = true;
+                            break;
+                        }
                     } catch (e) { }
                 }
             }
+
+            /* If we've received [DONE] or finish_reason, stop reading immediately */
+            if (streamDone) break;
         }
 
         state.thinkingContent = thinkingContent;
