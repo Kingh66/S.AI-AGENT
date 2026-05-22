@@ -6,6 +6,7 @@
    + LENIENT validation for free models
    + Inter-agent delay
    + Trivial plan detection
+   + Coder output → Apply button conversion
    ═══════════════════════════════════════ */
 import { state } from './state.js';
 import { toast, setConnectionStatus, autoResize, getTimeStr, highlightCodeBlocks } from './ui.js';
@@ -181,62 +182,28 @@ export var AGENTS = {
         currentModel: null,
         prompt: 'You are S.ai\'s Coder agent. Write COMPLETE, production-ready code based on the plan.\n\nOUTPUT FORMAT — follow EXACTLY:\nFor EACH file, output:\n\nfile:path/to/filename.ext\nCOMPLETE file content here — every line, no omissions\n\nAfter ALL files, output: <|INTEGRATION_CHECK|>\n\nCRITICAL RULES:\n- Output COMPLETE files. No "...", no "// rest unchanged", no "// existing code"\n- Every import, every function, every line must be present\n- If modifying an existing file, output the ENTIRE file\n- Include all necessary imports and error handling\n- NEVER abbreviate or skip any part of a file',
 
-        /* ═══════════════════════════════════════════════════
-           LENIENT VALIDATION FOR FREE MODELS
-           
-           Free models often don't follow the exact format.
-           We accept output if it contains ANY of:
-           1. file:path markers (standard format)
-           2. Markdown code blocks with substantial content
-           3. Raw code with identifiable file patterns
-           
-           We also use SMART "..." detection that only
-           flags lazy abbreviations, not spread operators
-           or CSS values.
-           ═══════════════════════════════════════════════════ */
         validateOutput: function(text) {
             if (!text || text.length < 50) return { valid: false, error: 'Output too short' };
 
-            /* ═══════════════════════════════════════════════════
-               SMART "..." DETECTION
-               
-               OLD BUG: Regex /\.\.\.[\s\S]*?\.\.\./ caught
-               spread operators (...args), CSS (0 0 ... 10px),
-               and any two "..." anywhere in the text.
-               
-               NEW: Only flag "..." when it's used as a lazy
-               abbreviation — on its own line or in a comment
-               that says "rest", "unchanged", "existing", etc.
-               ═══════════════════════════════════════════════════ */
+            /* SMART "..." DETECTION — only flags lazy abbreviations */
             var lines = text.split('\n');
             var lazyLineCount = 0;
             for (var li = 0; li < lines.length; li++) {
                 var line = lines[li].trim();
-
-                /* Line is JUST "..." — always lazy */
                 if (line === '...' || line === '…') { lazyLineCount++; continue; }
-
-                /* Comment with "..." and lazy keywords */
                 if ((line.startsWith('//') || line.startsWith('#') || line.startsWith('/*') || line.startsWith('*')) &&
                     /\.\.\./.test(line) &&
-                    /\b(rest|unchanged|existing|same|omitted|continued|previous|unchanged|unchanged code|existing code|other code|more code|etc)\b/i.test(line)) {
-                    lazyLineCount++;
-                    continue;
+                    /\b(rest|unchanged|existing|same|omitted|continued|previous|unchanged code|existing code|other code|more code|etc)\b/i.test(line)) {
+                    lazyLineCount++; continue;
                 }
-
-                /* "// ..." at end of line suggesting continuation */
                 if (/\/\/\s*\.\.\.\s*$/.test(line)) { lazyLineCount++; continue; }
                 if (/#\s*\.\.\.\s*$/.test(line)) { lazyLineCount++; continue; }
             }
-
-            /* Allow up to 2 lazy lines — free models sometimes add "// ..." as section dividers */
             if (lazyLineCount > 2) {
                 return { valid: false, error: 'Lazy code detected — ' + lazyLineCount + ' lines contain abbreviated "..."' };
             }
 
-            /* ═══════════════════════════════════════════════════
-               FILE BLOCK DETECTION — Multiple strategies
-               ═══════════════════════════════════════════════════ */
+            /* FILE BLOCK DETECTION — Multiple strategies */
             var fileCount = 0;
 
             /* Strategy 1: Standard file:path format */
@@ -256,7 +223,6 @@ export var AGENTS = {
             }
 
             /* Strategy 3: Markdown code blocks with filenames */
-            /* Matches ```lang:path or ```lang path or ```path.ext */
             var mdBlocks = text.match(/```[\w]*\s*[:/]?([^\n]*\.(js|ts|jsx|tsx|py|java|html|css|json|md|yaml|yml|sh|sql|go|rs|cpp|c|h|rb|php|dart|kt|svg))[^\n]*\n([\s\S]*?)```/g);
             if (mdBlocks && mdBlocks.length > 0) {
                 fileCount = mdBlocks.length;
@@ -267,10 +233,8 @@ export var AGENTS = {
             /* Strategy 4: Any markdown code blocks with substantial content */
             var codeBlocks = text.match(/```[\w]*\n([\s\S]*?)```/g);
             if (codeBlocks && codeBlocks.length > 0) {
-                /* Count blocks with meaningful content (>100 chars) */
                 var substantialBlocks = 0;
                 for (var cb = 0; cb < codeBlocks.length; cb++) {
-                    /* Remove the ``` markers and check size */
                     var blockContent = codeBlocks[cb].replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '');
                     if (blockContent.length > 100) substantialBlocks++;
                 }
@@ -281,11 +245,9 @@ export var AGENTS = {
                 }
             }
 
-            /* Strategy 5: Substantial raw output (no code blocks but >2000 chars of content) */
-            /* This handles models that output raw code without markdown */
+            /* Strategy 5: Substantial raw output */
             var textWithoutMarkup = text.replace(/<[^>]+>/g, '').replace(/```/g, '').trim();
             if (textWithoutMarkup.length > 2000) {
-                /* Check if it looks like code (has braces, semicolons, or indentation) */
                 var codeIndicators = (textWithoutMarkup.match(/[{};]/g) || []).length;
                 if (codeIndicators > 20) {
                     console.log('[MultiAgent] Coder validation: accepting raw code output (' + textWithoutMarkup.length + ' chars, ' + codeIndicators + ' code indicators)');
@@ -437,33 +399,99 @@ function showAgentWorking(agentName) {
 
 function removeWorking(uid) { if (!uid) return; var el = document.getElementById(uid); if (el) el.remove(); }
 
+/* ═══════════════════════════════════════════════════
+   FORMAT CODER OUTPUT — Convert file: blocks to
+   markdown code fences so parseMarkdown() renders
+   them with Apply buttons.
+   
+   Coder outputs:        Markdown needs:
+   file:path.ext         ```file:path.ext
+   content here          content here
+   next line             next line
+                         ```
+   
+   Without this conversion, parseMarkdown() never
+   sees code fences with "file:" prefix, so it
+   renders them as plain text with no Apply button.
+   ═══════════════════════════════════════════════════ */
+function formatCoderOutput(text) {
+    if (!text || text.indexOf('file:') === -1) return text;
+
+    /* Remove integration check markers */
+    var cleaned = text.replace(/<\|INTEGRATION_CHECK\|>/g, '').trimEnd();
+
+    /* Split on file: markers (must be at start of line) */
+    var parts = cleaned.split(/(?=^file:)/m);
+    var output = [];
+
+    for (var i = 0; i < parts.length; i++) {
+        var part = parts[i];
+        if (!part || !part.trim()) continue;
+
+        /* Check if this part starts with file: */
+        var trimmed = part.trimStart();
+        if (trimmed.startsWith('file:')) {
+            /* Find the first newline — everything before is the path, after is content */
+            var firstNewline = trimmed.indexOf('\n');
+            if (firstNewline === -1) {
+                /* Just a path with no content — skip */
+                continue;
+            }
+
+            var filePath = trimmed.substring(5, firstNewline).trim();
+            var content = trimmed.substring(firstNewline + 1).trimEnd();
+
+            /* Build proper markdown code fence */
+            output.push('```file:' + filePath + '\n' + content + '\n```');
+        } else {
+            /* Non-file content (commentary, etc.) — keep as-is */
+            output.push(part.trim());
+        }
+    }
+
+    return output.join('\n\n');
+}
+
+/* ═══════════════════════════════════════════════════
+   RENDER AGENT MESSAGE
+   
+   For coder output, we convert file: blocks to
+   ```file:path format so parseMarkdown() renders
+   Apply/Edit buttons that call applyFileChange().
+   ═══════════════════════════════════════════════════ */
 function renderAgentMessage(agentName, content, status) {
     removeWelcome();
     var msgs = document.getElementById('messages');
-    var div = document.createElement('div'); div.className = 'message bot';
-    div.innerHTML = '<div class="msg-avatar" style="background:rgba(0,212,170,0.12)"><i class="fas ' + (AGENT_ICONS[agentName] || 'fa-robot') + '"></i></div><div class="msg-body"><div class="msg-meta"><span class="msg-name" style="color:var(--accent)">' + (AGENT_NAMES[agentName] || agentName) + ' Agent</span>' + (STATUS_HTML[status] || '') + '<span class="msg-time">' + getTimeStr() + '</span></div><div class="msg-content">' + parseMarkdown(content) + '</div></div>';
-    msgs.appendChild(div); highlightCodeBlocks(div); scrollMessages();
+    var div = document.createElement('div');
+    div.className = 'message bot';
+
+    /* Convert coder file: blocks to markdown code fences for Apply buttons */
+    var displayContent = content;
+    if (agentName === 'coder') {
+        displayContent = formatCoderOutput(content);
+    }
+
+    div.innerHTML =
+        '<div class="msg-avatar" style="background:rgba(0,212,170,0.12)"><i class="fas ' + (AGENT_ICONS[agentName] || 'fa-robot') + '"></i></div>' +
+        '<div class="msg-body"><div class="msg-meta">' +
+        '<span class="msg-name" style="color:var(--accent)">' + (AGENT_NAMES[agentName] || agentName) + ' Agent</span>' +
+        (STATUS_HTML[status] || '') +
+        '<span class="msg-time">' + getTimeStr() + '</span>' +
+        '</div><div class="msg-content">' + parseMarkdown(displayContent) + '</div></div>';
+    msgs.appendChild(div);
+    highlightCodeBlocks(div);
+    scrollMessages();
 }
 
 /* ═══════════════════════════════════════════════════
    TRIVIAL TASK DETECTION
-   
-   When the user's message is a greeting or simple
-   question, there's nothing to code. The planner
-   will say "no files needed" and the coder will
-   fail because there's nothing to implement.
-   
-   We detect this and skip the coder/critic/tester.
    ═══════════════════════════════════════════════════ */
 function isTrivialPlan(plan) {
     if (!plan) return true;
-    /* No files to create/modify */
     if ((!plan.files || plan.files.length === 0) &&
         (!plan.steps || plan.steps.length === 0)) return true;
-    /* Objective mentions greeting/acknowledgment */
     var obj = (plan.objective || '').toLowerCase();
     if (/\b(greet|acknowledge|respond to|say hello|welcome|no files|no code|nothing to|chat|conversation)\b/i.test(obj)) return true;
-    /* Very few steps and no files */
     if (plan.steps && plan.steps.length <= 2 && (!plan.files || plan.files.length === 0)) return true;
     return false;
 }
@@ -495,12 +523,6 @@ function getInterAgentDelay() {
 MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt) {
     if (multiAgentState.isActive) { toast('Multi-agent task already running', 'error'); return false; }
 
-    /* ═══════════════════════════════════════════════════
-       TRIVIAL MESSAGE SHORT-CIRCUIT
-       
-       If the user just says "hi" or "thanks", don't
-       waste 4 agent calls on it. Respond directly.
-       ═══════════════════════════════════════════════════ */
     if (isTrivialMessage(userPrompt)) {
         renderAgentMessage('system', 'Hello! 👋 How can I help you today? Give me a coding task and the multi-agent team will get to work.', 'success');
         return true;
@@ -528,13 +550,6 @@ MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt
 
     try {
         while (multiAgentState.isActive && this.currentAgentIndex < this.agentOrder.length) {
-            /* ═══════════════════════════════════════════════════
-               TRIVIAL PLAN SHORT-CIRCUIT
-               
-               After the planner runs, check if the plan
-               actually needs code. If not, skip the
-               coder/critic/tester — they'll just fail.
-               ═══════════════════════════════════════════════════ */
             if (this.currentAgentIndex === 1 && multiAgentState.plan && isTrivialPlan(multiAgentState.plan)) {
                 console.log('[MultiAgent] Trivial plan detected — skipping coder/critic/tester');
                 toast('No code needed for this task — plan only', 'info');
@@ -555,7 +570,6 @@ MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt
             if (!result) throw new Error('Agent ' + agentName + ' returned no result');
             if (!result.success) throw new Error('Agent ' + agentName + ' failed: ' + (result.error || 'no details'));
 
-            /* Store the plan after planner succeeds */
             if (agentName === 'planner' && result.plan) {
                 multiAgentState.plan = result.plan;
             }
@@ -634,17 +648,10 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
                     multiAgentState.criticRejections++;
                     var maxRejections = state.settings.maxCriticRejections || multiAgentState.maxCriticRejections;
                     if (multiAgentState.criticRejections >= maxRejections) {
-                        if (this.taskContext && this.taskContext.indexOf('file:') > -1) {
+                        if (this.taskContext && (this.taskContext.indexOf('file:') > -1 || this.taskContext.indexOf('```') > -1) && this.taskContext.length > 500) {
                             toast('Critic rejected but code exists — accepting anyway', 'info');
                             result.success = true; result.decision = 'APPROVED';
                             renderAgentMessage('critic', '**Accepted (Override)**\n\nCritic rejected but code files were produced.', 'success');
-                            break;
-                        }
-                        /* Also accept if there are substantial code blocks in context */
-                        if (this.taskContext && this.taskContext.indexOf('```') > -1 && this.taskContext.length > 500) {
-                            toast('Critic rejected but code produced — accepting', 'info');
-                            result.success = true; result.decision = 'APPROVED';
-                            renderAgentMessage('critic', '**Accepted (Override)**\n\nCode was produced despite critic concerns.', 'success');
                             break;
                         }
                         toast('Critic rejected ' + maxRejections + ' times — task failed', 'error');
@@ -826,13 +833,11 @@ MultiAgentOrchestrator.prototype.buildAgentPrompt = function(agentName, plan, cr
 
 MultiAgentOrchestrator.prototype.accumulateContext = function(agentName, content) {
     if (agentName === 'coder') {
-        /* Try standard file: format first */
         var fileBlocks = content.match(/file:([^\n]+)\n([\s\S]*?)(?=\nfile:|<\|INTEGRATION_CHECK\|>|$)/g) || [];
         if (fileBlocks.length > 0) {
             var filesContext = fileBlocks.map(function(block) { var lines = block.split('\n'); var filePath = lines[0].replace('file:', '').trim(); var code = lines.slice(1).join('\n'); return 'file:' + filePath + '\n' + code; }).join('\n\n');
             return '## IMPLEMENTED CODE\n' + filesContext + '\n\n';
         }
-        /* Fallback: just use the raw content — critic can still review it */
         return '## IMPLEMENTED CODE\n' + content + '\n\n';
     }
     return '## ' + agentName.toUpperCase() + ' OUTPUT\n' + content + '\n\n';
