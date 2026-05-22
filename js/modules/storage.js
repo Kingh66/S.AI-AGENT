@@ -5,7 +5,7 @@ import { state, voiceState } from './state.js';
 import { SYSTEM_PROMPTS, PROVIDER_DEFAULTS, MULTI_AGENT_CONFIG } from './config.js';
 import { toast } from './ui.js';
 
-var SETTINGS_VERSION = 6;
+var SETTINGS_VERSION = 7; /* Bumped: dead model cleanup + dynamic auto-detect */
 
 var BAD_ENDPOINTS = [
     'http://localhost:8000/v1',
@@ -13,9 +13,34 @@ var BAD_ENDPOINTS = [
     ''
 ];
 
+/* ═══════════════════════════════════════════════════
+   DEAD MODELS — Known-removed OpenRouter model IDs
+   
+   When a saved setting references one of these, we
+   clear it to '' (empty string) instead of replacing
+   with another hardcoded model that might ALSO be dead.
+   
+   For multi-agent: '' means "auto-detect from OpenRouter
+   free models at runtime" (handled by multiagent.js).
+   
+   For the main chat model: '' means the user needs to
+   select a fresh model from the settings dropdown.
+   
+   To add a newly-dead model, just add it to this map
+   with value ''. The repair functions handle the rest.
+   ═══════════════════════════════════════════════════ */
 var DEAD_MODELS = {
-    'qwen/qwen-3.6-plus': 'xiaomi/mimo-v2-pro:free',
-    'openrouter/hunter-alpha': 'xiaomi/mimo-v2-pro:free'
+    /* ── Confirmed dead (404 on OpenRouter) ── */
+    'xiaomi/mimo-v2-pro:free': '',
+    'minimax/minimax-m2.7:free': '',
+    'nvidia/nemotron-3-super:free': '',
+    'minimax/minimax-m2.5:free': '',
+    'qwen/qwen-3.6-plus': '',
+    'openrouter/hunter-alpha': '',
+    /* ── Previously hardcoded in config v5/v6 — may be dead ── */
+    'stepfun/step-3.5-flash:free': '',
+    'z-ai/glm-5-turbo:free': '',
+    'meta-llama/llama-3.1-70b-instruct:free': ''
 };
 
 /* ── Nuclear safeguard ── */
@@ -47,24 +72,66 @@ function repairEndpoint() {
     return false;
 }
 
+/* ═══════════════════════════════════════════════════
+   REPAIR DEAD MODELS — Multi-agent agent models
+   
+   OLD BUG: Replaced dead models with other hardcoded
+   models (e.g. xiaomi/mimo-v2-pro:free) that were
+   ALSO dead, creating an endless 404 loop.
+   
+   NEW: Sets dead model values to '' (empty string),
+   which signals multiagent.js to auto-detect a valid
+   free model from OpenRouter at runtime.
+   ═══════════════════════════════════════════════════ */
 function repairDeadModels() {
     var repaired = false;
     var models = state.settings.agentModels;
     if (!models) return false;
 
-    for (var key in DEAD_MODELS) {
-        if (models[key] === key) {
-            models[key] = DEAD_MODELS[key];
+    /* Check each agent model slot */
+    var agentKeys = ['planner', 'coder', 'coderFallback', 'critic', 'criticFallback', 'tester'];
+    for (var k = 0; k < agentKeys.length; k++) {
+        var key = agentKeys[k];
+        var val = models[key];
+
+        if (!val) continue; /* empty = auto-detect, which is fine */
+
+        /* Check if this model is in the dead list */
+        if (DEAD_MODELS.hasOwnProperty(val)) {
+            console.warn('[Storage] Agent model "' + val + '" is dead. Clearing to auto-detect.');
+            models[key] = ''; /* empty = auto-detect at runtime */
             repaired = true;
+            continue;
         }
-    }
-    if (models.coderFallback && DEAD_MODELS[models.coderFallback]) {
-        models.coderFallback = DEAD_MODELS[models.coderFallback];
-        repaired = true;
-    }
-    if (models.criticFallback && DEAD_MODELS[models.criticFallback]) {
-        models.criticFallback = DEAD_MODELS[models.criticFallback];
-        repaired = true;
+
+        /* ═══════════════════════════════════════════════════
+           PROACTIVE DEAD MODEL DETECTION
+           
+           Even if a model isn't in our DEAD_MODELS list,
+           we can detect likely-dead models by pattern:
+           - Models that were hardcoded in old config versions
+           - Models with known-removed patterns
+           
+           This catches models that die AFTER a release
+           but BEFORE we update the DEAD_MODELS list.
+           ═══════════════════════════════════════════════════ */
+        if (typeof val === 'string' && val.indexOf('/') > -1 && val.indexOf(':free') > -1) {
+            /* It's an OpenRouter free model — check if we can verify it */
+            var verifiedList = state.verifiedFreeModelIds;
+            if (verifiedList && verifiedList.length > 0) {
+                var isVerified = false;
+                for (var vi = 0; vi < verifiedList.length; vi++) {
+                    if (verifiedList[vi] === val) { isVerified = true; break; }
+                }
+                if (!isVerified) {
+                    console.warn('[Storage] Agent model "' + val + '" not in verified free model list. Clearing to auto-detect.');
+                    models[key] = '';
+                    repaired = true;
+                }
+            }
+            /* If verifiedList isn't loaded yet, we can't check — leave it.
+               The multiagent.js dynamic fallback will handle it at runtime. */
+        }
     }
 
     return repaired;
@@ -77,6 +144,7 @@ export function resetAllSettings() {
     localStorage.removeItem('sai_voice_lang');
     localStorage.removeItem('sai_voice_rate');
     localStorage.removeItem('sai_multiagent');
+    localStorage.removeItem('sai_verified_free_models'); /* Clear cached model list too */
 
     state.settings.provider = 'openrouter';
     state.settings.endpoint = PROVIDER_DEFAULTS.openrouter.endpoint;
@@ -135,20 +203,41 @@ export function saveSettings() {
 export function loadSettings() {
     var repaired = false;
 
+    /* ═══════════════════════════════════════════════════
+       VERSION MIGRATION
+       
+       Bumped from v6 → v7 to force cleanup of dead
+       hardcoded models (xiaomi/mimo-v2-pro:free etc.)
+       that cause 404 errors in multi-agent mode.
+       
+       We preserve the API key and provider across
+       version upgrades so the user doesn't have to
+       re-enter credentials.
+       ═══════════════════════════════════════════════════ */
     try {
         var savedRaw = localStorage.getItem('sai_settings');
         if (savedRaw) {
             var quickCheck = JSON.parse(savedRaw);
             if (quickCheck._version !== SETTINGS_VERSION) {
-                console.warn('[Storage] Settings version mismatch. Resetting.');
+                console.warn('[Storage] Settings v' + quickCheck._version + ' → v' + SETTINGS_VERSION + '. Migrating.');
                 var keepKey = quickCheck.apiKey || '';
                 var keepModel = quickCheck.model || '';
+                var keepProvider = quickCheck.provider || 'openrouter';
+                var keepEndpoint = quickCheck.endpoint || '';
+                var keepTemp = typeof quickCheck.temperature === 'number' ? quickCheck.temperature : 0.7;
+
+                /* ── Clear dead model from main model slot ── */
+                if (keepModel && DEAD_MODELS.hasOwnProperty(keepModel)) {
+                    console.warn('[Storage] Main model "' + keepModel + '" is dead. Clearing.');
+                    keepModel = '';
+                }
+
                 localStorage.removeItem('sai_settings');
-                state.settings.provider = 'openrouter';
-                state.settings.endpoint = PROVIDER_DEFAULTS.openrouter.endpoint;
+                state.settings.provider = keepProvider;
+                state.settings.endpoint = keepEndpoint || (PROVIDER_DEFAULTS[keepProvider] ? PROVIDER_DEFAULTS[keepProvider].endpoint : 'https://openrouter.ai/api/v1');
                 state.settings.apiKey = keepKey;
                 state.settings.model = keepModel;
-                state.settings.temperature = 0.7;
+                state.settings.temperature = keepTemp;
                 state.settings.maxTokens = 8192;
                 state.settings.contextBudget = 25000;
                 state.settings.systemPrompt = SYSTEM_PROMPTS[state.currentMode];
@@ -156,6 +245,28 @@ export function loadSettings() {
                 repaired = true;
                 toast('Settings updated to v' + SETTINGS_VERSION, 'info');
                 savedRaw = null;
+
+                /* Also clear dead multi-agent models from the old save */
+                try {
+                    var maOld = localStorage.getItem('sai_multiagent');
+                    if (maOld) {
+                        var maOldParsed = JSON.parse(maOld);
+                        if (maOldParsed.agentModels) {
+                            var maCleaned = false;
+                            for (var mak in maOldParsed.agentModels) {
+                                if (DEAD_MODELS.hasOwnProperty(maOldParsed.agentModels[mak])) {
+                                    maOldParsed.agentModels[mak] = '';
+                                    maCleaned = true;
+                                }
+                            }
+                            if (maCleaned) {
+                                localStorage.setItem('sai_multiagent', JSON.stringify(maOldParsed));
+                            }
+                        }
+                    }
+                } catch (maCleanErr) {
+                    /* Non-critical — multi-agent repair runs below anyway */
+                }
             }
         }
     } catch (e) {
@@ -196,34 +307,45 @@ export function loadSettings() {
 
     state.settings._version = SETTINGS_VERSION;
 
+    /* ═══════════════════════════════════════════════════
+       MULTI-AGENT SETTINGS LOAD
+       
+       Merges saved agent models with config defaults.
+       Empty string ('') = auto-detect at runtime.
+       Dead models are cleared to '' for auto-detect.
+       ═══════════════════════════════════════════════════ */
     try {
         var maSaved = localStorage.getItem('sai_multiagent');
         if (maSaved) {
             var maParsed = JSON.parse(maSaved);
             state.settings.multiAgentEnabled = maParsed.multiAgentEnabled || false;
+
+            /* Merge: saved values override defaults, but dead models get cleared */
             state.settings.agentModels = Object.assign({}, MULTI_AGENT_CONFIG.agentModels, maParsed.agentModels || {});
             state.settings.maxCoderAttempts = maParsed.maxCoderAttempts || MULTI_AGENT_CONFIG.maxCoderAttempts;
             state.settings.maxCriticRejections = maParsed.maxCriticRejections || MULTI_AGENT_CONFIG.maxCriticRejections;
 
-            if (state.settings.agentModels) {
-                var agentModelsFixed = false;
-                for (var amKey in state.settings.agentModels) {
-                    var amVal = state.settings.agentModels[amKey];
-                    if (amVal && amVal.indexOf('/') > -1 && amVal.indexOf(':free') === -1) {
-                        state.settings.agentModels[amKey] = amVal + ':free';
-                        agentModelsFixed = true;
-                    }
-                }
-                if (agentModelsFixed) {
-                    repaired = true;
-                    toast('Auto-fixed multi-agent models to use free tier', 'info');
-                }
-            }
-
+            /* ── Clear dead models from agent model slots ── */
             if (repairDeadModels()) {
                 repaired = true;
-                toast('Auto-repaired removed models in multi-agent settings', 'info');
+                toast('Cleared removed models from multi-agent settings (will auto-detect)', 'info');
             }
+
+            /* ═══════════════════════════════════════════════════
+               REMOVED: Aggressive :free auto-appending
+               
+               OLD BUG: This blindly appended :free to any
+               model ID containing '/', which created invalid
+               IDs for non-OpenRouter providers (ollama, etc.)
+               and for paid models that don't have :free variants.
+               
+               The ensureFreeModel() function in multiagent.js
+               now handles this correctly at runtime — it only
+               appends :free for OpenRouter provider and only
+               for models that look like they should have it.
+               
+               We NO LONGER modify saved model IDs in storage.
+               ═══════════════════════════════════════════════════ */
         } else {
             state.settings.multiAgentEnabled = false;
             state.settings.agentModels = Object.assign({}, MULTI_AGENT_CONFIG.agentModels);
@@ -239,20 +361,16 @@ export function loadSettings() {
 
     repaired = repairEndpoint() || repaired;
 
-    /* ── FIX: Only reset endpoint if it's truly invalid, not just different from default ──
-       OLD BUG: This always reset the endpoint to the provider default,
-       even if the user intentionally set a custom URL (e.g. proxy, different region). */
+    /* ── Endpoint validation ── */
     var defaults = PROVIDER_DEFAULTS[state.settings.provider];
     if (defaults) {
         var ep = state.settings.endpoint;
-        /* Only reset if endpoint is empty, has double /v1, or matches a known-bad endpoint */
         var epIsBad = !ep || ep.indexOf('/v1/v1') > -1;
         if (!epIsBad) {
             for (var bi = 0; bi < BAD_ENDPOINTS.length; bi++) {
                 if (ep === BAD_ENDPOINTS[bi]) { epIsBad = true; break; }
             }
         }
-        /* Also reset if the endpoint belongs to a DIFFERENT provider */
         if (!epIsBad && defaults.endpoint) {
             var allProviderEndpoints = Object.values(PROVIDER_DEFAULTS).map(function(d) { return d.endpoint; });
             var epMatchesOtherProvider = false;
@@ -273,7 +391,24 @@ export function loadSettings() {
         }
     }
 
+    /* ═══════════════════════════════════════════════════
+       MAIN MODEL VALIDATION
+       
+       If the saved main model is a known-dead model,
+       clear it so the user selects a fresh one.
+       We do NOT replace it with another hardcoded model
+       (that might also be dead).
+       ═══════════════════════════════════════════════════ */
     if (state.settings.model) {
+        /* Check if model is in dead list */
+        if (DEAD_MODELS.hasOwnProperty(state.settings.model)) {
+            console.warn('[Storage] Main model "' + state.settings.model + '" is dead. Clearing.');
+            state.settings.model = '';
+            repaired = true;
+            toast('Previous model no longer available — please select a new one', 'info');
+        }
+
+        /* Basic format validation */
         var modelIsOk = false;
         if (state.settings.model.indexOf(':free') > -1) modelIsOk = true;
         if (state.settings.model.indexOf('/') > -1) modelIsOk = true;
@@ -281,13 +416,8 @@ export function loadSettings() {
         if (state.settings.model.indexOf('llama') > -1) modelIsOk = true;
         if (state.settings.model.indexOf('gpt') > -1) modelIsOk = true;
         if (state.settings.model.indexOf('gemini') > -1) modelIsOk = true;
+        if (state.settings.model.indexOf('models/') > -1) modelIsOk = true; /* Google AI Studio */
         if (!modelIsOk) { state.settings.model = ''; repaired = true; }
-    }
-
-    if (state.settings.model && DEAD_MODELS[state.settings.model]) {
-        state.settings.model = DEAD_MODELS[state.settings.model];
-        repaired = true;
-        toast('Main model was replaced (removed from OpenRouter)', 'info');
     }
 
     if (repaired) saveSettings();
@@ -328,7 +458,6 @@ export function saveFromSettingsUI() {
     state.settings.model = document.getElementById('s-model').value.trim();
     state.settings.temperature = parseFloat(document.getElementById('q-temp').value);
     state.settings.maxTokens = parseInt(document.getElementById('q-tokens').value) || 8192;
-    /* ── FIX: Null check for dynamically-injected context budget element ── */
     var ctxBudgetEl = document.getElementById('q-context-budget');
     state.settings.contextBudget = ctxBudgetEl ? (parseInt(ctxBudgetEl.value) || 25000) : (state.settings.contextBudget || 25000);
     voiceState.lang = document.getElementById('q-voice-lang').value;

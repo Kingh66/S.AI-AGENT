@@ -4,6 +4,7 @@
    Self-contained payload + chat rendering
    + smart file context (truncated per agent)
    + auto-retry on 402 with token reduction
+   + DYNAMIC MODEL DISCOVERY (no hardcoded models)
    ═══════════════════════════════════════ */
 import { state } from './state.js';
 import { toast, setConnectionStatus, autoResize, getTimeStr, highlightCodeBlocks } from './ui.js';
@@ -11,11 +12,180 @@ import { removeWelcome, addUserMessage } from './messages.js';
 import { parseMarkdown } from './markdown.js';
 import { getFileContext, isConnected } from './filesystem.js';
 
+/* ═══════════════════════════════════════════════════
+   DYNAMIC MODEL DISCOVERY
+   Fetches available free models from OpenRouter at
+   runtime instead of using hardcoded model IDs that
+   may 404 when models are removed/renamed.
+   ═══════════════════════════════════════════════════ */
+var _verifiedFreeModels = null;
+var _modelFetchPromise = null;
+
+/* Hardcoded fallbacks — ONLY used if dynamic fetch fails completely */
+var HARDCODED_FALLBACK_MODELS = [
+    'minimax/minimax-m2.5:free',
+    'stepfun/step-3.5-flash:free',
+    'google/gemma-3-27b-it:free',
+    'meta-llama/llama-4-scout:free',
+    'deepseek/deepseek-chat-v3-0324:free',
+    'qwen/qwen3-235b-a22b:free',
+    'qwen/qwen3-coder:free'
+];
+
+/* Preference patterns per agent role — tried in order against available models */
+var AGENT_MODEL_PREFERENCES = {
+    planner: ['mimo', 'minimax', 'qwen3', 'deepseek', 'nemotron', 'llama-4', 'gemma', 'step', 'glm'],
+    coder:   ['minimax', 'qwen3', 'deepseek', 'mimo', 'llama-4', 'gemma', 'nemotron', 'step', 'glm'],
+    critic:  ['nemotron', 'minimax', 'mimo', 'qwen3', 'gemma', 'deepseek', 'llama-4', 'step', 'glm'],
+    tester:  ['gemma', 'qwen3', 'mimo', 'minimax', 'deepseek', 'llama-4', 'nemotron', 'step', 'glm']
+};
+
+async function fetchAvailableFreeModels() {
+    /* Return cached if available */
+    if (_verifiedFreeModels && _verifiedFreeModels.length > 0) {
+        return _verifiedFreeModels;
+    }
+
+    /* Check state from connection.js fetch */
+    if (state.verifiedFreeModelIds && state.verifiedFreeModelIds.length > 0) {
+        _verifiedFreeModels = state.verifiedFreeModelIds.slice();
+        return _verifiedFreeModels;
+    }
+
+    /* Check localStorage cache */
+    try {
+        var cached = localStorage.getItem('sai_verified_free_models');
+        if (cached) {
+            var parsed = JSON.parse(cached);
+            if (parsed && parsed.length > 0) {
+                _verifiedFreeModels = parsed;
+                state.verifiedFreeModelIds = parsed;
+                return _verifiedFreeModels;
+            }
+        }
+    } catch (e) {}
+
+    /* Prevent duplicate fetches */
+    if (_modelFetchPromise) return _modelFetchPromise;
+
+    _modelFetchPromise = (async function () {
+        try {
+            console.log('[MultiAgent] Fetching available free models from OpenRouter...');
+            toast('Discovering available free models...', 'info');
+
+            var h = { 'Content-Type': 'application/json' };
+            if (state.settings.apiKey) h['Authorization'] = 'Bearer ' + state.settings.apiKey;
+
+            var r = await fetch('https://openrouter.ai/api/v1/models', { headers: h });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            var d = await r.json();
+            var allModels = d.data || [];
+
+            /* Store context limits */
+            for (var x = 0; x < allModels.length; x++) {
+                if (allModels[x].context_length) {
+                    state.modelContextLimits[allModels[x].id] = Math.floor(allModels[x].context_length * 3.5);
+                }
+            }
+
+            /* Filter truly free models (both prompt and completion pricing are zero) */
+            var trulyFree = allModels.filter(function (m) {
+                if (!m || !m.pricing) return false;
+                var p = m.pricing;
+                return (p.prompt === '0' || parseFloat(p.prompt) === 0) &&
+                       (p.completion === '0' || parseFloat(p.completion) === 0);
+            });
+
+            /* Sort by context length descending — prefer models with larger context */
+            trulyFree.sort(function (a, b) {
+                return (b.context_length || 0) - (a.context_length || 0);
+            });
+
+            _verifiedFreeModels = trulyFree.map(function (m) { return m.id; });
+            state.verifiedFreeModelIds = _verifiedFreeModels;
+
+            try {
+                localStorage.setItem('sai_verified_free_models', JSON.stringify(_verifiedFreeModels));
+            } catch (e) {}
+
+            console.log('[MultiAgent] Discovered ' + _verifiedFreeModels.length + ' free models');
+            if (_verifiedFreeModels.length > 0) {
+                toast(_verifiedFreeModels.length + ' free models available', 'success');
+            } else {
+                toast('No free models found — using fallbacks', 'warning');
+                _verifiedFreeModels = HARDCODED_FALLBACK_MODELS.slice();
+            }
+            return _verifiedFreeModels;
+
+        } catch (e) {
+            console.error('[MultiAgent] Failed to fetch free models:', e);
+            toast('Could not fetch models — using fallbacks', 'warning');
+            _verifiedFreeModels = HARDCODED_FALLBACK_MODELS.slice();
+            return _verifiedFreeModels;
+        } finally {
+            _modelFetchPromise = null;
+        }
+    })();
+
+    return _modelFetchPromise;
+}
+
+/**
+ * Pick the best available model for an agent role.
+ * Uses preference patterns to match against verified models.
+ * Skips models that have already been tried and failed.
+ */
+function pickModelForRole(agentName, availableModels) {
+    if (!availableModels || availableModels.length === 0) return null;
+
+    var preferences = AGENT_MODEL_PREFERENCES[agentName];
+    if (!preferences) preferences = AGENT_MODEL_PREFERENCES.planner;
+
+    /* Try each preference pattern in order */
+    for (var p = 0; p < preferences.length; p++) {
+        var pattern = preferences[p];
+        for (var m = 0; m < availableModels.length; m++) {
+            if (availableModels[m].toLowerCase().indexOf(pattern.toLowerCase()) > -1) {
+                /* Skip models we've already tried and failed */
+                if (multiAgentState.triedModels && multiAgentState.triedModels.has(availableModels[m])) continue;
+                return availableModels[m];
+            }
+        }
+    }
+
+    /* No preferred model found — use first untried available model */
+    for (var i = 0; i < availableModels.length; i++) {
+        if (multiAgentState.triedModels && multiAgentState.triedModels.has(availableModels[i])) continue;
+        return availableModels[i];
+    }
+
+    /* All models tried — reset triedModels and return first available */
+    if (multiAgentState.triedModels) multiAgentState.triedModels.clear();
+    return availableModels[0];
+}
+
+/**
+ * Get the next untried model for fallback after a failure.
+ * Marks the current model as tried.
+ */
+function getNextAvailableModel(currentModel, agentName) {
+    /* Mark current model as tried */
+    if (!multiAgentState.triedModels) multiAgentState.triedModels = new Set();
+    if (currentModel) multiAgentState.triedModels.add(currentModel);
+
+    if (!_verifiedFreeModels || _verifiedFreeModels.length === 0) return null;
+
+    return pickModelForRole(agentName, _verifiedFreeModels);
+}
+
+
 /* ── Agent definitions ── */
 export var AGENTS = {
     planner: {
         name: 'Planner',
         description: 'Task decomposition and architecture design',
+        /* defaultModel/fallbackModels are LEGACY — only used as absolute last resort.
+           Dynamic model discovery overrides these at runtime. */
         defaultModel: 'xiaomi/mimo-v2-pro:free',
         fallbackModels: ['minimax/minimax-m2.7:free', 'stepfun/step-3.5-flash:free'],
         maxTokens: 16384,
@@ -174,7 +344,8 @@ export var multiAgentState = {
     maxCriticRejections: 2,
     conversationHistory: [],
     taskQueue: [],
-    activeLoop: null
+    activeLoop: null,
+    triedModels: new Set()  /* Track models that returned 404/402 so we don't retry them */
 };
 
 /* ═══════════════════════════════════════
@@ -216,21 +387,11 @@ function buildAgentHeaders() {
 
 /* ═══════════════════════════════════════
    SMART FILE CONTEXT — Per-agent truncation
-   Regular chat sends ALL files (223KB).
-   Multi-agent CANNOT afford that — 4 sequential
-   calls would blow any credit budget.
-   
-   Planner: file tree only (~1KB)
-   Coder:   file tree + most relevant files (~15KB cap)
-   Critic:  only the code the coder produced (via taskContext, not raw files)
-   Tester:  only the code the coder produced (via taskContext, not raw files)
    ═══════════════════════════════════════ */
 function getSmartFileContext(agentName) {
     var fullCtx = getFileContext();
     if (!fullCtx) return '';
 
-    /* ── Planner: just the file tree, no file contents ──
-       The tree ends at the first "--- FILE:" line */
     if (agentName === 'planner') {
         var lines = fullCtx.split('\n');
         var treeLines = [];
@@ -243,21 +404,14 @@ function getSmartFileContext(agentName) {
         return tree + '\n\nNote: Full file contents will be provided to the Coder agent. Plan based on the file tree and task description.';
     }
 
-    /* ── Coder: file tree + truncated file contents ──
-       Cap at 30KB to give the coder enough context to write accurate code.
-       IMPORTANT: Always cut at a file boundary — never mid-file.
-       If truncation would cut a file in half, drop that entire file instead. */
     if (agentName === 'coder') {
         var MAX_CODER_CTX = 30000;
         if (fullCtx.length <= MAX_CODER_CTX) return fullCtx;
 
-        /* Strategy: build context file-by-file, stopping when budget runs out.
-           Never include a partial file — if a file doesn't fit, skip it entirely. */
         var fileSections = fullCtx.split(/(?=--- FILE: )/);
         var treeSection = '';
         var fileContents = [];
 
-        /* First element is the tree (before any "--- FILE:" markers) */
         if (fileSections.length > 0 && fileSections[0].indexOf('--- FILE:') === -1) {
             treeSection = fileSections[0];
             fileSections = fileSections.slice(1);
@@ -273,7 +427,6 @@ function getSmartFileContext(agentName) {
                 includedFiles.push(section);
                 budgetRemaining -= section.length;
             } else {
-                /* Extract filename for the omission notice */
                 var nameMatch = section.match(/--- FILE: (.+?) ---/);
                 omittedFiles.push(nameMatch ? nameMatch[1] : 'file ' + (fi + 1));
             }
@@ -287,10 +440,6 @@ function getSmartFileContext(agentName) {
         return result;
     }
 
-    /* ── Critic and Tester: NO raw file context ──
-       They receive the coder's output via taskContext,
-       which is much smaller and only contains the files
-       that were actually created/modified. */
     return '';
 }
 
@@ -380,7 +529,27 @@ MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt
         return false;
     }
 
+    /* ═══════════════════════════════════════════════════
+       DYNAMIC MODEL DISCOVERY
+       Fetch available free models from OpenRouter BEFORE
+       starting any agents. This prevents 404 errors from
+       hardcoded model IDs that no longer exist on the API.
+       ═══════════════════════════════════════════════════ */
+    if (state.settings.provider === 'openrouter') {
+        try {
+            await fetchAvailableFreeModels();
+            if (_verifiedFreeModels && _verifiedFreeModels.length > 0) {
+                console.log('[MultiAgent] Using ' + _verifiedFreeModels.length + ' dynamically discovered models');
+            } else {
+                console.warn('[MultiAgent] No free models found — will try hardcoded fallbacks');
+            }
+        } catch (e) {
+            console.warn('[MultiAgent] Model discovery failed:', e.message);
+        }
+    }
+
     multiAgentState.isActive = true;
+    multiAgentState.triedModels = new Set(); /* Reset tried models for new task */
     multiAgentState.currentTask = {
         id: Date.now(),
         userPrompt: userPrompt,
@@ -425,6 +594,77 @@ MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt
     }
 };
 
+/* ═══════════════════════════════════════════════════
+   MODEL SELECTION — Dynamic, not hardcoded
+   
+   Priority:
+   1. User-configured model for this agent (settings.agentModels)
+   2. For non-OpenRouter: user's main configured model
+   3. For OpenRouter: dynamically discovered free model (pickModelForRole)
+   4. Last resort: agent's hardcoded defaultModel
+   ═══════════════════════════════════════════════════ */
+MultiAgentOrchestrator.prototype.selectModelForAgent = function(agent, agentName) {
+    /* 1. Check if user configured a specific model for this agent */
+    if (state.settings.agentModels) {
+        var configured = state.settings.agentModels[agentName];
+        if (configured) return ensureFreeModel(configured);
+    }
+
+    /* 2. For non-OpenRouter providers, use the user's main configured model */
+    if (state.settings.provider !== 'openrouter') {
+        return state.settings.model;
+    }
+
+    /* 3. For OpenRouter, use dynamically discovered models */
+    if (_verifiedFreeModels && _verifiedFreeModels.length > 0) {
+        var dynamicModel = pickModelForRole(agentName, _verifiedFreeModels);
+        if (dynamicModel) {
+            console.log('[MultiAgent] Selected dynamic model for ' + agentName + ': ' + dynamicModel);
+            return dynamicModel;
+        }
+    }
+
+    /* 4. Last resort: use agent's hardcoded default */
+    console.warn('[MultiAgent] No dynamic models available, falling back to hardcoded default: ' + agent.defaultModel);
+    return ensureFreeModel(agent.defaultModel);
+};
+
+/* ═══════════════════════════════════════════════════
+   CODER FALLBACK — Dynamic, not hardcoded
+   
+   Uses verified free models first, then hardcoded
+   fallbacks only if dynamic discovery failed.
+   ═══════════════════════════════════════════════════ */
+MultiAgentOrchestrator.prototype.getNextCoderFallback = function(agent, currentModel) {
+    /* 1. Check user-configured fallback */
+    var configuredFallback = (state.settings.agentModels || {}).coderFallback;
+    if (configuredFallback && configuredFallback !== currentModel) return ensureFreeModel(configuredFallback);
+
+    /* 2. For non-OpenRouter, no fallback available */
+    if (state.settings.provider !== 'openrouter') return null;
+
+    /* 3. Use dynamically discovered models */
+    var nextModel = getNextAvailableModel(currentModel, 'coder');
+    if (nextModel) {
+        console.log('[MultiAgent] Coder fallback: ' + nextModel);
+        return nextModel;
+    }
+
+    /* 4. Use agent's hardcoded fallbacks (absolute last resort) */
+    var fallbacks = agent.fallbackModels.filter(function(m) { return m !== currentModel && !multiAgentState.triedModels.has(m); });
+    return fallbacks.length > 0 ? ensureFreeModel(fallbacks[0]) : null;
+};
+
+/* ── Ensure model ID has `:free` suffix on OpenRouter ── */
+function ensureFreeModel(model) {
+    if (!model) return model;
+    if (state.settings.provider !== 'openrouter') return model;
+    if (model.indexOf(':free') > -1) return model;
+    if (model.indexOf('/') === -1) return model;
+    console.warn('[MultiAgent] Auto-appending :free to model "' + model + '" to prevent 402 errors');
+    return model + ':free';
+}
+
 MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customPrompt) {
     var agent = AGENTS[agentName];
     if (!agent) return { success: false, error: 'Unknown agent: ' + agentName };
@@ -444,7 +684,7 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
     var attempts = 0;
     var maxAttempts = agentName === 'coder'
         ? (state.settings.maxCoderAttempts || multiAgentState.maxCoderAttempts)
-        : 2;
+        : 3; /* Increased from 2 to give more room for model fallbacks */
 
     var workingId = showAgentWorking(agentName);
 
@@ -496,23 +736,54 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
                     return { success: false, error: 'Task aborted by user' };
                 }
 
-                /* 402 is now handled INSIDE executeAgentCall with auto-retry.
-                   If it still reaches here, it means all retries exhausted. */
+                /* 402 is handled inside executeAgentCall with auto-retry.
+                   If it still reaches here, all retries exhausted. */
                 if (lastError.indexOf('HTTP 402') > -1 || lastError.indexOf('credits') > -1) {
+                    /* Mark this model as tried and try a different one */
+                    if (model) multiAgentState.triedModels.add(model);
+                    var nextOn402 = getNextAvailableModel(model, agentName);
+                    if (nextOn402 && attempts < maxAttempts) {
+                        model = nextOn402;
+                        toast('Credits issue with ' + agentName + ', switching to ' + model, 'info');
+                        continue;
+                    }
                     return { success: false, error: lastError };
                 }
 
+                /* ═══════════════════════════════════════════════════
+                   404 / INVALID MODEL — Dynamic fallback
+                   
+                   Instead of cycling through hardcoded fallbackModels,
+                   we now pick from the dynamically verified free model
+                   list. This prevents the death spiral of trying
+                   multiple hardcoded models that all 404.
+                   ═══════════════════════════════════════════════════ */
                 if (lastError.indexOf('is not a valid model ID') > -1 || lastError.indexOf('HTTP 404') > -1) {
-                    toast('Model "' + model + '" invalid, trying fallback...', 'error');
+                    /* Mark this model as tried */
+                    if (model) multiAgentState.triedModels.add(model);
+                    console.warn('[MultiAgent] Model "' + model + '" unavailable (404), finding next available...');
+
+                    /* Try dynamic model discovery first */
+                    var nextOn404 = getNextAvailableModel(model, agentName);
+                    if (nextOn404) {
+                        model = nextOn404;
+                        toast(agentName + ' model unavailable, switching to ' + model, 'info');
+                        if (attempts < maxAttempts) continue;
+                    }
+
+                    /* Then try hardcoded fallbacks */
                     if (agentName === 'coder') {
                         model = this.getNextCoderFallback(agent, model);
                         if (model && attempts < maxAttempts) continue;
                     } else {
                         var fallbacks = agent.fallbackModels || [];
-                        if (fallbacks.length > 0) {
-                            model = ensureFreeModel(fallbacks[0]);
-                            if (attempts < maxAttempts) continue;
+                        for (var fb = 0; fb < fallbacks.length; fb++) {
+                            if (!multiAgentState.triedModels.has(fallbacks[fb])) {
+                                model = ensureFreeModel(fallbacks[fb]);
+                                break;
+                            }
                         }
+                        if (attempts < maxAttempts) continue;
                     }
                 }
 
@@ -543,45 +814,8 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
     return result;
 };
 
-/* ── Ensure model ID has `:free` suffix on OpenRouter ──
-   Prevents accidental use of paid models (HTTP 402). */
-function ensureFreeModel(model) {
-    if (!model) return model;
-    /* Only applies to OpenRouter provider */
-    if (state.settings.provider !== 'openrouter') return model;
-    /* Skip if already has `:free` suffix */
-    if (model.indexOf(':free') > -1) return model;
-    /* Skip local providers (ollama, lmstudio) and Google AI Studio */
-    if (model.indexOf('/') === -1) return model;
-    /* Auto-append `:free` to prevent 402 errors */
-    console.warn('[MultiAgent] Auto-appending :free to model "' + model + '" to prevent 402 errors');
-    return model + ':free';
-}
-
-MultiAgentOrchestrator.prototype.selectModelForAgent = function(agent, agentName) {
-    var model = null;
-    if (state.settings.agentModels) {
-        var configured = state.settings.agentModels[agentName];
-        if (configured) model = configured;
-    }
-    if (!model && agentName === 'coder' && agent.currentModel) model = agent.currentModel;
-    if (!model) model = agent.defaultModel;
-    return ensureFreeModel(model);
-};
-
-MultiAgentOrchestrator.prototype.getNextCoderFallback = function(agent, currentModel) {
-    var configuredFallback = (state.settings.agentModels || {}).coderFallback;
-    if (configuredFallback && configuredFallback !== currentModel) return ensureFreeModel(configuredFallback);
-    var fallbacks = agent.fallbackModels.filter(function(m) { return m !== currentModel; });
-    return fallbacks.length > 0 ? ensureFreeModel(fallbacks[0]) : null;
-};
-
 /* ═══════════════════════════════════════
    SELF-CONTAINED EXECUTE
-   - NO connection.js dependency
-   - Smart per-agent file context
-   - AUTO-RETRY on 402 with token reduction
-     (1800 → 900 → 450 → 200)
    ═══════════════════════════════════════ */
 MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, model, prompt) {
     var self = this;
@@ -601,10 +835,6 @@ MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, mo
         systemContent += '\n\n' + fileCtx;
     }
 
-    /* ── Agent token budget: use the HIGHER of user setting or agent requirement ──
-       IMPORTANT: Math.min() was capping agent output at the user's maxTokens (default 2048),
-       which is WAY too low for code generation. The agent knows what it needs — let it decide.
-       The user's setting is a CEILING for chat, not a FLOOR for agents. */
     var userMax = state.settings.maxTokens || 4096;
     var agentBudget = agent.maxTokens || 8192;
     var startTokens = Math.max(agentBudget, Math.min(userMax, 32768));
@@ -612,9 +842,7 @@ MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, mo
     var fileCount = fileCtx ? (fileCtx.match(/--- FILE:/g) || []).length : 0;
     console.log('[MultiAgent] ' + agentName + ' model=' + model + ' startTokens=' + startTokens + ' fileCtx=' + fileCtx.length + ' chars ' + fileCount + ' files');
 
-    /* ── 402 AUTO-RETRY LOOP ──
-       If we get a 402, halve the tokens and try again.
-       This adapts to whatever credit balance the user has. */
+    /* ── 402 AUTO-RETRY LOOP ── */
     var MAX_402_RETRIES = 4;
     var currentTokens = startTokens;
 
@@ -638,16 +866,14 @@ MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, mo
                 continue;
             }
 
-            /* All retries exhausted or different error — throw */
             throw error;
         }
     }
 
-    /* Should not reach here, but safety net */
     throw new Error(agentName + ' failed after ' + MAX_402_RETRIES + ' attempts');
 };
 
-/* ── Actual fetch call (extracted for 402 retry loop) ── */
+/* ── Actual fetch call ── */
 MultiAgentOrchestrator.prototype._doFetch = function(agentName, model, systemContent, prompt, maxTokens, timeoutMs) {
     var self = this;
 
@@ -872,6 +1098,7 @@ MultiAgentOrchestrator.prototype.completeTask = function(status, error) {
         multiAgentState.conversationHistory = [];
         multiAgentState.criticRejections = 0;
         multiAgentState.coderAttempts = 0;
+        multiAgentState.triedModels = new Set();
     }, 1000);
 };
 
@@ -902,8 +1129,6 @@ export function startMultiAgentMode() {
     if (!isConnected()) {
         toast('No workspace folder connected. Agents will work without file context.', 'info');
     }
-
-    /* NO hard block on max tokens anymore — the 402 auto-retry handles it */
 
     input.value = '';
     input.style.height = 'auto';
