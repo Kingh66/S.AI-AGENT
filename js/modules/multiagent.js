@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════
    MULTI-AGENT ORCHESTRATION
    + DYNAMIC MODEL DISCOVERY
-   + 429 rate-limit model switching
+   + 429 rate-limit model switching + GLOBAL DAILY LIMIT detection
    + 404 model pruning
    + LENIENT validation for free models
    + Inter-agent delay
@@ -36,26 +36,77 @@ var HARDCODED_FALLBACK_MODELS = [
 var _rateLimitedModels = {};
 var RATE_LIMIT_COOLDOWN_MS = 90000;
 
-function markRateLimited(modelId) {
+/* ═══════════════════════════════════════════════════
+   GLOBAL DAILY LIMIT TRACKING
+   
+   OpenRouter returns a 429 with "free-models-per-day"
+   when the account's daily free-model quota is exhausted.
+   This is a GLOBAL limit — no model switching will help.
+   We track the reset timestamp so we can inform the user
+   exactly when they can resume.
+   ═══════════════════════════════════════════════════ */
+var _globalDailyLimitReset = 0;
+
+function markRateLimited(modelId, cooldownMs) {
     if (!modelId) return;
-    _rateLimitedModels[modelId] = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-    console.log('[MultiAgent] Rate-limited: ' + modelId + ' (cooldown 90s)');
+    var expiry = (cooldownMs && cooldownMs > 0) ? (Date.now() + cooldownMs) : (Date.now() + RATE_LIMIT_COOLDOWN_MS);
+    _rateLimitedModels[modelId] = expiry;
+    console.log('[MultiAgent] Rate-limited: ' + modelId + ' (until ' + new Date(expiry).toLocaleTimeString() + ')');
+}
+
+function markGlobalDailyLimit(resetTimestamp) {
+    _globalDailyLimitReset = resetTimestamp || (Date.now() + 3600000);
+    // Mark ALL verified free models as rate-limited until the global reset
+    if (_verifiedFreeModels && _verifiedFreeModels.length > 0) {
+        for (var i = 0; i < _verifiedFreeModels.length; i++) {
+            _rateLimitedModels[_verifiedFreeModels[i]] = _globalDailyLimitReset;
+        }
+    }
+    var resetDate = new Date(_globalDailyLimitReset).toLocaleTimeString();
+    console.log('[MultiAgent] GLOBAL daily limit hit. All free models blocked until ' + resetDate);
+}
+
+function isGlobalDailyLimitActive() {
+    if (!_globalDailyLimitReset) return false;
+    if (Date.now() > _globalDailyLimitReset) { _globalDailyLimitReset = 0; return false; }
+    return true;
 }
 
 function isRateLimited(modelId) {
     if (!modelId) return false;
+    if (isGlobalDailyLimitActive()) return true; // All models blocked
     var expiry = _rateLimitedModels[modelId];
     if (!expiry) return false;
     if (Date.now() > expiry) { delete _rateLimitedModels[modelId]; return false; }
     return true;
 }
 
-function clearRateLimits() { _rateLimitedModels = {}; }
+function clearRateLimits() { _rateLimitedModels = {}; _globalDailyLimitReset = 0; }
 
 function countRateLimitedModels() {
     var count = 0, now = Date.now();
     for (var key in _rateLimitedModels) { if (_rateLimitedModels[key] > now) count++; }
     return count;
+}
+
+/* ═══════════════════════════════════════════════════
+   PARSE 429 RESET TIMESTAMP
+   
+   OpenRouter 429 errors include:
+   "X-RateLimit-Reset":"1779494400000"
+   
+   We extract this to know exactly when the limit resets.
+   ═══════════════════════════════════════════════════ */
+function parse429ResetTimestamp(errorText) {
+    if (!errorText) return null;
+    var match = errorText.match(/X-RateLimit-Reset["\s:]+(\d{10,13})/);
+    if (match) {
+        var ts = parseInt(match[1], 10);
+        // If timestamp is in seconds (10 digits), convert to milliseconds
+        if (ts < 1e12) ts *= 1000;
+        return ts;
+    }
+    return null;
 }
 
 /* ═══════════════════════════════════════════════════
@@ -182,22 +233,11 @@ export var AGENTS = {
         maxTokens: 16384,
         currentModel: null,
 
-        /* ═══════════════════════════════════════════════════════════════
-           CODER PROMPT — Emphasize preserving existing code
-
-           The #1 problem with free models: they invent new file
-           contents from scratch instead of modifying existing
-           files. This prompt explicitly tells the coder:
-           1. The FULL content of each file to modify is provided
-           2. It MUST output the entire file with changes applied
-           3. It MUST NOT invent new structure or drop existing code
-           ═══════════════════════════════════════════════════════════════ */
         prompt: 'You are S.ai\'s Coder agent. You modify EXISTING files in a real project.\n\nCRITICAL RULES:\n1. You will receive the FULL current content of each file you need to modify.\n2. You MUST output the COMPLETE file with ALL existing code preserved plus your changes.\n3. NEVER invent new HTML structure, never drop existing elements, never replace a file with a different one.\n4. If adding a feature (e.g. a dropdown), ADD it to the EXISTING structure — keep everything else exactly as-is.\n5. Every existing import, function, element, and style MUST appear in your output unchanged.\n6. If a file is large, output it in full anyway — do NOT use "..." or "// rest unchanged".\n\nOUTPUT FORMAT — follow EXACTLY:\nFor EACH file, output:\n\nfile:path/to/filename.ext\nCOMPLETE file content here — every line, no omissions\n\nAfter ALL files, output: <|INTEGRATION_CHECK|>\n\nREMEMBER: You are MODIFYING existing files, not creating new ones from scratch. Preserve ALL existing code.',
 
         validateOutput: function(text) {
             if (!text || text.length < 50) return { valid: false, error: 'Output too short' };
 
-            /* SMART "..." DETECTION — only flags lazy abbreviations */
             var lines = text.split('\n');
             var lazyLineCount = 0;
             for (var li = 0; li < lines.length; li++) {
@@ -215,10 +255,8 @@ export var AGENTS = {
                 return { valid: false, error: 'Lazy code detected — ' + lazyLineCount + ' lines contain abbreviated "..."' };
             }
 
-            /* FILE BLOCK DETECTION — Multiple strategies */
             var fileCount = 0;
 
-            /* Strategy 1: Standard file:path format */
             var standardBlocks = text.match(/file:([^\n]+)\n([\s\S]*?)(?=\nfile:|<\|INTEGRATION_CHECK\|>|$)/g);
             if (standardBlocks && standardBlocks.length > 0) {
                 fileCount = standardBlocks.length;
@@ -226,7 +264,6 @@ export var AGENTS = {
                 return { valid: true, fileCount: fileCount };
             }
 
-            /* Strategy 2: file: with space */
             var spaceBlocks = text.match(/file:\s*([^\n]+)\n([\s\S]*?)(?=\nfile:|<\|INTEGRATION_CHECK\|>|$)/g);
             if (spaceBlocks && spaceBlocks.length > 0) {
                 fileCount = spaceBlocks.length;
@@ -234,7 +271,6 @@ export var AGENTS = {
                 return { valid: true, fileCount: fileCount };
             }
 
-            /* Strategy 3: Markdown code blocks with filenames */
             var mdBlocks = text.match(/```[\w]*\s*[:/]?([^\n]*\.(js|ts|jsx|tsx|py|java|html|css|json|md|yaml|yml|sh|sql|go|rs|cpp|c|h|rb|php|dart|kt|svg))[^\n]*\n([\s\S]*?)```/g);
             if (mdBlocks && mdBlocks.length > 0) {
                 fileCount = mdBlocks.length;
@@ -242,7 +278,6 @@ export var AGENTS = {
                 return { valid: true, fileCount: fileCount };
             }
 
-            /* Strategy 4: Any markdown code blocks with substantial content */
             var codeBlocks = text.match(/```[\w]*\n([\s\S]*?)```/g);
             if (codeBlocks && codeBlocks.length > 0) {
                 var substantialBlocks = 0;
@@ -257,7 +292,6 @@ export var AGENTS = {
                 }
             }
 
-            /* Strategy 5: Substantial raw output */
             var textWithoutMarkup = text.replace(/<[^>]+>/g, '').replace(/```/g, '').trim();
             if (textWithoutMarkup.length > 2000) {
                 var codeIndicators = (textWithoutMarkup.match(/[{};]/g) || []).length;
@@ -326,7 +360,7 @@ export var multiAgentState = {
     taskQueue: [],
     activeLoop: null,
     triedModels: new Set(),
-    targetFileContents: ''   /* ← full contents of files the plan targets */
+    targetFileContents: ''
 };
 
 /* ═══════════════════════════════════════
@@ -400,13 +434,6 @@ function getSmartFileContext(agentName) {
         return tree + '\n\nNote: Full file contents will be provided to the Coder agent.';
     }
     if (agentName === 'coder') {
-        /* ═══════════════════════════════════════════════════════
-           CODER CONTEXT BUDGET: 80KB (up from 30KB)
-
-           The coder needs as much context as possible so it
-           can see existing file contents and preserve them.
-           Free models with 128K context can easily handle 80K.
-           ═══════════════════════════════════════════════════════ */
         var MAX_CODER_CTX = 80000;
         if (fullCtx.length <= MAX_CODER_CTX) return fullCtx;
         var fileSections = fullCtx.split(/(?=--- FILE: )/);
@@ -450,27 +477,13 @@ function showAgentWorking(agentName) {
 function removeWorking(uid) { if (!uid) return; var el = document.getElementById(uid); if (el) el.remove(); }
 
 /* ═══════════════════════════════════════════════════
-   FORMAT CODER OUTPUT — Convert file: blocks to
-   markdown code fences so parseMarkdown() renders
-   them with Apply buttons.
-
-   Coder outputs:        Markdown needs:
-   file:path.ext         ```file:path.ext
-   content here          content here
-   next line             next line
-                         ```
-
-   Without this conversion, parseMarkdown() never
-   sees code fences with "file:" prefix, so it
-   renders them as plain text with no Apply button.
+   FORMAT CODER OUTPUT
    ═══════════════════════════════════════════════════ */
 function formatCoderOutput(text) {
     if (!text || text.indexOf('file:') === -1) return text;
 
-    /* Remove integration check markers */
     var cleaned = text.replace(/<\|INTEGRATION_CHECK\|>/g, '').trimEnd();
 
-    /* Split on file: markers (must be at start of line) */
     var parts = cleaned.split(/(?=^file:)/m);
     var output = [];
 
@@ -478,23 +491,18 @@ function formatCoderOutput(text) {
         var part = parts[i];
         if (!part || !part.trim()) continue;
 
-        /* Check if this part starts with file: */
         var trimmed = part.trimStart();
         if (trimmed.startsWith('file:')) {
-            /* Find the first newline — everything before is the path, after is content */
             var firstNewline = trimmed.indexOf('\n');
             if (firstNewline === -1) {
-                /* Just a path with no content — skip */
                 continue;
             }
 
             var filePath = trimmed.substring(5, firstNewline).trim();
             var content = trimmed.substring(firstNewline + 1).trimEnd();
 
-            /* Build proper markdown code fence */
             output.push('```file:' + filePath + '\n' + content + '\n```');
         } else {
-            /* Non-file content (commentary, etc.) — keep as-is */
             output.push(part.trim());
         }
     }
@@ -504,10 +512,6 @@ function formatCoderOutput(text) {
 
 /* ═══════════════════════════════════════════════════
    RENDER AGENT MESSAGE
-
-   For coder output, we convert file: blocks to
-   ```file:path format so parseMarkdown() renders
-   Apply/Edit buttons that call applyFileChange().
    ═══════════════════════════════════════════════════ */
 function renderAgentMessage(agentName, content, status) {
     removeWelcome();
@@ -515,7 +519,6 @@ function renderAgentMessage(agentName, content, status) {
     var div = document.createElement('div');
     div.className = 'message bot';
 
-    /* Convert coder file: blocks to markdown code fences for Apply buttons */
     var displayContent = content;
     if (agentName === 'coder') {
         displayContent = formatCoderOutput(content);
@@ -573,6 +576,19 @@ function getInterAgentDelay() {
 MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt) {
     if (multiAgentState.isActive) { toast('Multi-agent task already running', 'error'); return false; }
 
+    /* ═══════════════════════════════════════════════════════
+       PRE-CHECK: If the global daily limit is active, abort
+       immediately with a helpful message instead of wasting
+       time on requests that will all fail.
+       ═══════════════════════════════════════════════════════ */
+    if (isGlobalDailyLimitActive() && state.settings.provider === 'openrouter') {
+        var resetDate = new Date(_globalDailyLimitReset).toLocaleTimeString();
+        var limitMsg = 'Daily free model limit reached on OpenRouter. Add $10 credits to unlock 1000 requests/day, or wait until ' + resetDate + '.';
+        toast(limitMsg, 'error', 10000);
+        renderAgentMessage('system', '**Daily Limit Reached**\n\n' + limitMsg, 'error');
+        return false;
+    }
+
     if (isTrivialMessage(userPrompt)) {
         renderAgentMessage('system', 'Hello! 👋 How can I help you today? Give me a coding task and the multi-agent team will get to work.', 'success');
         return true;
@@ -621,11 +637,6 @@ MultiAgentOrchestrator.prototype.startMultiAgentTask = async function(userPrompt
             if (!result) throw new Error('Agent ' + agentName + ' returned no result');
             if (!result.success) throw new Error('Agent ' + agentName + ' failed: ' + (result.error || 'no details'));
 
-            /* ═══════════════════════════════════════════════════════
-               AFTER PLANNER SUCCEEDS: Read the full content of
-               every file the plan targets, so the Coder gets the
-               actual source instead of inventing it from scratch.
-               ═══════════════════════════════════════════════════════ */
             if (agentName === 'planner' && result.plan) {
                 multiAgentState.plan = result.plan;
                 if (result.plan.files && result.plan.files.length > 0 && isConnected()) {
@@ -735,8 +746,39 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
                 console.warn('Agent ' + agentName + ' attempt ' + attempts + ' error:', lastError);
                 if (error.name === 'AbortError') return { success: false, error: 'Task aborted by user' };
 
+                /* ═══════════════════════════════════════════════════════
+                   429 RATE LIMIT HANDLING
+                   
+                   Two types of 429 from OpenRouter:
+                   1. Per-model rate limit → switch to another model
+                   2. Global "free-models-per-day" limit → ALL models
+                      are blocked until the reset time. No switching helps.
+                      We extract X-RateLimit-Reset to tell the user when
+                      they can resume, and abort immediately.
+                   ═══════════════════════════════════════════════════════ */
                 if (lastError.indexOf('HTTP 429') > -1) {
-                    markRateLimited(model);
+                    // Parse the exact reset timestamp from the error
+                    var resetTimestamp = parse429ResetTimestamp(lastError);
+
+                    // Detect global daily limit (account-wide, not per-model)
+                    var isGlobalDailyLimit = lastError.indexOf('free-models-per-day') > -1;
+
+                    if (isGlobalDailyLimit) {
+                        // Mark ALL free models as rate-limited until the reset time
+                        markGlobalDailyLimit(resetTimestamp);
+
+                        var resetDate = resetTimestamp ? new Date(resetTimestamp).toLocaleTimeString() : 'later today';
+                        var dailyLimitMsg = 'Daily free model limit reached on OpenRouter. Add $10 credits to unlock 1000 requests/day, or wait until ' + resetDate + '.';
+
+                        toast(dailyLimitMsg, 'error', 10000);
+                        result = { success: false, error: dailyLimitMsg };
+                        break; // Stop retrying — no model will work
+                    }
+
+                    // Per-model rate limit — try switching models
+                    var cooldownMs = resetTimestamp ? Math.max(resetTimestamp - Date.now(), 5000) : RATE_LIMIT_COOLDOWN_MS;
+                    markRateLimited(model, cooldownMs);
+
                     var backoffDelay = Math.min(2000 * attempts, 10000);
                     console.log('[MultiAgent] 429 backoff: ' + (backoffDelay / 1000) + 's');
                     await this.delay(backoffDelay);
@@ -747,7 +789,7 @@ MultiAgentOrchestrator.prototype.runAgent = async function(agentName, customProm
                         var waitSecs = Math.ceil(shortestWait / 1000);
                         toast('All models rate-limited. Waiting ' + waitSecs + 's...', 'info');
                         setConnectionStatus('connecting', 'Rate-limited — waiting ' + waitSecs + 's...');
-                        await this.delay(shortestWait);
+                        await this.delay(Math.min(shortestWait, 30000));
                         clearRateLimits();
                         model = this.selectModelForAgent(agent, agentName);
                         if (model) continue;
@@ -802,14 +844,6 @@ MultiAgentOrchestrator.prototype.executeAgentCall = async function(agentName, mo
     var fileCtx = getSmartFileContext(agentName);
     if (fileCtx) systemContent += '\n\n' + fileCtx;
 
-    /* ═══════════════════════════════════════════════════════
-       INJECT TARGET FILE CONTENTS INTO CODER SYSTEM PROMPT
-
-       This is the critical fix: the coder gets the FULL
-       content of every file the plan identified, so it
-       knows what already exists and can modify it rather
-       than inventing new contents from scratch.
-       ═══════════════════════════════════════════════════════ */
     if (agentName === 'coder' && multiAgentState.targetFileContents) {
         systemContent += '\n\n--- EXISTING FILES YOU MUST MODIFY (FULL CONTENT) ---\n';
         systemContent += 'IMPORTANT: These are the CURRENT contents of files you need to modify.\n';
@@ -859,7 +893,7 @@ MultiAgentOrchestrator.prototype._doFetch = function(agentName, model, systemCon
 
         fetch(url, { method: 'POST', headers: headers, body: JSON.stringify(payload), signal: controller.signal }).then(function(response) {
             clearTimeout(fetchTimeout); clearTimeout(timeoutId);
-            if (!response.ok) { return response.text().then(function(errText) { throw new Error('HTTP ' + response.status + ': ' + errText.substring(0, 300)); }); }
+            if (!response.ok) { return response.text().then(function(errText) { throw new Error('HTTP ' + response.status + ': ' + errText.substring(0, 500)); }); }
             var reader = response.body.getReader(), decoder = new TextDecoder(), fullContent = '';
             function readChunk() {
                 return reader.read().then(function(result) {
@@ -899,21 +933,12 @@ MultiAgentOrchestrator.prototype.parseAgentResult = function(agentName, content)
     }
 };
 
-/* ═══════════════════════════════════════════════════════════════
-   BUILD AGENT PROMPT — now includes target file contents
-   for the coder so it knows what it's modifying.
-   ═══════════════════════════════════════════════════════════════ */
 MultiAgentOrchestrator.prototype.buildAgentPrompt = function(agentName, plan, criticFeedback) {
     switch (agentName) {
         case 'planner': return 'Create an implementation plan for this task:\n\n' + (multiAgentState.currentTask ? multiAgentState.currentTask.userPrompt : 'No task');
         case 'coder':
             var prompt = 'Implement the code according to this plan:\n\n';
             if (plan) { prompt += '## PLAN\nObjective: ' + plan.objective + '\n\nSteps:\n'; for (var i = 0; i < plan.steps.length; i++) prompt += (i + 1) + '. ' + plan.steps[i] + '\n'; prompt += '\n'; if (plan.files.length) prompt += 'Files to create/modify:\n' + plan.files.join('\n') + '\n\n'; }
-            /* ═══════════════════════════════════════════════════════
-               INJECT FULL TARGET FILE CONTENTS INTO CODER PROMPT
-               This ensures the coder sees what it's modifying
-               even if the system prompt context was truncated.
-               ═══════════════════════════════════════════════════════ */
             if (multiAgentState.targetFileContents) {
                 prompt += '## EXISTING FILES TO MODIFY (FULL CURRENT CONTENT)\n';
                 prompt += 'Below is the FULL current content of each file you must modify.\n';
