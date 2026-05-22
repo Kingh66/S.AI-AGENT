@@ -1,12 +1,16 @@
 /* ═══════════════════════════════════════
    VOICE — Speech Recognition & TTS
    Natural conversation flow, high-quality
-   voice selection, smart text cleanup
+   voice selection, smart text cleanup,
+   + Tab focus greeting (closest to 
+     "welcome back" possible in browser)
    ═══════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { toast } from './ui.js';
 
 let femaleVoice = null;
+let lastVisibleTimestamp = Date.now();
+let hasGreetedThisSession = false;
 
 export function initVoice() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -25,38 +29,101 @@ export function initVoice() {
         voiceState.recognition.onend = handleVoiceEnd;
     }
 
-    /* Pre-load voices — they load asynchronously */
     if ('speechSynthesis' in window) {
         loadVoices();
         window.speechSynthesis.onvoiceschanged = loadVoices;
     }
+
+    /* ═══════════════════════════════════════════════════
+       TAB FOCUS GREETING
+       
+       When the user switches back to the S.ai tab
+       after being away for > 2 minutes, S.ai greets
+       them with a time-appropriate welcome.
+       
+       This is the browser-equivalent of "welcome back
+       from lock screen" — it triggers when the user
+       clicks back on the Chrome tab.
+       ═══════════════════════════════════════════════════ */
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleWindowFocus);
+}
+
+function handleVisibilityChange() {
+    if (document.visibilityState === 'visible') {
+        const awayDuration = Date.now() - lastVisibleTimestamp;
+        const awayMinutes = Math.floor(awayDuration / 60000);
+        
+        /* Only greet if away for more than 2 minutes and voice chat is active */
+        if (awayMinutes >= 2 && voiceState.isVoiceChat && !state.isStreaming && !voiceState.isSpeaking) {
+            const greeting = getTimeAppropriateGreeting(awayMinutes);
+            speakText(greeting, () => {
+                /* After greeting, auto-start listening for a response */
+                if (voiceState.isVoiceChat) {
+                    setTimeout(() => startListening(), 500);
+                }
+            });
+        }
+        
+        /* If voice chat is active and we come back, resume listening */
+        if (voiceState.isVoiceChat && voiceState.mode === 'idle' && !state.isStreaming) {
+            setTimeout(() => startListening(), 300);
+        }
+    } else {
+        lastVisibleTimestamp = Date.now();
+        /* Tab lost focus — pause listening to save resources */
+        if (voiceState.mode === 'listening' && voiceState.isVoiceChat) {
+            stopListening();
+            voiceState.mode = 'idle'; // Keep idle so we can resume later
+        }
+    }
+}
+
+function handleWindowFocus() {
+    /* Similar to visibility change but catches alt-tab back */
+    if (!hasGreetedThisSession && voiceState.isVoiceChat) {
+        hasGreetedThisSession = true;
+        // First focus greeting is handled by visibility change
+    }
 }
 
 /* ═══════════════════════════════════════════════════
-   VOICE SELECTION — Prioritize natural-sounding voices
+   TIME-APPROPRIATE GREETINGS
    
-   Priority order:
-   1. Google network voices (most natural in Chrome)
-   2. Microsoft Enhanced/Neural voices (very natural)
-   3. Female-identified voices matching the language
-   4. Any voice matching the language
-   5. English female voice as fallback
-   6. First available voice as last resort
+   Generates a natural, time-aware greeting based
+   on how long the user was away and current time.
    ═══════════════════════════════════════════════════ */
+function getTimeAppropriateGreeting(awayMinutes) {
+    const hour = new Date().getHours();
+    let timeGreeting;
+    
+    if (hour >= 5 && hour < 12) timeGreeting = 'Good morning';
+    else if (hour >= 12 && hour < 17) timeGreeting = 'Good afternoon';
+    else if (hour >= 17 && hour < 21) timeGreeting = 'Good evening';
+    else timeGreeting = 'Hello';
+    
+    if (awayMinutes >= 60) {
+        const hours = Math.floor(awayMinutes / 60);
+        return timeGreeting + ' sir. Nice to have you back. It\'s been about ' + hours + (hours === 1 ? ' hour' : ' hours') + '. What are we working on today?';
+    } else if (awayMinutes >= 10) {
+        return timeGreeting + ' sir. Welcome back. What would you like to work on?';
+    } else {
+        return timeGreeting + '. Ready when you are.';
+    }
+}
+
 function loadVoices() {
     const voices = window.speechSynthesis.getVoices();
     const lang = voiceState.lang.split('-')[0];
     
     const femaleKeywords = ['female', 'woman', 'samantha', 'karen', 'moira', 'tessa', 'fiona', 'veena', 'zira', 'hazel', 'susan', 'linda', 'heather', 'catherine', 'allison', 'paulina', 'alice', 'ana', 'maria', 'elena', 'sofia', 'nicky', 'filiz', 'amelie', 'charlotte'];
     
-    /* 1. Google network voices (most natural) */
     femaleVoice = voices.find(v =>
         v.lang.startsWith(lang) &&
         v.name.toLowerCase().includes('google')
     );
     if (femaleVoice) return;
     
-    /* 2. Microsoft Enhanced/Neural voices (very natural) */
     femaleVoice = voices.find(v =>
         v.lang.startsWith(lang) &&
         v.name.toLowerCase().includes('microsoft') &&
@@ -64,14 +131,12 @@ function loadVoices() {
     );
     if (femaleVoice) return;
     
-    /* 3. Female-identified voices matching language */
     femaleVoice = voices.find(v =>
         v.lang.startsWith(lang) &&
         femaleKeywords.some(kw => v.name.toLowerCase().includes(kw))
     );
     if (femaleVoice) return;
     
-    /* 4. Any non-male voice matching language */
     femaleVoice = voices.find(v =>
         v.lang.startsWith(lang) &&
         !v.name.toLowerCase().includes('male') &&
@@ -83,29 +148,19 @@ function loadVoices() {
     );
     if (femaleVoice) return;
     
-    /* 5. Any voice for the language */
     femaleVoice = voices.find(v => v.lang.startsWith(lang));
     if (femaleVoice) return;
     
-    /* 6. English female voice as fallback */
     femaleVoice = voices.find(v =>
         v.lang.startsWith('en') &&
         femaleKeywords.some(kw => v.name.toLowerCase().includes(kw))
     );
     
-    /* 7. Last resort */
     if (!femaleVoice && voices.length > 0) {
         femaleVoice = voices[0];
     }
 }
 
-/* ═══════════════════════════════════════════════════
-   VOICE RESULT HANDLING
-   
-   FIX: Increased auto-send timeout from 2s to 2.8s
-   to allow for natural speech pauses (thinking,
-   breathing) without prematurely cutting off the user.
-   ═══════════════════════════════════════════════════ */
 function handleVoiceResult(event) {
     if (voiceState.isVoiceChat) clearTimeout(voiceState.autoSendTimeout);
     let finalT = '', interimT = '';
@@ -122,7 +177,6 @@ function handleVoiceResult(event) {
     }
     import('./ui.js').then(({ autoResize }) => autoResize(input));
 
-    /* Auto-send after a natural pause (2.8s) in voice chat mode */
     if (voiceState.isVoiceChat && finalT.trim()) {
         voiceState.autoSendTimeout = setTimeout(() => {
             const text = input.value.trim();
@@ -145,7 +199,6 @@ function handleVoiceError(event) {
 }
 
 function handleVoiceEnd() {
-    /* Restart if we're still supposed to be listening AND not speaking */
     if (voiceState.mode === 'listening' && voiceState.recognition) {
         try { voiceState.recognition.start(); } catch(e) {}
     }
@@ -153,8 +206,6 @@ function handleVoiceEnd() {
 
 export function startListening() {
     if (!voiceState.isSupported || !voiceState.recognition) { toast('Voice recognition not supported', 'error'); return false; }
-    
-    /* Don't start if AI is currently speaking */
     if (voiceState.isSpeaking) return false;
     
     voiceState.accumulatedText = '';
@@ -210,20 +261,9 @@ export function stopVoiceChatCompletely() {
     toast('Voice chat stopped', 'info');
 }
 
-/* ═══════════════════════════════════════════════════
-   TEXT-TO-SPEECH — Natural voice output
-   
-   Improvements:
-   1. Better text cleanup for TTS (strips code, markdown,
-      emojis, URLs, and file paths that sound robotic)
-   2. Slightly higher pitch (1.12) for a warmer tone
-   3. Auto-resume listening after speaking in voice chat
-   4. Chrome 15-second bug workaround via chunking
-   ═══════════════════════════════════════════════════ */
 export function speakText(text, onDone) {
     if (!('speechSynthesis' in window)) { if (onDone) onDone(); return; }
 
-    /* CRITICAL: Kill recognition while speaking to prevent feedback loop */
     if (voiceState.recognition) {
         try { voiceState.recognition.abort(); } catch(e) {}
     }
@@ -237,7 +277,6 @@ export function speakText(text, onDone) {
         if (i >= chunks.length) {
             voiceState.isSpeaking = false;
             if (onDone) onDone();
-            /* Auto-resume listening after speaking in voice chat mode */
             if (voiceState.isVoiceChat && !state.isStreaming) {
                 setTimeout(() => {
                     if (voiceState.isVoiceChat && voiceState.mode === 'idle') {
@@ -261,27 +300,11 @@ export function speakText(text, onDone) {
     speakChunk(0);
 }
 
-/* ═══════════════════════════════════════════════════
-   CLEAN TEXT FOR TTS
-   
-   Strips everything that sounds robotic when read aloud:
-   - Code blocks and inline code
-   - Markdown formatting (headers, bold, italic, links)
-   - Emojis (replaced with descriptions or removed)
-   - URLs (replaced with "link")
-   - File paths (cleaned up)
-   - Excessive punctuation
-   ═══════════════════════════════════════════════════ */
 function cleanTextForTTS(text) {
     return text
-        /* Remove entire code blocks */
         .replace(/```[\s\S]*?```/g, '. Code omitted. ')
         .replace(/```[\s\S]*$/g, '. Code omitted. ')
-        
-        /* Remove inline code */
         .replace(/`([^`]+)`/g, '$1')
-        
-        /* Replace emojis with natural descriptions */
         .replace(/✅/g, 'done')
         .replace(/❌/g, 'failed')
         .replace(/⚠️/g, 'warning')
@@ -293,55 +316,29 @@ function cleanTextForTTS(text) {
         .replace(/📊/g, '')
         .replace(/🤖/g, '')
         .replace(/👤/g, '')
-        .replace(/[\u{1F300}-\u{1F9FF}]/gu, '') /* Remove most other emojis */
-        
-        /* Remove markdown headers */
+        .replace(/[\u{1F300}-\u{1F9FF}]/gu, '')
         .replace(/^#{1,6}\s/gm, '')
-        
-        /* Remove bold/italic markers */
         .replace(/\*\*\*([^*]+)\*\*\*/g, '$1')
         .replace(/\*\*([^*]+)\*\*/g, '$1')
         .replace(/\*([^*]+)\*/g, '$1')
         .replace(/__([^_]+)__/g, '$1')
         .replace(/_([^_]+)_/g, '$1')
-        
-        /* Remove links, keep text */
         .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-        
-        /* Remove raw URLs */
         .replace(/https?:\/\/[^\s)\]]+/g, 'link')
-        
-        /* Remove file paths (they sound terrible spoken aloud) */
         .replace(/(?:\/[\w.-]+){2,}/g, match => match.split('/').pop())
-        
-        /* Clean up list markers */
         .replace(/^[-*+]\s/gm, '')
         .replace(/^\d+\.\s/gm, '')
         .replace(/^>\s/gm, '')
-        
-        /* Remove horizontal rules */
         .replace(/^---+$/gm, '')
-        
-        /* Remove HTML tags */
         .replace(/<[^>]+>/g, '')
-        
-        /* Clean up excessive punctuation */
         .replace(/\.{4,}/g, '...')
         .replace(/\.\.\./g, ', pause, ')
         .replace(/—/g, ', ')
         .replace(/–/g, ', ')
-        
-        /* Convert line breaks to sentences */
         .replace(/\n{2,}/g, '. ')
         .replace(/\n/g, '. ')
-        
-        /* Clean up spacing */
         .replace(/\s{2,}/g, ' ')
-        
-        /* Remove empty parentheses */
         .replace(/\(\s*\)/g, '')
-        
-        /* Clean up trailing/leading dots and spaces */
         .replace(/\.\s*\./g, '.')
         .replace(/^\s*\.\s*/g, '')
         .trim();
@@ -410,7 +407,6 @@ export function setVoiceMode(mode) {
     updateMicButton();
     updateVoiceStatusBar();
 
-    /* When entering speaking mode, aggressively kill the mic to prevent feedback */
     if (mode === 'speaking' && voiceState.recognition) {
         try { voiceState.recognition.abort(); } catch(e) {}
     }
