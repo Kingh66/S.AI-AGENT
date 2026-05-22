@@ -1,5 +1,11 @@
 /* ═══════════════════════════════════════════════════
    CONNECTION — LLM API calls, streaming
+   
+   FIX: Stream loop breaks immediately on [DONE] or
+   finish_reason instead of waiting for HTTP close.
+   This eliminates the 2-5s cursor blink after the
+   last token and prevents "No response received"
+   errors when the connection drops after [DONE].
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { FILE_SYSTEM_INSTRUCTIONS, FREE_MODEL_FALLBACKS, MODE_MAX_TOKENS_FLOOR } from './config.js';
@@ -36,8 +42,6 @@ var CONTINUE_MSG_FILE = 'CONTINUE your previous response EXACTLY where you left 
 var CONTINUE_MSG_STALL = 'Your output was cut off. CONTINUE from the exact point where you stopped. If mid-code, continue the SAME code block. Do NOT restart or summarize. <|CONTINUE_TASK|> if more remain, end normally if last. No commentary.';
 
 var _lastRequestTime = 0;
-
-/* Track the ORIGINAL user message so auto-continue can maintain file context and intent */
 var _originalUserMessage = '';
 
 function getNextFallbackModel(currentModel) {
@@ -258,7 +262,6 @@ function isNewProjectRequest(text) {
     if (/\bfix\b/.test(t) && /\b(error|bugs?|issues?|broken)\b/.test(t)) return false;
     if (/\b(modify|update|change|refactor|improve)\b/.test(t) && /\b(this|the|existing|current)\b/.test(t)) return false;
     if (/\.js\b|\.py\b|\.html\b|\.css\b|\.ts\b/.test(t) && /\b(file|in|from)\b/.test(t)) return false;
-    /* Only match "simple" and "basic" at the START of the message to avoid false positives */
     if (/^(simple|basic)\s+/.test(t)) return true;
     var newWords = ['code a ','code simple ','create a ','build a ','make a ','write a ','design a ','develop a ','new project','new app','new website','new page','new system','landing page'];
     for (var i = 0; i < newWords.length; i++) { if (t.indexOf(newWords[i]) > -1) return true; }
@@ -318,22 +321,9 @@ function buildSafeMessages(userText, systemPrompt) {
     return [{ role: 'system', content: systemPrompt }].concat(historySlice);
 }
 
-/* ═══════════════════════════════════════════════════
-   responseSeemsIncomplete — Conservative detection
-   
-   Only flags STRONG evidence of truncation:
-   1. Unclosed code block
-   2. Ends with comma/colon in long responses
-   3. Ends with a connector/conjunction word
-   4. Incomplete conditional paragraph
-   5. Last word appears cut off mid-phrase
-   
-   Does NOT flag just because there's no period.
-   ═══════════════════════════════════════════════════ */
 function responseSeemsIncomplete(text) {
     if (!text || text.length < 200) return false;
 
-    /* Completion markers — definitely NOT incomplete */
     var completionMarkers = [
         'FILES READY TO APPLY', 'SUMMARY', 'REVIEW BEFORE APPLYING',
         'All files completed', 'Task Complete', 'Task Failed', 'END FILE',
@@ -346,7 +336,6 @@ function responseSeemsIncomplete(text) {
 
     var trimmed = text.trimEnd();
 
-    /* 1. Unclosed code block */
     var codeBlockCount = 0;
     var codeRe = /```/g;
     while (codeRe.exec(text) !== null) codeBlockCount++;
@@ -355,20 +344,16 @@ function responseSeemsIncomplete(text) {
         return true;
     }
 
-    /* 2. Ends with comma or colon in a long response */
     if (/[,:]\s*$/.test(trimmed) && trimmed.length > 1000) {
         console.log('[Connection] Incomplete: ends with comma/colon');
         return true;
     }
 
-    /* 3. Ends with a connector/conjunction word — anchored to END of full trimmed text */
     if (/\b(and|or|then|also|further|additionally|like|if|when|while|because|since|although|though|unless|until|whether|before|after|between|through|during|without|within|about|into|onto|upon|across|along|around|behind|below|beneath|beside|beyond|despite|except|inside|near|toward|towards|under|unlike|via|with)\s*$/i.test(trimmed)) {
         console.log('[Connection] Incomplete: ends with connector word');
         return true;
     }
 
-    /* 4. Last paragraph is an incomplete conditional — starts with
-       "If/When/For/The..." and doesn't end with sentence punctuation */
     if (trimmed.length > 500) {
         var lastNewline = trimmed.lastIndexOf('\n');
         var lastPara = lastNewline > -1 ? trimmed.substring(lastNewline + 1).trim() : trimmed.slice(-150);
@@ -381,12 +366,10 @@ function responseSeemsIncomplete(text) {
         }
     }
 
-    /* 5. Last word appears cut off mid-phrase — the word before it is a
-       determiner, preposition, or verb suggesting more was coming */
     if (trimmed.length > 1000) {
         var lastWord = trimmed.split(/\s+/).pop();
         if (lastWord && /^[a-z]+$/.test(lastWord) && lastWord.length >= 2) {
-            var validEndWords = ['yes','no','ok','done','thanks','please','here','there','now','today','always','never','sometimes','often','already','enough','too','more','less','much','many','some','all','none','both','either','neither','each','every','first','last','next','previous','true','false','null','undefined','zero','one','fine','right','left','up','down','out','off','over','under','again','away','back','else','home','soon','late','early','hard','easy','fast','slow','well','else','away','together','apart','instead','however','therefore','otherwise','meanwhile','furthermore','moreover','nevertheless','nonetheless','regardless','certainly','definitely','probably','possibly','usually','normally','generally','simply','clearly','obviously','naturally','basically','essentially','ultimately','finally','originally','initially','eventually','recently','previously','currently','immediately','directly','exactly','specifically','particularly','especially','generally','commonly','frequently','rarely','seldom','hardly','scarcely','merely','only','just','also','too','quite','very','rather','fairly','pretty','somewhat','slightly','extremely','incredibly','absolutely','completely','totally','entirely','perfectly','nearly','almost','about','around','approximately','roughly','exactly'];
+            var validEndWords = ['yes','no','ok','done','thanks','please','here','there','now','today','always','never','sometimes','often','already','enough','too','more','less','much','many','some','all','none','both','either','neither','each','every','first','last','next','previous','true','false','null','undefined','zero','one','fine','right','left','up','down','out','off','over','under','again','away','back','else','home','soon','late','early','hard','easy','fast','slow','well','together','apart','instead','however','therefore','otherwise','meanwhile','furthermore','moreover','nevertheless','nonetheless','regardless','certainly','definitely','probably','possibly','usually','normally','generally','simply','clearly','obviously','naturally','basically','essentially','ultimately','finally','originally','initially','eventually','recently','previously','currently','immediately','directly','exactly','specifically','particularly','especially','commonly','frequently','rarely','seldom','hardly','scarcely','merely','only','just','also','too','quite','very','rather','fairly','pretty','somewhat','slightly','extremely','incredibly','absolutely','completely','totally','entirely','perfectly','nearly','almost','about','around','approximately','roughly','exactly'];
             var isLastWordValid = validEndWords.indexOf(lastWord.toLowerCase()) > -1;
             if (!isLastWordValid) {
                 var words = trimmed.split(/\s+/);
@@ -515,17 +498,27 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             throw new Error('HTTP ' + status + ': ' + errText.substring(0, 300));
         }
 
-                /* ═════════════════════════
+        /* ═══════════════════════════════════════════════════
            STREAM READING
-           
+
            FIX: Break immediately on [DONE] or finish_reason.
-           The old code used `continue` for [DONE], which kept
-           the loop alive waiting for the HTTP connection to
-           close. This caused:
+           
+           The old code used `continue` for [DONE], which
+           kept the while(true) loop alive, calling
+           reader.read() repeatedly until the HTTP connection
+           closed. This caused:
+           
            1. 2-5 second delay after last token (cursor blink)
-           2. If the connection dropped, no content was received
-              → "No response received" error
-           ═════════════════════════ */
+           2. If connection dropped after [DONE], no content
+              was received → "No response received" error
+           
+           Now we:
+           1. Set streamDone = true when [DONE] or
+              finish_reason is received
+           2. Break the inner SSE/Ollama parsing loop
+           3. Check streamDone after each chunk and break
+              the outer while(true) loop immediately
+           ═══════════════════════════════════════════════════ */
         resetFallbackTracking();
         var reader = res.body.getReader();
         var decoder = new TextDecoder();
@@ -554,14 +547,25 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             } else {
                 var sseLines = chunk.split('\n');
                 for (var j = 0; j < sseLines.length; j++) {
+                    /* FIX: Use startsWith('data:') then strip prefix.
+                       Some providers send "data:" with no space,
+                       others send "data: " with a space. Both must work. */
                     if (!sseLines[j].startsWith('data:')) continue;
                     var data = sseLines[j].replace(/^data:\s*/, '').trim();
+                    
+                    /* FIX: [DONE] means the stream is finished.
+                       OLD BUG: `continue` skipped it but kept the
+                       outer loop alive, calling reader.read() until
+                       the HTTP connection closed (2-5s delay).
+                       NEW: Break immediately. */
                     if (data === '[DONE]') {
                         finishReason = finishReason || 'stop';
                         streamDone = true;
                         break;
                     }
+                    
                     if (!data) continue;
+                    
                     try {
                         var parsed = JSON.parse(data);
                         if (!parsed.choices || !parsed.choices[0]) continue;
@@ -571,7 +575,9 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                         var content = delta.content || null;
                         if (reasoning) { if (!isThinkingPhase) isThinkingPhase = true; thinkingContent += reasoning; showThinkingBlock(thinkingContent); }
                         if (content) appendStreamChunk(content);
-                        /* Break as soon as finish_reason is set — nothing more to read */
+                        
+                        /* FIX: Break as soon as finish_reason is set.
+                           After this, there's nothing more to read. */
                         if (finishReason && finishReason !== 'null') {
                             streamDone = true;
                             break;
@@ -580,10 +586,13 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                 }
             }
 
-            /* If we've received [DONE] or finish_reason, stop reading immediately */
+            /* FIX: If we've received [DONE] or finish_reason,
+               stop reading immediately. Don't wait for the
+               HTTP connection to close — that takes seconds. */
             if (streamDone) break;
         }
 
+        /* ── Stream finished — finalize the response ── */
         state.thinkingContent = thinkingContent;
         if (isThinkingPhase) closeThinkingBlock();
         finalizeStream();
@@ -608,9 +617,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             hitLimit = true;
         }
 
-        /* Auto-continue: only for finish_reason='length' or <|CONTINUE_TASK|>,
-           NOT for "seemsIncomplete" (that just shows the Continue button).
-           Cap at 3 loops to prevent 429 death spirals on free tier. */
         var shouldAutoContinue = (hitLimit && !seemsIncomplete) && state.activeTask.isRunning && state.activeTask.loopCount < 3;
 
         if (shouldAutoContinue) {
@@ -620,7 +626,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
 
             state.conversationHistory.push({ role: 'user', content: CONTINUE_MSG_FILE });
 
-            /* Trim conversation history to prevent unbounded growth */
             if (state.conversationHistory.length > 16) {
                 var sysMsg = state.conversationHistory[0];
                 var recent = state.conversationHistory.slice(-14);
