@@ -1,4 +1,4 @@
-```markdown
+
 # S.ai — Autonomous AI Coding Assistant
 
 A fully client-side, browser-based AI coding agent that plans, reads, writes, and iterates across your local codebase with zero manual intervention between steps. Built by **Sizwe Mthembu**.
@@ -518,4 +518,3 @@ MIT
 ---
 
 Built by **Sizwe Mthembu**
-```
