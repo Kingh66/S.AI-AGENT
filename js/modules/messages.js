@@ -3,7 +3,6 @@
    Advanced rendering with collapsible phases
    
    PERF: Fast path for simple responses.
-   FIX: Always clear streaming state in finalizeStream.
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { parseMarkdown } from './markdown.js';
@@ -210,12 +209,6 @@ function needsFullParse(text) {
 /* ═══════════════════════════════════════════════════
    FINALIZE — Render the complete message
    
-   FIX: Always clear isStreaming and update the send
-   button. The old code only did this when
-   !state.activeTask.isRunning, which meant custom/
-   selfimprove/multiagent modes kept the stop button
-   and streaming cursor visible until connection.js
-   got around to clearing it seconds later.
    ═══════════════════════════════════════════════════ */
 export function finalizeStream() {
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
@@ -282,18 +275,6 @@ export function finalizeStream() {
         fastScroll();
     }
 
-    /* ═══════════════════════════════════════════════════
-       FIX: Always clear streaming state immediately.
-       
-       OLD BUG: This was gated on !state.activeTask.isRunning.
-       For custom/selfimprove/multiagent modes, isRunning
-       was true, so the stop button and streaming cursor
-       persisted for seconds until connection.js cleared
-       them in its finally block.
-       
-       NEW: Always clear immediately. connection.js will
-       re-set isStreaming=true if it needs to auto-continue.
-       ═══════════════════════════════════════════════════ */
     state.isStreaming = false;
     updateSendButton();
 }

@@ -106,7 +106,7 @@ class NeuralWave {
         this.maxRadius = 400;
         this.alpha = 0.8;
         this.speed = CONFIG.waveSpeed;
-        this.alive = true; /* ── FIX: Track alive state separately ── */
+        this.alive = true; 
     }
 
     update() {
@@ -310,7 +310,6 @@ function animate() {
     drawBackground();
     drawBrainOutline();
 
-    /* ── FIX: Update and draw waves in separate passes, don't call update() twice ── */
     for (let i = neuralWaves.length - 1; i >= 0; i--) {
         neuralWaves[i].draw();
         if (!neuralWaves[i].update()) {

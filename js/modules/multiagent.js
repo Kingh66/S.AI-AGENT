@@ -481,11 +481,6 @@ function removeWorking(uid) { if (!uid) return; var el = document.getElementById
    markdown code fences so parseMarkdown() renders
    them with Apply buttons.
    
-   FIX: Adaptive fence length. If the file content
-   contains ``` (3 backticks), we use ```` (4) or
-   more for the outer fence so the inner backticks
-   don't prematurely close the code block.
-   
    The parseMarkdown() line-by-line parser tracks
    fence length and only closes on >= matching length.
    ═══════════════════════════════════════════════════ */
@@ -978,15 +973,6 @@ MultiAgentOrchestrator.prototype._doFetch = function(agentName, model, systemCon
                             if (!sseLines[j].startsWith('data:')) continue;
                             var data = sseLines[j].replace(/^data:\s*/, '').trim();
 
-                            /* ═══════════════════════════════════════════════════
-                               FIX: Break immediately on [DONE] or finish_reason
-                               
-                               OLD BUG: `if (data === '[DONE]') continue;`
-                               kept the outer while loop alive, calling
-                               reader.read() until HTTP closed (2-5s delay).
-                               If the connection dropped after [DONE], the
-                               promise never resolved → "No response" error.
-                               ═══════════════════════════════════════════════════ */
                             if (data === '[DONE]') {
                                 streamDone = true;
                                 break;  // ← FIX: break inner SSE loop
@@ -1005,13 +991,12 @@ MultiAgentOrchestrator.prototype._doFetch = function(agentName, model, systemCon
                                 if (parsed.choices[0].finish_reason 
                                     && parsed.choices[0].finish_reason !== 'null') {
                                     streamDone = true;
-                                    break;  // ← FIX: break on finish_reason
+                                    break; 
                                 }
                             } catch (e) {}
                         }
                     }
 
-                    /* FIX: If stream is done, stop reading immediately */
                     if (streamDone) {
                         finishStream();
                         return;

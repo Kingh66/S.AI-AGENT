@@ -76,13 +76,6 @@ var ENTRY_POINTS = new Set([
     'cli.js','cli.ts','script.js'
 ]);
 
-/* ═══════════════════════════════════════
-   FIX: INTENT DETECTION
-   When the user says "debug", "find bugs", "review",
-   "analyze", "read folder", they want ALL source files.
-   The old keyword scoring missed this because "debug"
-   doesn't contain "javascript" or "js" or "react".
-   ═══════════════════════════════════════ */
 var SOURCE_CODE_EXTS = new Set([
     'js','mjs','cjs','ts','tsx','jsx','py','java','css','html','htm',
     'json','sql','go','rs','rb','php','vue','svelte','dart','kt',
@@ -320,21 +313,6 @@ export async function getSmartFileContext(userMessage, maxChars) {
         return await buildRawContext(readableFiles, maxChars, projectName);
     }
 
-    /* ═══════════════════════════════════════════════════
-       FIX: DEBUG/REVIEW INTENT → INCLUDE ALL SOURCE FILES
-       
-       OLD BUG: "debug two bugs in this folder" didn't match
-       any EXT_TOPICS for .js files because the message
-       doesn't contain "javascript", "js", "react", etc.
-       Only CSS/HTML files got included because "folder"
-       and "find" happened to score them slightly higher.
-       
-       NEW: When intent is debug/review/analyze, ALL source
-       code files get a massive score boost (+50), ensuring
-       they're included before CSS/assets. We also expand
-       the budget to fit more files since the user clearly
-       wants comprehensive analysis.
-       ═══════════════════════════════════════════════════ */
     var isDebugIntent = isDebugOrReviewIntent(userMessage);
 
     /* Phase 1: Score by metadata */
@@ -348,7 +326,6 @@ export async function getSmartFileContext(userMessage, maxChars) {
 
         scores[filePath] = scoreFileMetadata(filePath, keywords, userMessage);
 
-        /* ── FIX: Massive boost for source code files when intent is debug/review ── */
         if (isDebugIntent && SOURCE_CODE_EXTS.has(fileExt)) {
             scores[filePath] += 50;
 
@@ -379,7 +356,6 @@ export async function getSmartFileContext(userMessage, maxChars) {
         return (scores[b.path] || 0) - (scores[a.path] || 0);
     });
 
-    /* ── FIX: Read more candidates for debug intent (top 40 instead of 20) ── */
     var candidateCount = isDebugIntent
         ? Math.min(sorted.length, 40)
         : Math.min(sorted.length, 20);
@@ -411,15 +387,6 @@ export async function getSmartFileContext(userMessage, maxChars) {
     }
     header += '---\n';
 
-    /* ═══════════════════════════════════════════════════
-       FIX: EXPAND BUDGET FOR DEBUG INTENT
-       
-       When the user says "debug bugs" or "read folder",
-       they want ALL the source files. The default 25K char
-       budget is way too small for a project with 20+ JS files.
-       We expand it to 80K for debug intent, which is still
-       within most free model limits.
-       ═══════════════════════════════════════════════════ */
     var effectiveMaxChars = maxChars;
     if (isDebugIntent) {
         effectiveMaxChars = Math.max(maxChars, 80000);
@@ -442,7 +409,6 @@ export async function getSmartFileContext(userMessage, maxChars) {
 
         var overhead = file.path.length + 50;
         if (used + fileContent.length + overhead > effectiveMaxChars) {
-            /* ── FIX: For debug intent, truncate large files instead of omitting them ── */
             if (isDebugIntent && fileContent.length > 5000) {
                 var truncatedContent = fileContent.substring(0, Math.min(fileContent.length, effectiveMaxChars - used - overhead - 200));
                 if (truncatedContent.length > 500) {

@@ -1,11 +1,6 @@
 /* ═══════════════════════════════════════════════════
    CONNECTION — LLM API calls, streaming
    
-   FIX: Stream loop breaks immediately on [DONE] or
-   finish_reason instead of waiting for HTTP close.
-   This eliminates the 2-5s cursor blink after the
-   last token and prevents "No response received"
-   errors when the connection drops after [DONE].
    ═══════════════════════════════════════════════════ */
 import { state, voiceState } from './state.js';
 import { FILE_SYSTEM_INSTRUCTIONS, FREE_MODEL_FALLBACKS, MODE_MAX_TOKENS_FLOOR } from './config.js';
@@ -500,24 +495,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
 
         /* ═══════════════════════════════════════════════════
            STREAM READING
-
-           FIX: Break immediately on [DONE] or finish_reason.
-           
-           The old code used `continue` for [DONE], which
-           kept the while(true) loop alive, calling
-           reader.read() repeatedly until the HTTP connection
-           closed. This caused:
-           
-           1. 2-5 second delay after last token (cursor blink)
-           2. If connection dropped after [DONE], no content
-              was received → "No response received" error
-           
-           Now we:
-           1. Set streamDone = true when [DONE] or
-              finish_reason is received
-           2. Break the inner SSE/Ollama parsing loop
-           3. Check streamDone after each chunk and break
-              the outer while(true) loop immediately
            ═══════════════════════════════════════════════════ */
         resetFallbackTracking();
         var reader = res.body.getReader();
@@ -547,17 +524,11 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
             } else {
                 var sseLines = chunk.split('\n');
                 for (var j = 0; j < sseLines.length; j++) {
-                    /* FIX: Use startsWith('data:') then strip prefix.
-                       Some providers send "data:" with no space,
-                       others send "data: " with a space. Both must work. */
+                   
                     if (!sseLines[j].startsWith('data:')) continue;
                     var data = sseLines[j].replace(/^data:\s*/, '').trim();
                     
-                    /* FIX: [DONE] means the stream is finished.
-                       OLD BUG: `continue` skipped it but kept the
-                       outer loop alive, calling reader.read() until
-                       the HTTP connection closed (2-5s delay).
-                       NEW: Break immediately. */
+                    
                     if (data === '[DONE]') {
                         finishReason = finishReason || 'stop';
                         streamDone = true;
@@ -575,9 +546,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                         var content = delta.content || null;
                         if (reasoning) { if (!isThinkingPhase) isThinkingPhase = true; thinkingContent += reasoning; showThinkingBlock(thinkingContent); }
                         if (content) appendStreamChunk(content);
-                        
-                        /* FIX: Break as soon as finish_reason is set.
-                           After this, there's nothing more to read. */
                         if (finishReason && finishReason !== 'null') {
                             streamDone = true;
                             break;
@@ -586,9 +554,6 @@ async function executeStream(messages, overrideMaxTokens, isAutoContinue) {
                 }
             }
 
-            /* FIX: If we've received [DONE] or finish_reason,
-               stop reading immediately. Don't wait for the
-               HTTP connection to close — that takes seconds. */
             if (streamDone) break;
         }
 

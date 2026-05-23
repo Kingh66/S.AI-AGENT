@@ -174,17 +174,6 @@ export function resetAllSettings() {
     state.settings.maxCoderAttempts = MULTI_AGENT_CONFIG.maxCoderAttempts;
     state.settings.maxCriticRejections = MULTI_AGENT_CONFIG.maxCriticRejections;
 
-    /* ═══════════════════════════════════════════════════
-       FIX: RESET IN-MEMORY RUNTIME STATE FLAGS
-       
-       OLD BUG: Only localStorage keys were cleared, but
-       the in-memory state object still held stale values.
-       The next saveRuntimeState() call would write them
-       right back to localStorage, defeating the reset.
-       
-       Now we explicitly zero out all transient runtime
-       flags so both storage AND memory are clean.
-       ═══════════════════════════════════════════════════ */
     state.responseTruncated = false;
     state.cooldownUntil = 0;
     if (state.cooldownTimer) {
@@ -367,21 +356,6 @@ export function loadSettings() {
                 toast('Cleared removed models from multi-agent settings (will auto-detect)', 'info');
             }
 
-            /* ═══════════════════════════════════════════════════
-               REMOVED: Aggressive :free auto-appending
-               
-               OLD BUG: This blindly appended :free to any
-               model ID containing '/', which created invalid
-               IDs for non-OpenRouter providers (ollama, etc.)
-               and for paid models that don't have :free variants.
-               
-               The ensureFreeModel() function in multiagent.js
-               now handles this correctly at runtime — it only
-               appends :free for OpenRouter provider and only
-               for models that look like they should have it.
-               
-               We NO LONGER modify saved model IDs in storage.
-               ═══════════════════════════════════════════════════ */
         } else {
             state.settings.multiAgentEnabled = false;
             state.settings.agentModels = Object.assign({}, MULTI_AGENT_CONFIG.agentModels);
